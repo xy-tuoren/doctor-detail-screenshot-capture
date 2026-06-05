@@ -1,5 +1,5 @@
 ﻿param(
-    [ValidateSet('Probe','Prototype','Batch','Search','SearchNames','Calibrate','LoginCalibrate','CalibrateAll','LoginAndSearchNames','Review')]
+    [ValidateSet('Probe','Prototype','Batch','Search','SearchNames','Calibrate','LoginCalibrate','CalibrateAll','LoginToHome','OpenListAndSearchNames','LoginAndSearchNames','Review')]
     [string]$Mode = 'Probe',
 
     [string]$MainWindowTitleRegex = '8\.9\.4|医师电子化注册信息系统',
@@ -34,6 +34,8 @@
     [int]$DetailWaitSeconds = 6,
     [int]$MaxRowsPerName = 50,
     [int]$CalibrateCountdown = 5,
+    [int]$CaptureRestInterval = 100,
+    [int]$CaptureRestMinutes = 5,
     [switch]$NoOcr,
 
     # 登录自动化相关
@@ -128,7 +130,9 @@ if ($Elevate -and -not (Test-IsAdministrator)) {
         '-LoginPassword', (Quote-Arg $LoginPassword),
         '-LoginWindowTitleRegex', (Quote-Arg $LoginWindowTitleRegex),
         '-LoginWaitSeconds', $LoginWaitSeconds,
-        '-PostLoginWaitSeconds', $PostLoginWaitSeconds
+        '-PostLoginWaitSeconds', $PostLoginWaitSeconds,
+        '-CaptureRestInterval', $CaptureRestInterval,
+        '-CaptureRestMinutes', $CaptureRestMinutes
     )
     if ($Names -and $Names.Count -gt 0) {
         foreach ($n in $Names) { $argParts += '-Names'; $argParts += (Quote-Arg $n) }
@@ -263,12 +267,20 @@ function Get-WindowHandles {
 function Bring-ToFront {
     param([System.Windows.Automation.AutomationElement]$Element)
     $handle = [IntPtr]([int]$Element.Current.NativeWindowHandle)
-    [NativeWin32]::ShowWindow($handle, 9) | Out-Null
+    [NativeWin32]::ShowWindow($handle, 5) | Out-Null
     [NativeWin32]::SetWindowPos($handle, [IntPtr](-1), 0, 0, 0, 0, 0x0043) | Out-Null
     Start-Sleep -Milliseconds 80
     [NativeWin32]::SetWindowPos($handle, [IntPtr](-2), 0, 0, 0, 0, 0x0043) | Out-Null
     [NativeWin32]::SetForegroundWindow($handle) | Out-Null
     Start-Sleep -Milliseconds 250
+}
+
+function Maximize-Window {
+    param([System.Windows.Automation.AutomationElement]$Element)
+    $handle = [IntPtr]([int]$Element.Current.NativeWindowHandle)
+    [NativeWin32]::ShowWindow($handle, 3) | Out-Null
+    [NativeWin32]::SetForegroundWindow($handle) | Out-Null
+    Start-Sleep -Milliseconds 500
 }
 
 function Element-IsVisible {
@@ -1454,7 +1466,7 @@ function Invoke-WinRtAwait {
             $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
     }
     $asTask = $script:WinRtAsTaskGeneric.MakeGenericMethod($ResultType)
-    $netTask = $asTask.Invoke($null, @($Operation))
+    $netTask = $asTask.Invoke($null, [object[]]@($Operation))
     $netTask.Wait(-1) | Out-Null
     return $netTask.Result
 }
@@ -1728,6 +1740,18 @@ function Invoke-NameSearchInput {
     [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
 }
 
+function Invoke-CaptureBatchRest {
+    param([int]$TotalSaved)
+    if ($CaptureRestInterval -le 0 -or $CaptureRestMinutes -le 0) { return }
+    if ($TotalSaved % $CaptureRestInterval -ne 0) { return }
+
+    $restSeconds = $CaptureRestMinutes * 60
+    Write-CaptureState -Stage 'Rest' -Message ("已抓取 {0} 次，休息 {1} 分钟" -f $TotalSaved, $CaptureRestMinutes)
+    Write-Step ("已累计成功截图 {0} 张，休息 {1} 分钟..." -f $TotalSaved, $CaptureRestMinutes)
+    Start-Sleep -Seconds $restSeconds
+    Write-Step '休息结束，继续抓取。'
+}
+
 function Capture-NameSeries {
     $allPersons = @(Resolve-PersonList)
     if ($allPersons.Count -eq 0) {
@@ -1789,6 +1813,9 @@ function Capture-NameSeries {
 
         $rowSavedForName = 0
         $seenSignatures = @{}
+        $consecutiveRowFailures = 0
+        $stopCurrentName = $false
+        $previousDetailHash = ''
         for ($row = 0; $row -lt $MaxRowsPerName -and $remaining.Count -gt 0; $row++) {
             $x = [int]$cfg.NameX
             $y = [int]$cfg.FirstRowY + ($row * [int]$cfg.RowHeight)
@@ -1819,52 +1846,62 @@ function Capture-NameSeries {
                 Write-CaptureState -Stage 'CaptureDetail' -CurrentName $searchName -CurrentRow $row -Message ("截图第 {0} 行详情" -f ($row + 1))
                 $bitmap = Capture-WindowBitmap -Window $detail
                 try {
-                    $ocrIdCard = $null
-                    if (-not $NoOcr) {
-                        $ocrText = Get-OcrTextFromBitmap -Bitmap $bitmap
-                        $fields = Get-DetailFieldsFromOcrText -Text $ocrText
-                        $ocrIdCard = $fields.IdCard
-                    }
-
-                    if ($remaining.Count -eq 1) {
-                        $targetPerson = $remaining[0]
+                    $detailHash = Get-BitmapHash -Bitmap $bitmap
+                    if (-not [string]::IsNullOrWhiteSpace($previousDetailHash) -and $detailHash -eq $previousDetailHash) {
+                        $isDuplicate = $true
+                        $stopCurrentName = $true
+                        Write-Step ("  第 {0} 行详情与上一行相同，判定为空行重复弹窗，结束该姓名。" -f ($row + 1))
                     }
                     else {
-                        $targetPerson = Find-PersonByOcrIdCard -Candidates @($remaining) -OcrIdCard $ocrIdCard
-                        if ($null -eq $targetPerson) {
-                            $isUnmatched = $true
-                            Write-Step ("  第 {0} 行未匹配到待抓取身份证（OCR={1}），继续下一行。" -f ($row + 1), $(if ($ocrIdCard) { $ocrIdCard } else { '未识别' }))
-                        }
-                    }
-
-                    if ($null -ne $targetPerson) {
-                        if ([string]::IsNullOrWhiteSpace($targetPerson.IdCard)) {
-                            throw '该人员未配置 idCard，无法按 姓名+身份证 保存。'
+                        $previousDetailHash = $detailHash
+                        $ocrIdCard = $null
+                        if (-not $NoOcr) {
+                            $ocrText = Get-OcrTextFromBitmap -Bitmap $bitmap
+                            $fields = Get-DetailFieldsFromOcrText -Text $ocrText
+                            $ocrIdCard = $fields.IdCard
                         }
 
-                        $signature = 'idcard:' + (Normalize-IdCard $targetPerson.IdCard)
-                        if ($seenSignatures.ContainsKey($signature)) {
-                            $isDuplicate = $true
-                            Write-Step ("  第 {0} 行与已截取的记录重复，停止该姓名。" -f ($row + 1))
-                        }
-                        elseif (Test-PersonAlreadyCaptured -Person $targetPerson) {
-                            $isDuplicate = $true
-                            Write-Step ("  第 {0} 行对应人员已有截图，停止该姓名。" -f ($row + 1))
+                        if ($remaining.Count -eq 1) {
+                            $targetPerson = $remaining[0]
                         }
                         else {
-                            $seenSignatures[$signature] = $true
-                            $baseName = Get-PersonOutputBaseName -Person $targetPerson
-                            $path = Join-Path $OutputDir ($baseName + '.png')
-                            $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
-                            $fileName = [IO.Path]::GetFileName($path)
-                            [void]$remaining.Remove($targetPerson)
-                            Write-CaptureState -Stage 'SearchName' -CurrentName $searchName -CurrentRow ($row + 1) -CurrentIdCard $targetPerson.IdCard -Message '已保存当前人员，继续下一行'
+                            $targetPerson = Find-PersonByOcrIdCard -Candidates @($remaining) -OcrIdCard $ocrIdCard
+                            if ($null -eq $targetPerson) {
+                                $isUnmatched = $true
+                                Write-Step ("  第 {0} 行未匹配到待抓取身份证（OCR={1}），继续下一行。" -f ($row + 1), $(if ($ocrIdCard) { $ocrIdCard } else { '未识别' }))
+                            }
+                        }
+
+                        if ($null -ne $targetPerson) {
+                            if ([string]::IsNullOrWhiteSpace($targetPerson.IdCard)) {
+                                throw '该人员未配置 idCard，无法按 姓名+身份证 保存。'
+                            }
+
+                            $signature = 'idcard:' + (Normalize-IdCard $targetPerson.IdCard)
+                            if ($seenSignatures.ContainsKey($signature)) {
+                                $isDuplicate = $true
+                                Write-Step ("  第 {0} 行与已截取的记录重复，停止该姓名。" -f ($row + 1))
+                            }
+                            elseif (Test-PersonAlreadyCaptured -Person $targetPerson) {
+                                $isDuplicate = $true
+                                Write-Step ("  第 {0} 行对应人员已有截图，停止该姓名。" -f ($row + 1))
+                            }
+                            else {
+                                $seenSignatures[$signature] = $true
+                                $baseName = Get-PersonOutputBaseName -Person $targetPerson
+                                $path = Join-Path $OutputDir ($baseName + '.png')
+                                $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+                                $fileName = [IO.Path]::GetFileName($path)
+                                [void]$remaining.Remove($targetPerson)
+                                Write-CaptureState -Stage 'SearchName' -CurrentName $searchName -CurrentRow ($row + 1) -CurrentIdCard $targetPerson.IdCard -Message '已保存当前人员，继续下一行'
+                            }
                         }
                     }
                 }
                 finally {
                     $bitmap.Dispose()
                 }
+                $consecutiveRowFailures = 0
 
                 if ($null -ne $targetPerson -and -not $isDuplicate -and -not $isUnmatched) {
                     Append-LogRow ([pscustomobject]@{
@@ -1882,6 +1919,7 @@ function Capture-NameSeries {
                     Write-Step ("  已保存：{0}" -f $fileName)
                     $totalSaved++
                     $rowSavedForName++
+                    Invoke-CaptureBatchRest -TotalSaved $totalSaved
                 }
             }
             catch {
@@ -1898,6 +1936,11 @@ function Capture-NameSeries {
                     RowText     = ''
                 })
                 Write-Step ("  第 {0} 行截图失败：{1}" -f ($row + 1), $_.Exception.Message)
+                $consecutiveRowFailures++
+                if ($consecutiveRowFailures -ge $StopAfterConsecutiveFailures) {
+                    Write-Step ("  连续 {0} 行截图失败，停止该姓名，避免继续点击空行。" -f $consecutiveRowFailures)
+                    $stopCurrentName = $true
+                }
             }
             finally {
                 Close-WindowWithAltF4 $detail
@@ -1906,6 +1949,7 @@ function Capture-NameSeries {
                 Start-Sleep -Milliseconds 150
             }
 
+            if ($stopCurrentName) { break }
             if ($isDuplicate) { break }
         }
 
@@ -2111,7 +2155,7 @@ function Wait-LoggedInMainWindow {
     return $null
 }
 
-function Invoke-LoginAndEnterList {
+function Invoke-LoginToHome {
     Write-CaptureState -Stage 'Login' -Message '准备登录'
     $loginCfg = Get-LoginCalibration
     if ($null -eq $loginCfg) {
@@ -2168,7 +2212,35 @@ function Invoke-LoginAndEnterList {
         throw '登录后未检测到主窗口，请检查账号密码、验证码/扫码要求或网络加载状态。'
     }
     Bring-ToFront $main
+    Write-Step '最大化主页窗口。'
+    Maximize-Window $main
+    $main = Find-MainApplicationWindow $MainWindowTitleRegex
+    if ($null -eq $main) {
+        throw '最大化主页窗口后主窗口丢失。'
+    }
     Wait-RectStable -Rect $main.Current.BoundingRectangle -TimeoutSeconds $PostLoginWaitSeconds -StableChecks 2 | Out-Null
+    Write-CaptureState -Stage 'HomeReady' -Message '主页已稳定'
+    Write-Step '主页已稳定。'
+    return $main
+}
+
+function Invoke-EnterListFromHome {
+    param([System.Windows.Automation.AutomationElement]$MainWindow = $null)
+
+    $loginCfg = Get-LoginCalibration
+    if ($null -eq $loginCfg) {
+        Write-Step ("未找到有效登录坐标，请在 config.json 的 loginCalibration 中配置，或运行 run-calibrate.cmd。")
+        throw 'Login calibration required.'
+    }
+
+    $main = $MainWindow
+    if ($null -eq $main) {
+        $main = Find-MainApplicationWindow $MainWindowTitleRegex
+        if ($null -eq $main) {
+            Write-MainWindowNotFoundHelp $MainWindowTitleRegex
+            throw 'Main window not found. Please login to the home page first.'
+        }
+    }
 
     Write-CaptureState -Stage 'OpenList' -Message '点击主执业机构入口'
     Write-Step '点击“主执业机构在本院医师”。'
@@ -2187,6 +2259,21 @@ function Invoke-LoginAndEnterList {
         Write-Step '列表页已稳定。'
     }
     Write-CaptureState -Stage 'ListReady' -Message '列表页已稳定'
+}
+
+function Invoke-LoginAndEnterList {
+    $main = Invoke-LoginToHome
+    Invoke-EnterListFromHome -MainWindow $main
+}
+
+function Invoke-OpenListAndCaptureNames {
+    if ($ResetState) {
+        Clear-CaptureState
+        Write-Step '已清除上次状态文件。'
+    }
+    Write-Step '将从当前主页点击入口进入列表，然后开始姓名截图。'
+    Invoke-EnterListFromHome
+    Capture-NameSeries
 }
 
 function Invoke-LoginAndCaptureNames {
@@ -2218,6 +2305,8 @@ switch ($Mode) {
     'Batch' { Capture-Details -EffectiveLimit $Limit; Review-Output }
     'Search' { Capture-NameSeries }
     'SearchNames' { Capture-NameSeries }
+    'LoginToHome' { [void](Invoke-LoginToHome) }
+    'OpenListAndSearchNames' { Invoke-OpenListAndCaptureNames }
     'LoginAndSearchNames' { Invoke-LoginAndCaptureNames }
     'Review' { Review-Output }
 }
