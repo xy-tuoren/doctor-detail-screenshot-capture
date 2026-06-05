@@ -1,15 +1,13 @@
 @echo off
+chcp 65001 >nul
 cd /d "%~dp0"
-echo ============================================================
-echo  Coordinate calibration (run this ONCE)
-echo ------------------------------------------------------------
-echo  1) Open the doctor app and log in.
-echo  2) Type any common surname in the name box and press Enter
-echo     so the list shows at least TWO rows.
-echo  3) Keep that list visible, then press any key here.
-echo ------------------------------------------------------------
-pause
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0capture-doctor-details.ps1" -Mode Calibrate
+echo ========================================
+echo   坐标校准（登录 + 列表，一次性完成）
+echo ========================================
 echo.
-echo Done.
+echo 请先打开医师系统登录页，然后按任意键开始...
+pause >nul
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0capture-doctor-details.ps1" -Mode CalibrateAll
+echo.
+echo 校准完成。接下来可运行 run-capture.cmd 开始自动截图。
 pause

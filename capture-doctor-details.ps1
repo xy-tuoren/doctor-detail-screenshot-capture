@@ -1,5 +1,5 @@
 ﻿param(
-    [ValidateSet('Probe','Prototype','Batch','Search','SearchNames','Calibrate','Review')]
+    [ValidateSet('Probe','Prototype','Batch','Search','SearchNames','Calibrate','LoginCalibrate','CalibrateAll','LoginAndSearchNames','Review')]
     [string]$Mode = 'Probe',
 
     [string]$MainWindowTitleRegex = '8\.9\.4|医师电子化注册信息系统',
@@ -9,6 +9,9 @@
     [string]$OutputDir = (Join-Path $PSScriptRoot 'captures'),
     [string]$LogPath = (Join-Path $PSScriptRoot 'capture-log.csv'),
     [string]$CalibrationPath = (Join-Path $PSScriptRoot 'calibration.json'),
+    [string]$LoginConfigPath = (Join-Path $PSScriptRoot 'login-calibration.json'),
+    [string]$ConfigPath = (Join-Path $PSScriptRoot 'config.json'),
+    [string]$StatePath = (Join-Path $PSScriptRoot 'capture-state.json'),
 
     [int]$StartIndex = 1,
     [int]$Limit = 0,
@@ -30,12 +33,22 @@
     [int]$SearchWaitSeconds = 3,
     [int]$DetailWaitSeconds = 6,
     [int]$MaxRowsPerName = 50,
-    [int]$CalibrateCountdown = 6,
+    [int]$CalibrateCountdown = 5,
     [switch]$NoOcr,
+
+    # 登录自动化相关
+    [string]$AppPath = '',
+    [string]$LoginUser = '',
+    [string]$LoginPassword = '',
+    [string]$LoginWindowTitleRegex = '用户登录|医师电子化注册信息系统',
+    [int]$LoginWaitSeconds = 90,
+    [int]$PostLoginWaitSeconds = 8,
 
     [switch]$UseAutomationButtons,
     [switch]$UsePaneDetection,
     [switch]$Elevate,
+    [switch]$ResetState,
+    [switch]$DisableStateResume,
     [switch]$Resume,
     [switch]$NoScroll,
     [switch]$KeepDetailWindowOpen
@@ -93,6 +106,10 @@ if ($Elevate -and -not (Test-IsAdministrator)) {
         '-ViewDetailButtonRegex', (Quote-Arg $ViewDetailButtonRegex),
         '-OutputDir', (Quote-Arg $OutputDir),
         '-LogPath', (Quote-Arg $LogPath),
+        '-CalibrationPath', (Quote-Arg $CalibrationPath),
+        '-LoginConfigPath', (Quote-Arg $LoginConfigPath),
+        '-ConfigPath', (Quote-Arg $ConfigPath),
+        '-StatePath', (Quote-Arg $StatePath),
         '-StartIndex', $StartIndex,
         '-Limit', $Limit,
         '-WaitSeconds', $WaitSeconds,
@@ -105,7 +122,13 @@ if ($Elevate -and -not (Test-IsAdministrator)) {
         '-TableRowHeight', $TableRowHeight,
         '-StopAfterConsecutiveFailures', $StopAfterConsecutiveFailures,
         '-SearchName', (Quote-Arg $SearchName),
-        '-NamesFile', (Quote-Arg $NamesFile)
+        '-NamesFile', (Quote-Arg $NamesFile),
+        '-AppPath', (Quote-Arg $AppPath),
+        '-LoginUser', (Quote-Arg $LoginUser),
+        '-LoginPassword', (Quote-Arg $LoginPassword),
+        '-LoginWindowTitleRegex', (Quote-Arg $LoginWindowTitleRegex),
+        '-LoginWaitSeconds', $LoginWaitSeconds,
+        '-PostLoginWaitSeconds', $PostLoginWaitSeconds
     )
     if ($Names -and $Names.Count -gt 0) {
         foreach ($n in $Names) { $argParts += '-Names'; $argParts += (Quote-Arg $n) }
@@ -113,6 +136,8 @@ if ($Elevate -and -not (Test-IsAdministrator)) {
     if ($SearchAllMatches) { $argParts += '-SearchAllMatches' }
     if ($UseAutomationButtons) { $argParts += '-UseAutomationButtons' }
     if ($UsePaneDetection) { $argParts += '-UsePaneDetection' }
+    if ($ResetState) { $argParts += '-ResetState' }
+    if ($DisableStateResume) { $argParts += '-DisableStateResume' }
     if ($Resume) { $argParts += '-Resume' }
     if ($NoScroll) { $argParts += '-NoScroll' }
     if ($KeepDetailWindowOpen) { $argParts += '-KeepDetailWindowOpen' }
@@ -210,7 +235,7 @@ function Write-MainWindowNotFoundHelp {
     Write-Step 'Main window not found.'
     if (Test-IsAdministrator) {
         Write-Step 'This PowerShell is elevated (Administrator). If the doctor app is a normal window, Windows blocks automation across privilege levels.'
-        Write-Step 'Close the admin window and run: .\run-batch.cmd  (do not use run-batch-as-admin.cmd).'
+        Write-Step 'Close the admin window and run: .\run-capture.cmd'
     }
     else {
         Write-Step 'Open the doctor registration app and stay on the list page, then run again.'
@@ -560,6 +585,303 @@ function Close-WindowWithAltF4 {
 
 function Get-Utf8Encoding {
     return New-Object System.Text.UTF8Encoding($true)
+}
+
+function Write-CaptureState {
+    param(
+        [string]$Stage,
+        [string]$CurrentName = '',
+        [int]$CurrentRow = 0,
+        [string]$CurrentIdCard = '',
+        [string]$Message = ''
+    )
+    if ($DisableStateResume) { return }
+    $state = [pscustomobject]@{
+        Stage = $Stage
+        CurrentName = $CurrentName
+        CurrentRow = $CurrentRow
+        CurrentIdCard = $CurrentIdCard
+        Message = $Message
+        UpdatedAt = (Get-Date).ToString('s')
+    }
+    [System.IO.File]::WriteAllText($StatePath, ($state | ConvertTo-Json), (Get-Utf8Encoding))
+}
+
+function Read-CaptureState {
+    if ($DisableStateResume -or -not (Test-Path $StatePath)) { return $null }
+    try {
+        $json = [System.IO.File]::ReadAllText($StatePath, (Get-Utf8Encoding))
+        return ($json | ConvertFrom-Json)
+    }
+    catch {
+        Write-Step ("Warning: 无法读取状态文件 {0}：{1}" -f $StatePath, $_.Exception.Message)
+        return $null
+    }
+}
+
+function Clear-CaptureState {
+    if (Test-Path $StatePath) {
+        Remove-Item -Path $StatePath -Force
+    }
+}
+
+function Test-StateStageAtOrAfterList {
+    param($State)
+    if ($null -eq $State) { return $false }
+    return @('ListReady','SearchName','OpenRow','CaptureDetail') -contains ([string]$State.Stage)
+}
+
+function Test-StateStageWithinName {
+    param($State)
+    if ($null -eq $State) { return $false }
+    return @('SearchName','OpenRow','CaptureDetail') -contains ([string]$State.Stage)
+}
+
+$script:ConfigPersons = @()
+
+function Get-AppConfig {
+    if (-not (Test-Path $ConfigPath)) { return $null }
+    try {
+        $json = [System.IO.File]::ReadAllText($ConfigPath, (Get-Utf8Encoding))
+        return ($json | ConvertFrom-Json)
+    }
+    catch {
+        throw ("无法读取配置文件 {0}：{1}" -f $ConfigPath, $_.Exception.Message)
+    }
+}
+
+function Get-ConfigProperty {
+    param(
+        $Config,
+        [string[]]$Names
+    )
+    if ($null -eq $Config) { return $null }
+    foreach ($name in $Names) {
+        $prop = $Config.PSObject.Properties[$name]
+        if ($null -ne $prop) { return $prop.Value }
+    }
+    return $null
+}
+
+function ConvertTo-PersonEntry {
+    param($Item)
+    if ($null -eq $Item) { return $null }
+
+    if ($Item -is [string]) {
+        $text = $Item.Trim()
+        if ($text.Length -eq 0) { return $null }
+        return [pscustomobject]@{ Name = $text; IdCard = '' }
+    }
+
+    $name = Get-ConfigProperty -Config $Item -Names @('name', 'Name')
+    $idCard = Get-ConfigProperty -Config $Item -Names @('idCard', 'IdCard', 'idcard', '身份证')
+    $nameText = [string]$name
+    if ([string]::IsNullOrWhiteSpace($nameText)) { return $null }
+    return [pscustomobject]@{
+        Name   = $nameText.Trim()
+        IdCard = if ($null -eq $idCard) { '' } else { [string]$idCard.Trim() }
+    }
+}
+
+function Add-PersonsToList {
+    param(
+        [System.Collections.Generic.List[object]]$List,
+        $RawPersons
+    )
+    if ($null -eq $RawPersons) { return }
+    foreach ($item in @($RawPersons)) {
+        if ($item -is [string]) {
+            foreach ($part in ($item -split '[,，;；\s]+')) {
+                $entry = ConvertTo-PersonEntry $part
+                if ($null -ne $entry) { $List.Add($entry) }
+            }
+            continue
+        }
+        $entry = ConvertTo-PersonEntry $item
+        if ($null -ne $entry) { $List.Add($entry) }
+    }
+}
+
+function Normalize-IdCard {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    return ($Value.Trim().ToUpperInvariant() -replace '\s', '')
+}
+
+function Get-PersonOutputBaseName {
+    param($Person)
+    $safeName = Sanitize-FileName $Person.Name
+    if ([string]::IsNullOrWhiteSpace($Person.IdCard)) {
+        return $safeName
+    }
+    return ('{0}_{1}' -f $safeName, (Sanitize-FileName $Person.IdCard))
+}
+
+function Get-PersonKey {
+    param($Person)
+    return ('{0}|{1}' -f (Sanitize-FileName $Person.Name), (Normalize-IdCard $Person.IdCard))
+}
+
+function Test-PersonAlreadyCaptured {
+    param($Person)
+    if ([string]::IsNullOrWhiteSpace($Person.IdCard)) { return $false }
+    $path = Join-Path $OutputDir ((Get-PersonOutputBaseName -Person $Person) + '.png')
+    return (Test-Path $path)
+}
+
+function Resolve-PersonList {
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($Names -and $Names.Count -gt 0) {
+        Add-PersonsToList -List $list -RawPersons $Names
+    }
+
+    if ($script:ConfigPersons -and $script:ConfigPersons.Count -gt 0) {
+        Add-PersonsToList -List $list -RawPersons $script:ConfigPersons
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($NamesFile)) {
+        foreach ($line in (Read-LinesUtf8 -Path $NamesFile)) {
+            $t = $line.Trim()
+            if ($t.Length -eq 0) { continue }
+            if ($t.StartsWith('#')) { continue }
+            Add-PersonsToList -List $list -RawPersons $t
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($SearchName)) {
+        $entry = ConvertTo-PersonEntry $SearchName.Trim()
+        if ($null -ne $entry) { $list.Add($entry) }
+    }
+
+    $unique = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($person in $list) {
+        $key = Get-PersonKey $person
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $unique.Add($person)
+    }
+    return $unique.ToArray()
+}
+
+function Get-PendingPersons {
+    param([object[]]$Persons)
+    $pending = New-Object System.Collections.Generic.List[object]
+    $skipped = 0
+    foreach ($person in $Persons) {
+        if (Test-PersonAlreadyCaptured -Person $person) {
+            $skipped++
+            continue
+        }
+        $pending.Add($person)
+    }
+    return [pscustomobject]@{
+        Pending = $pending.ToArray()
+        Skipped = $skipped
+    }
+}
+
+function Find-PersonByOcrIdCard {
+    param(
+        [object[]]$Candidates,
+        [string]$OcrIdCard
+    )
+    $norm = Normalize-IdCard $OcrIdCard
+    if ($norm.Length -eq 0) { return $null }
+    foreach ($person in $Candidates) {
+        $pNorm = Normalize-IdCard $person.IdCard
+        if ($pNorm.Length -eq 0) { continue }
+        if ($pNorm -eq $norm) { return $person }
+        if ($norm.Contains($pNorm) -or $pNorm.Contains($norm)) { return $person }
+    }
+    return $null
+}
+
+function Apply-AppConfig {
+    $cfg = Get-AppConfig
+    if ($null -eq $cfg) { return }
+
+    $cfgAppPath = Get-ConfigProperty -Config $cfg -Names @('appPath', 'AppPath')
+    if ([string]::IsNullOrWhiteSpace($script:AppPath) -and -not [string]::IsNullOrWhiteSpace([string]$cfgAppPath)) {
+        $script:AppPath = [string]$cfgAppPath
+    }
+
+    $cfgLoginUser = Get-ConfigProperty -Config $cfg -Names @('loginUser', 'LoginUser')
+    if ([string]::IsNullOrWhiteSpace($script:LoginUser) -and -not [string]::IsNullOrWhiteSpace([string]$cfgLoginUser)) {
+        $script:LoginUser = [string]$cfgLoginUser
+    }
+
+    $cfgLoginPassword = Get-ConfigProperty -Config $cfg -Names @('loginPassword', 'LoginPassword')
+    if ([string]::IsNullOrWhiteSpace($script:LoginPassword) -and -not [string]::IsNullOrWhiteSpace([string]$cfgLoginPassword)) {
+        $script:LoginPassword = [string]$cfgLoginPassword
+    }
+
+    $cfgNames = Get-ConfigProperty -Config $cfg -Names @('names', 'Names')
+    if ($null -ne $cfgNames) {
+        $personList = New-Object System.Collections.Generic.List[object]
+        Add-PersonsToList -List $personList -RawPersons $cfgNames
+        $script:ConfigPersons = @()
+        foreach ($person in $personList) {
+            $script:ConfigPersons += $person
+        }
+    }
+}
+
+function Read-ConfigHashtable {
+    if (-not (Test-Path $ConfigPath)) {
+        return @{
+            appPath = ''
+            loginUser = ''
+            loginPassword = ''
+            names = @()
+        }
+    }
+    $json = [System.IO.File]::ReadAllText($ConfigPath, (Get-Utf8Encoding))
+    $obj = $json | ConvertFrom-Json
+    $ht = @{}
+    foreach ($prop in $obj.PSObject.Properties) {
+        $ht[$prop.Name] = $prop.Value
+    }
+    return $ht
+}
+
+function Write-ConfigHashtable {
+    param($Hashtable)
+    $json = $Hashtable | ConvertTo-Json -Depth 6
+    [System.IO.File]::WriteAllText($ConfigPath, $json, (Get-Utf8Encoding))
+}
+
+function Set-ConfigSection {
+    param(
+        [string]$SectionName,
+        [hashtable]$SectionData
+    )
+    $root = Read-ConfigHashtable
+    $root[$SectionName] = $SectionData
+    Write-ConfigHashtable -Hashtable $root
+}
+
+function Test-ConfigSection {
+    param(
+        $Section,
+        [string[]]$RequiredFields
+    )
+    if ($null -eq $Section) { return $false }
+    $props = @($Section.PSObject.Properties.Name)
+    foreach ($field in $RequiredFields) {
+        if ($props -notcontains $field) { return $false }
+    }
+    return $true
+}
+
+function Read-LegacyJsonFile {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return $null }
+    try {
+        $json = [System.IO.File]::ReadAllText($Path, (Get-Utf8Encoding))
+        return ($json | ConvertFrom-Json)
+    }
+    catch { return $null }
 }
 
 function Read-LinesUtf8 {
@@ -1210,8 +1532,9 @@ function Get-DetailFieldsFromOcrText {
     param([string]$Text)
     $name = $null
     $code = $null
+    $idCard = $null
     if ([string]::IsNullOrWhiteSpace($Text)) {
-        return @{ Name = $null; CertCode = $null }
+        return @{ Name = $null; CertCode = $null; IdCard = $null }
     }
 
     $compact = ($Text -replace '\s+', '')
@@ -1222,14 +1545,19 @@ function Get-DetailFieldsFromOcrText {
         $name = $Matches[1]
     }
 
+    $idMatches = [regex]::Matches($Text, '(?<!\d)\d{17}[\dXx](?!\d)')
+    if ($idMatches.Count -gt 0) {
+        $idCard = $idMatches[0].Value.ToUpperInvariant()
+    }
+
     $digits = [regex]::Matches($Text, '\d+') | ForEach-Object { $_.Value }
     if ($digits.Count -gt 0) {
         $code = $digits | Where-Object { $_.Length -ge 20 } | Sort-Object Length -Descending | Select-Object -First 1
         if ([string]::IsNullOrWhiteSpace($code)) {
-            $code = $digits | Sort-Object Length -Descending | Select-Object -First 1
+            $code = $digits | Where-Object { $_.Length -ne 18 } | Sort-Object Length -Descending | Select-Object -First 1
         }
     }
-    return @{ Name = $name; CertCode = $code }
+    return @{ Name = $name; CertCode = $code; IdCard = $idCard }
 }
 
 function Get-CertCodeFromBitmap {
@@ -1319,39 +1647,62 @@ function Wait-DetailWindowByTitle {
 }
 
 function Get-Calibration {
-    if (-not (Test-Path $CalibrationPath)) { return $null }
-    try {
-        $cfgJson = [System.IO.File]::ReadAllText($CalibrationPath, (Get-Utf8Encoding))
-        $cfg = $cfgJson | ConvertFrom-Json
+    $cfg = Get-AppConfig
+    if ($null -ne $cfg) {
+        $section = Get-ConfigProperty -Config $cfg -Names @('listCalibration', 'ListCalibration')
+        if (Test-ConfigSection -Section $section -RequiredFields @('SearchBoxX','SearchBoxY','NameX','FirstRowY','RowHeight')) {
+            return $section
+        }
     }
-    catch { return $null }
-    $props = @($cfg.PSObject.Properties.Name)
-    foreach ($field in @('SearchBoxX','SearchBoxY','NameX','FirstRowY','RowHeight')) {
-        if ($props -notcontains $field) { return $null }
+
+    $legacy = Read-LegacyJsonFile -Path $CalibrationPath
+    if (Test-ConfigSection -Section $legacy -RequiredFields @('SearchBoxX','SearchBoxY','NameX','FirstRowY','RowHeight')) {
+        return $legacy
     }
-    return $cfg
+    return $null
 }
 
-function Read-CursorPointAfterCountdown {
-    param([string]$Prompt, [int]$Seconds)
-    Write-Host ''
-    Write-Step $Prompt
-    for ($i = $Seconds; $i -ge 1; $i--) {
-        Write-Host ("  {0}..." -f $i)
-        Start-Sleep -Seconds 1
+function Read-CursorPointWithConfirm {
+    param(
+        [string]$Title,
+        [string]$Instruction,
+        [int]$Seconds = $CalibrateCountdown
+    )
+
+    while ($true) {
+        Write-Host ''
+        Write-Step $Title
+        Write-Host ("  {0}" -f $Instruction)
+        Write-Host ("  按 Enter 后会开始 {0} 秒倒计时。" -f $Seconds)
+        Write-Host '  倒计时期间请把鼠标移动到目标位置，不要点击；倒计时结束自动记录。'
+        Read-Host '  准备开始时按 Enter' | Out-Null
+
+        for ($i = $Seconds; $i -ge 1; $i--) {
+            Write-Host ("  {0}..." -f $i)
+            Start-Sleep -Seconds 1
+        }
+
+        $cursor = [System.Windows.Forms.Cursor]::Position
+        $p = [pscustomobject]@{
+            X = [int]$cursor.X
+            Y = [int]$cursor.Y
+        }
+        Write-Step ("  已记录坐标：{0},{1}" -f $p.X, $p.Y)
+        $answer = (Read-Host '  确认使用这个坐标吗？输入 Y 确认，R 重新记录，Q 退出').Trim().ToUpperInvariant()
+        if ($answer -eq '' -or $answer -eq 'Y') { return $p }
+        if ($answer -eq 'Q') { throw '用户取消坐标校准。' }
+        Write-Step '  将重新记录该步骤。'
     }
-    $p = [System.Windows.Forms.Cursor]::Position
-    Write-Step ("  recorded: {0},{1}" -f $p.X, $p.Y)
-    return $p
 }
 
 function Invoke-Calibration {
-    Write-Step '坐标校准开始。请保证医师系统已打开，且【先随便搜一个名字让列表出现至少两行】。'
-    Write-Step '过程中只需移动鼠标到指定位置，不要点击；每一步会倒计时后自动记录鼠标所在坐标。'
+    Write-Step '列表坐标校准开始。请保证医师系统已打开，并停留在医师列表页。'
+    Write-Step '请先随便搜索一个常见姓名/姓氏，让列表至少显示两行结果。'
+    Read-Host '列表准备好后按 Enter 开始校准'
 
-    $search = Read-CursorPointAfterCountdown -Prompt '第1步：把鼠标移到【医师姓名 输入框】上。' -Seconds $CalibrateCountdown
-    $row1 = Read-CursorPointAfterCountdown -Prompt '第2步：把鼠标移到【列表第 1 行 姓名 单元格】上。' -Seconds $CalibrateCountdown
-    $row2 = Read-CursorPointAfterCountdown -Prompt '第3步：把鼠标移到【列表第 2 行 姓名 单元格】上。' -Seconds $CalibrateCountdown
+    $search = Read-CursorPointWithConfirm -Title '列表校准 第1步/3：医师姓名输入框' -Instruction '把鼠标移到【医师姓名】输入框中间。'
+    $row1 = Read-CursorPointWithConfirm -Title '列表校准 第2步/3：第1行姓名单元格' -Instruction '把鼠标移到列表【第 1 行】的【姓名】单元格中间。'
+    $row2 = Read-CursorPointWithConfirm -Title '列表校准 第3步/3：第2行姓名单元格' -Instruction '把鼠标移到列表【第 2 行】的【姓名】单元格中间。'
 
     $rowHeight = [Math]::Abs($row2.Y - $row1.Y)
     if ($rowHeight -lt 8) {
@@ -1359,7 +1710,7 @@ function Invoke-Calibration {
         $rowHeight = $TableRowHeight
     }
 
-    $cfg = [pscustomobject]@{
+    $section = @{
         SearchBoxX = [int]$search.X
         SearchBoxY = [int]$search.Y
         NameX      = [int]$row1.X
@@ -1367,10 +1718,10 @@ function Invoke-Calibration {
         RowHeight  = [int]$rowHeight
         SavedAt    = (Get-Date).ToString('s')
     }
-    [System.IO.File]::WriteAllText($CalibrationPath, ($cfg | ConvertTo-Json), (Get-Utf8Encoding))
-    Write-Step ("校准已保存到 {0}" -f $CalibrationPath)
-    Write-Step ("搜索框=({0},{1}) 姓名列X={2} 首行Y={3} 行高={4}" -f $cfg.SearchBoxX, $cfg.SearchBoxY, $cfg.NameX, $cfg.FirstRowY, $cfg.RowHeight)
-    Write-Step '现在可以运行： .\\run-search.cmd  或  -Mode SearchNames -Names ...'
+    Set-ConfigSection -SectionName 'listCalibration' -SectionData $section
+    Write-Step ("列表坐标已保存到 {0} 的 listCalibration" -f $ConfigPath)
+    Write-Step ("搜索框=({0},{1}) 姓名列X={2} 首行Y={3} 行高={4}" -f $section.SearchBoxX, $section.SearchBoxY, $section.NameX, $section.FirstRowY, $section.RowHeight)
+    Write-Step '现在可以运行： .\\run-capture.cmd'
 }
 
 function Invoke-NameSearchInput {
@@ -1393,59 +1744,31 @@ function Invoke-NameSearchInput {
     [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
 }
 
-function Resolve-NameList {
-    $list = New-Object System.Collections.Generic.List[string]
-    if ($Names -and $Names.Count -gt 0) {
-        foreach ($n in $Names) {
-            foreach ($part in ($n -split '[,，;；\s]+')) {
-                $t = $part.Trim()
-                if ($t.Length -gt 0) { $list.Add($t) }
-            }
-        }
-    }
-
-    $filePath = $NamesFile
-    if ([string]::IsNullOrWhiteSpace($filePath)) {
-        $defaultFile = Join-Path $PSScriptRoot 'name.txt'
-        if (Test-Path $defaultFile) { $filePath = $defaultFile }
-    }
-    if (-not [string]::IsNullOrWhiteSpace($filePath)) {
-        foreach ($line in (Read-LinesUtf8 -Path $filePath)) {
-            $t = $line.Trim()
-            if ($t.Length -eq 0) { continue }
-            if ($t.StartsWith('#')) { continue }
-            foreach ($part in ($t -split '[,，;；\s]+')) {
-                $p = $part.Trim()
-                if ($p.Length -gt 0) { $list.Add($p) }
-            }
-        }
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($SearchName)) { $list.Add($SearchName.Trim()) }
-    return ($list | Select-Object -Unique)
-}
-
-function Get-UniqueOutputPath {
-    param([string]$BaseName)
-    $path = Join-Path $OutputDir ($BaseName + '.png')
-    if (-not (Test-Path $path)) { return $path }
-    for ($i = 2; $i -lt 1000; $i++) {
-        $path = Join-Path $OutputDir ("{0}_{1}.png" -f $BaseName, $i)
-        if (-not (Test-Path $path)) { return $path }
-    }
-    return (Join-Path $OutputDir ("{0}_{1}.png" -f $BaseName, ([Guid]::NewGuid().ToString('N').Substring(0,6))))
-}
-
 function Capture-NameSeries {
-    $nameList = @(Resolve-NameList)
-    if ($nameList.Count -eq 0) {
-        throw '请用 -Names "张三,李四" 或 -NamesFile names.txt 或 -SearchName "张三" 指定姓名。'
+    $allPersons = @(Resolve-PersonList)
+    if ($allPersons.Count -eq 0) {
+        throw ("请在 config.json 的 names 中配置人员（name + idCard），或使用 -Names / -NamesFile / -SearchName 指定。配置文件：{0}" -f $ConfigPath)
+    }
+
+    $pendingResult = Get-PendingPersons -Persons $allPersons
+    $personList = @($pendingResult.Pending)
+    if ($pendingResult.Skipped -gt 0) {
+        Write-Step ("已跳过 {0} 个已有截图的人员（按 姓名+身份证 匹配 captures 目录）。" -f $pendingResult.Skipped)
+    }
+    if ($personList.Count -eq 0) {
+        Write-Step '所有配置人员均已有截图，无需继续抓取。'
+        Review-Output
+        return
+    }
+
+    $missingIdCard = @($personList | Where-Object { [string]::IsNullOrWhiteSpace($_.IdCard) })
+    if ($missingIdCard.Count -gt 0) {
+        Write-Step ("警告：有 {0} 个人员未配置 idCard，将无法按身份证命名和启动前去重。" -f $missingIdCard.Count)
     }
 
     $cfg = Get-Calibration
     if ($null -eq $cfg) {
-        Write-Step ("未找到有效校准文件：{0}" -f $CalibrationPath)
-        Write-Step '请先运行：.\\run-calibrate.cmd（或 -Mode Calibrate）完成一次坐标校准。'
+        Write-Step ("未找到有效列表坐标，请在 config.json 的 listCalibration 中配置，或运行 run-calibrate.cmd。")
         throw 'Calibration required.'
     }
 
@@ -1459,13 +1782,39 @@ function Capture-NameSeries {
     }
     $mainHandle = [int]$main.Current.NativeWindowHandle
 
-    Write-Step ("共有 {0} 个姓名需要处理。OCR={1} 校准=({2},{3}) 姓名列X={4} 首行Y={5} 行高={6}" -f $nameList.Count, (-not $NoOcr), $cfg.SearchBoxX, $cfg.SearchBoxY, $cfg.NameX, $cfg.FirstRowY, $cfg.RowHeight)
+    Write-Step ("待抓取 {0} 人，OCR={1}，校准=({2},{3})，姓名列X={4}，首行Y={5}，行高={6}" -f `
+        $personList.Count, (-not $NoOcr), $cfg.SearchBoxX, $cfg.SearchBoxY, $cfg.NameX, $cfg.FirstRowY, $cfg.RowHeight)
 
     $totalSaved = 0
-    foreach ($name in $nameList) {
-        Write-Step ("=== 搜索姓名：{0} ===" -f $name)
+    $resumeState = Read-CaptureState
+    $resumeName = ''
+    $resumeRow = 0
+    $resumeNameReached = $true
+    if ((Test-StateStageWithinName -State $resumeState) -and -not [string]::IsNullOrWhiteSpace([string]$resumeState.CurrentName)) {
+        $resumeName = [string]$resumeState.CurrentName
+        $resumeRow = [int]$resumeState.CurrentRow
+        $resumeNameReached = $false
+        Write-Step ("将按状态文件恢复：姓名={0}，行号={1}，阶段={2}" -f $resumeName, ($resumeRow + 1), $resumeState.Stage)
+    }
+
+    $groups = $personList | Group-Object -Property Name
+    foreach ($group in $groups) {
+        $searchName = [string]$group.Name
+        if (-not $resumeNameReached) {
+            if ($searchName -ne $resumeName) {
+                Write-Step ("按状态恢复：跳过已越过的姓名 {0}" -f $searchName)
+                continue
+            }
+            $resumeNameReached = $true
+        }
+
+        $remaining = New-Object System.Collections.Generic.List[object]
+        foreach ($person in $group.Group) { $remaining.Add($person) }
+
+        Write-CaptureState -Stage 'SearchName' -CurrentName $searchName -CurrentRow 0 -Message '搜索姓名'
+        Write-Step ("=== 搜索姓名：{0}（待抓取 {1} 人）===" -f $searchName, $remaining.Count)
         try {
-            Invoke-NameSearchInput -MainWindow $main -Calibration $cfg -Name $name
+            Invoke-NameSearchInput -MainWindow $main -Calibration $cfg -Name $searchName
         }
         catch {
             Write-Step ("输入姓名失败：{0}" -f $_.Exception.Message)
@@ -1475,10 +1824,16 @@ function Capture-NameSeries {
 
         $rowSavedForName = 0
         $seenSignatures = @{}
-        for ($row = 0; $row -lt $MaxRowsPerName; $row++) {
+        $startRow = 0
+        if ($searchName -eq $resumeName -and $resumeRow -gt 0) {
+            $startRow = $resumeRow
+            Write-Step ("按状态恢复：{0} 从第 {1} 行继续。" -f $searchName, ($startRow + 1))
+        }
+        for ($row = $startRow; $row -lt $MaxRowsPerName -and $remaining.Count -gt 0; $row++) {
             $x = [int]$cfg.NameX
             $y = [int]$cfg.FirstRowY + ($row * [int]$cfg.RowHeight)
 
+            Write-CaptureState -Stage 'OpenRow' -CurrentName $searchName -CurrentRow $row -Message ("打开第 {0} 行" -f ($row + 1))
             $before = Get-WindowHandles
             Invoke-ScreenDoubleClick -X $x -Y $y -FocusWindow $main
             $detail = Wait-DetailWindowByTitle -BeforeHandles $before -MainHandle $mainHandle -TitleRegex $DetailWindowTitleRegex -TimeoutSeconds $DetailWaitSeconds
@@ -1491,68 +1846,76 @@ function Capture-NameSeries {
             }
 
             if ($null -eq $detail) {
-                if ($row -eq 0) { Write-Step ("  未出现详情窗口，'{0}' 可能无结果。" -f $name) }
+                if ($row -eq 0) { Write-Step ("  未出现详情窗口，'{0}' 可能无结果。" -f $searchName) }
                 else { Write-Step ("  第 {0} 行无更多结果，结束该姓名。" -f ($row + 1)) }
                 break
             }
 
             $fileName = $null
-            $filePersonName = $name
+            $targetPerson = $null
             $isDuplicate = $false
+            $isUnmatched = $false
             try {
+                Write-CaptureState -Stage 'CaptureDetail' -CurrentName $searchName -CurrentRow $row -Message ("截图第 {0} 行详情" -f ($row + 1))
                 $bitmap = Capture-WindowBitmap -Window $detail
                 try {
-                    $code = $null
-                    $detailName = $null
+                    $ocrIdCard = $null
                     if (-not $NoOcr) {
                         $ocrText = Get-OcrTextFromBitmap -Bitmap $bitmap
                         $fields = Get-DetailFieldsFromOcrText -Text $ocrText
-                        $code = $fields.CertCode
-                        $detailName = $fields.Name
+                        $ocrIdCard = $fields.IdCard
                     }
 
-                    # 去重键：有编码用编码，否则用截图哈希。重名(不同人)编码/截图不同，不会误判；
-                    # 同一行被重复打开则键相同 -> 判定为重复并停止该姓名。
-                    if (-not [string]::IsNullOrWhiteSpace($code)) {
-                        $signature = "code:$code"
+                    if ($remaining.Count -eq 1) {
+                        $targetPerson = $remaining[0]
                     }
                     else {
-                        $signature = "img:" + (Get-BitmapHash -Bitmap $bitmap)
+                        $targetPerson = Find-PersonByOcrIdCard -Candidates @($remaining) -OcrIdCard $ocrIdCard
+                        if ($null -eq $targetPerson) {
+                            $isUnmatched = $true
+                            Write-Step ("  第 {0} 行未匹配到待抓取身份证（OCR={1}），继续下一行。" -f ($row + 1), $(if ($ocrIdCard) { $ocrIdCard } else { '未识别' }))
+                        }
                     }
 
-                    if ($seenSignatures.ContainsKey($signature)) {
-                        $isDuplicate = $true
-                        Write-Step ("  第 {0} 行与已截取的记录重复（同一行被重复打开），停止该姓名。" -f ($row + 1))
-                    }
-                    else {
-                        $seenSignatures[$signature] = $true
-                        $filePersonName = if (-not [string]::IsNullOrWhiteSpace($detailName)) { $detailName } else { $name }
-                        $safeName = Sanitize-FileName $filePersonName
-                        if ([string]::IsNullOrWhiteSpace($code)) {
-                            $baseName = ("{0}_row{1}" -f $safeName, ($row + 1))
+                    if ($null -ne $targetPerson) {
+                        if ([string]::IsNullOrWhiteSpace($targetPerson.IdCard)) {
+                            throw '该人员未配置 idCard，无法按 姓名+身份证 保存。'
+                        }
+
+                        $signature = 'idcard:' + (Normalize-IdCard $targetPerson.IdCard)
+                        if ($seenSignatures.ContainsKey($signature)) {
+                            $isDuplicate = $true
+                            Write-Step ("  第 {0} 行与已截取的记录重复，停止该姓名。" -f ($row + 1))
+                        }
+                        elseif (Test-PersonAlreadyCaptured -Person $targetPerson) {
+                            $isDuplicate = $true
+                            Write-Step ("  第 {0} 行对应人员已有截图，停止该姓名。" -f ($row + 1))
                         }
                         else {
-                            $baseName = ("{0}_{1}" -f $safeName, (Sanitize-FileName $code))
+                            $seenSignatures[$signature] = $true
+                            $baseName = Get-PersonOutputBaseName -Person $targetPerson
+                            $path = Join-Path $OutputDir ($baseName + '.png')
+                            $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+                            $fileName = [IO.Path]::GetFileName($path)
+                            [void]$remaining.Remove($targetPerson)
+                            Write-CaptureState -Stage 'SearchName' -CurrentName $searchName -CurrentRow ($row + 1) -CurrentIdCard $targetPerson.IdCard -Message '已保存当前人员，继续下一行'
                         }
-                        $path = Get-UniqueOutputPath -BaseName $baseName
-                        $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
-                        $fileName = [IO.Path]::GetFileName($path)
                     }
                 }
                 finally {
                     $bitmap.Dispose()
                 }
 
-                if (-not $isDuplicate) {
+                if ($null -ne $targetPerson -and -not $isDuplicate -and -not $isUnmatched) {
                     Append-LogRow ([pscustomobject]@{
                         Timestamp   = (Get-Date).ToString('s')
                         RowIndex    = ($row + 1)
                         Status      = 'success'
                         FileName    = $fileName
                         DetailTitle = $detail.Current.Name
-                        Name        = $filePersonName
-                        License     = $code
-                        Signature   = ("search:{0}:file:{1}:row:{2}" -f $name, $filePersonName, ($row + 1))
+                        Name        = $targetPerson.Name
+                        License     = $targetPerson.IdCard
+                        Signature   = ("search:{0}:idcard:{1}:row:{2}" -f $searchName, $targetPerson.IdCard, ($row + 1))
                         Message     = 'name-series capture'
                         RowText     = ''
                     })
@@ -1568,9 +1931,9 @@ function Capture-NameSeries {
                     Status      = 'failed'
                     FileName    = $fileName
                     DetailTitle = ''
-                    Name        = $name
+                    Name        = $searchName
                     License     = ''
-                    Signature   = ("name:{0}:row:{1}" -f $name, ($row + 1))
+                    Signature   = ("name:{0}:row:{1}" -f $searchName, ($row + 1))
                     Message     = $_.Exception.Message
                     RowText     = ''
                 })
@@ -1586,18 +1949,318 @@ function Capture-NameSeries {
             if ($isDuplicate) { break }
         }
 
-        Write-Step ("  '{0}' 完成，截图 {1} 张。" -f $name, $rowSavedForName)
+        if ($remaining.Count -gt 0) {
+            Write-Step ("  '{0}' 仍有 {1} 人未匹配到截图。" -f $searchName, $remaining.Count)
+        }
+        Write-Step ("  '{0}' 完成，本次截图 {1} 张。" -f $searchName, $rowSavedForName)
+        Write-CaptureState -Stage 'ListReady' -CurrentName $searchName -CurrentRow 0 -Message ("姓名 {0} 已处理完成" -f $searchName)
     }
 
     Write-Step ("全部完成，共截图 {0} 张。" -f $totalSaved)
+    Write-CaptureState -Stage 'Completed' -Message '全部完成'
     Review-Output
+}
+
+#region 登录自动化（启动应用 + 坐标登录 + 进入列表页）
+
+function Get-LoginCalibration {
+    $cfg = Get-AppConfig
+    if ($null -ne $cfg) {
+        $section = Get-ConfigProperty -Config $cfg -Names @('loginCalibration', 'LoginCalibration')
+        if (Test-ConfigSection -Section $section -RequiredFields @('SwitchLoginX','SwitchLoginY','UserX','UserY','PasswordX','PasswordY','LoginButtonX','LoginButtonY','MainInstitutionX','MainInstitutionY')) {
+            return $section
+        }
+    }
+
+    $legacy = Read-LegacyJsonFile -Path $LoginConfigPath
+    if (Test-ConfigSection -Section $legacy -RequiredFields @('SwitchLoginX','SwitchLoginY','UserX','UserY','PasswordX','PasswordY','LoginButtonX','LoginButtonY','MainInstitutionX','MainInstitutionY')) {
+        return $legacy
+    }
+    return $null
+}
+
+function Invoke-LoginCalibration {
+    Write-Step '登录坐标校准开始。请打开医师系统登录页。'
+    Write-Step '每一步都会等待你按 Enter 后才记录坐标，并允许确认或重录。'
+    Read-Host '登录页准备好后按 Enter 开始校准'
+
+    $switchLogin = Read-CursorPointWithConfirm -Title '登录校准 第1步/5：切换登录方式' -Instruction '把鼠标移到右上角【切换登录方式】链接中间。'
+    $userBox = Read-CursorPointWithConfirm -Title '登录校准 第2步/5：账号输入框' -Instruction '切换到账号登录界面后，把鼠标移到【账号输入框】中间。'
+    $passwordBox = Read-CursorPointWithConfirm -Title '登录校准 第3步/5：密码输入框' -Instruction '把鼠标移到【密码输入框】中间。'
+    $loginButton = Read-CursorPointWithConfirm -Title '登录校准 第4步/5：登录按钮' -Instruction '把鼠标移到【登录】按钮中间。'
+
+    Write-Step '第5步需要校准登录后的主页入口。'
+    Write-Step '请先手动登录，等待主页加载完成，然后继续。'
+    Read-Host '主页已经加载完成后按 Enter 继续'
+    $mainEntry = Read-CursorPointWithConfirm -Title '登录校准 第5步/5：主执业机构在本院医师入口' -Instruction '把鼠标移到主页左侧【主执业机构在本院医师】入口中间。'
+
+    $section = @{
+        SwitchLoginX     = [int]$switchLogin.X
+        SwitchLoginY     = [int]$switchLogin.Y
+        UserX            = [int]$userBox.X
+        UserY            = [int]$userBox.Y
+        PasswordX        = [int]$passwordBox.X
+        PasswordY        = [int]$passwordBox.Y
+        LoginButtonX     = [int]$loginButton.X
+        LoginButtonY     = [int]$loginButton.Y
+        MainInstitutionX = [int]$mainEntry.X
+        MainInstitutionY = [int]$mainEntry.Y
+        SavedAt          = (Get-Date).ToString('s')
+    }
+    Set-ConfigSection -SectionName 'loginCalibration' -SectionData $section
+    Write-Step ("登录坐标已保存到 {0} 的 loginCalibration" -f $ConfigPath)
+    Write-Step ("切换=({0},{1}) 账号=({2},{3}) 密码=({4},{5}) 登录=({6},{7}) 入口=({8},{9})" -f `
+        $section.SwitchLoginX, $section.SwitchLoginY, $section.UserX, $section.UserY, $section.PasswordX, $section.PasswordY, `
+        $section.LoginButtonX, $section.LoginButtonY, $section.MainInstitutionX, $section.MainInstitutionY)
+}
+
+function Invoke-AllCalibration {
+    Write-Step '统一坐标校准开始。'
+    Write-Step '本流程会依次完成：登录坐标校准 -> 列表截图坐标校准。'
+    Write-Step '每个点位都需要你按 Enter 开始记录，并可以确认或重录。'
+    Read-Host '准备好后按 Enter 开始登录坐标校准'
+    Invoke-LoginCalibration
+
+    Write-Host ''
+    Write-Step '登录坐标校准已完成。下面开始列表截图坐标校准。'
+    Write-Step '请确保已经进入【主执业机构在本院医师】列表页，并让列表至少显示两行结果。'
+    Read-Host '列表页准备好后按 Enter 开始列表坐标校准'
+    Invoke-Calibration
+
+    Write-Host ''
+    Write-Step '统一坐标校准完成。'
+    Write-Step ("所有坐标已保存到 {0}" -f $ConfigPath)
+}
+
+function Find-WindowByAnyTitle {
+    param([string]$TitleRegex)
+    foreach ($win in Get-RootWindows) {
+        $title = $win.Current.Name
+        if (-not [string]::IsNullOrWhiteSpace($title) -and $title -match $TitleRegex) {
+            return $win
+        }
+    }
+    return $null
+}
+
+function Wait-WindowByAnyTitle {
+    param(
+        [string]$TitleRegex,
+        [int]$TimeoutSeconds
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $win = Find-WindowByAnyTitle -TitleRegex $TitleRegex
+        if ($null -ne $win) { return $win }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+    return $null
+}
+
+function Start-DoctorApplication {
+    if ([string]::IsNullOrWhiteSpace($AppPath)) {
+        Write-Step '未提供 -AppPath，将使用当前已打开的医师系统窗口。'
+        return
+    }
+    if (-not (Test-Path $AppPath)) {
+        throw "AppPath not found: $AppPath"
+    }
+    Write-Step ("启动应用：{0}" -f $AppPath)
+    Start-Process -FilePath $AppPath | Out-Null
+}
+
+function Convert-SecureStringToPlainText {
+    param([Security.SecureString]$Secure)
+    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+    }
+    finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+    }
+}
+
+function Clear-ClipboardSafe {
+    try {
+        [System.Windows.Forms.Clipboard]::Clear()
+    }
+    catch {
+        Write-Step ("Warning: 清空剪贴板失败：{0}" -f $_.Exception.Message)
+    }
+}
+
+function Invoke-ClickAndPasteText {
+    param(
+        [int]$X,
+        [int]$Y,
+        [string]$Text,
+        [System.Windows.Automation.AutomationElement]$FocusWindow = $null,
+        [switch]$ClearClipboardAfterPaste
+    )
+    Invoke-ScreenClick -X $X -Y $Y -FocusWindow $FocusWindow
+    Start-Sleep -Milliseconds 150
+    [System.Windows.Forms.SendKeys]::SendWait('^a')
+    Start-Sleep -Milliseconds 80
+    [System.Windows.Forms.SendKeys]::SendWait('{DEL}')
+    Start-Sleep -Milliseconds 80
+    Set-Clipboard -Value $Text
+    Start-Sleep -Milliseconds 80
+    [System.Windows.Forms.SendKeys]::SendWait('^v')
+    Start-Sleep -Milliseconds 120
+    if ($ClearClipboardAfterPaste) {
+        Clear-ClipboardSafe
+    }
+}
+
+function Wait-RectStable {
+    param(
+        [System.Windows.Rect]$Rect,
+        [int]$TimeoutSeconds = 10,
+        [int]$StableChecks = 2
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $last = $null
+    $same = 0
+    do {
+        try {
+            $hash = Get-ScreenRectHash $Rect
+            if ($hash -eq $last) { $same++ } else { $same = 0 }
+            $last = $hash
+            if ($same -ge $StableChecks) { return $true }
+        }
+        catch { }
+        Start-Sleep -Milliseconds 700
+    } while ((Get-Date) -lt $deadline)
+    return $false
+}
+
+function Wait-LoggedInMainWindow {
+    param([int]$TimeoutSeconds)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $main = Find-MainApplicationWindow $MainWindowTitleRegex
+        if ($null -ne $main) {
+            $title = $main.Current.Name
+            $rect = $main.Current.BoundingRectangle
+            if ($title -notmatch '用户登录' -and $rect.Width -gt 800 -and $rect.Height -gt 500) {
+                return $main
+            }
+        }
+        Start-Sleep -Milliseconds 700
+    } while ((Get-Date) -lt $deadline)
+    return $null
+}
+
+function Invoke-LoginAndEnterList {
+    Write-CaptureState -Stage 'Login' -Message '准备登录'
+    $loginCfg = Get-LoginCalibration
+    if ($null -eq $loginCfg) {
+        Write-Step ("未找到有效登录坐标，请在 config.json 的 loginCalibration 中配置，或运行 run-calibrate.cmd。")
+        throw 'Login calibration required.'
+    }
+    if ([string]::IsNullOrWhiteSpace($LoginUser)) {
+        $LoginUserValue = Read-Host '请输入登录账号'
+    }
+    else {
+        $LoginUserValue = $LoginUser
+    }
+    if ([string]::IsNullOrWhiteSpace($LoginPassword)) {
+        $securePassword = Read-Host '请输入登录密码（不会保存）' -AsSecureString
+        $plainPassword = Convert-SecureStringToPlainText -Secure $securePassword
+    }
+    else {
+        $plainPassword = $LoginPassword
+    }
+
+    Write-CaptureState -Stage 'StartApp' -Message '启动应用或使用已打开窗口'
+    Start-DoctorApplication
+    $loginWin = Wait-WindowByAnyTitle -TitleRegex $LoginWindowTitleRegex -TimeoutSeconds $LoginWaitSeconds
+    if ($null -eq $loginWin) {
+        throw "登录窗口未出现。请检查 -AppPath 或 -LoginWindowTitleRegex。"
+    }
+    Bring-ToFront $loginWin
+
+    Write-CaptureState -Stage 'Login' -Message '切换登录方式'
+    Write-Step '点击“切换登录方式”。'
+    Invoke-ScreenClick -X ([int]$loginCfg.SwitchLoginX) -Y ([int]$loginCfg.SwitchLoginY) -FocusWindow $loginWin
+    Start-Sleep -Milliseconds 1000
+    Wait-RectStable -Rect $loginWin.Current.BoundingRectangle -TimeoutSeconds 4 -StableChecks 1 | Out-Null
+
+    Write-Step '输入账号。'
+    Invoke-ClickAndPasteText -X ([int]$loginCfg.UserX) -Y ([int]$loginCfg.UserY) -Text $LoginUserValue -FocusWindow $loginWin
+
+    Write-Step '输入密码。'
+    try {
+        Invoke-ClickAndPasteText -X ([int]$loginCfg.PasswordX) -Y ([int]$loginCfg.PasswordY) -Text $plainPassword -FocusWindow $loginWin -ClearClipboardAfterPaste
+    }
+    finally {
+        $plainPassword = $null
+        Clear-ClipboardSafe
+    }
+
+    Write-Step '点击登录。'
+    Invoke-ScreenClick -X ([int]$loginCfg.LoginButtonX) -Y ([int]$loginCfg.LoginButtonY) -FocusWindow $loginWin
+
+    Write-CaptureState -Stage 'WaitMain' -Message '等待主页加载完成'
+    Write-Step '等待主页加载完成。'
+    $main = Wait-LoggedInMainWindow -TimeoutSeconds $LoginWaitSeconds
+    if ($null -eq $main) {
+        throw '登录后未检测到主窗口，请检查账号密码、验证码/扫码要求或网络加载状态。'
+    }
+    Bring-ToFront $main
+    Wait-RectStable -Rect $main.Current.BoundingRectangle -TimeoutSeconds $PostLoginWaitSeconds -StableChecks 2 | Out-Null
+
+    Write-CaptureState -Stage 'OpenList' -Message '点击主执业机构入口'
+    Write-Step '点击“主执业机构在本院医师”。'
+    Invoke-ScreenClick -X ([int]$loginCfg.MainInstitutionX) -Y ([int]$loginCfg.MainInstitutionY) -FocusWindow $main
+    Start-Sleep -Seconds 2
+    $main = Find-MainApplicationWindow $MainWindowTitleRegex
+    if ($null -eq $main) {
+        throw '点击主执业机构入口后主窗口丢失。'
+    }
+    Bring-ToFront $main
+    $tableRect = Find-TablePaneRect $main
+    if (-not (Wait-RectStable -Rect $tableRect -TimeoutSeconds $PostLoginWaitSeconds -StableChecks 2)) {
+        Write-Step 'Warning: 列表区域未完全稳定，仍将继续执行后续姓名截图。'
+    }
+    else {
+        Write-Step '列表页已稳定。'
+    }
+    Write-CaptureState -Stage 'ListReady' -Message '列表页已稳定'
+}
+
+function Invoke-LoginAndCaptureNames {
+    if ($ResetState) {
+        Clear-CaptureState
+        Write-Step '已清除上次执行状态，将从登录开始。'
+    }
+
+    $state = Read-CaptureState
+    $main = Find-MainApplicationWindow $MainWindowTitleRegex
+    if ((Test-StateStageAtOrAfterList -State $state) -and $null -ne $main) {
+        Write-Step ("检测到上次状态为 {0}，且主窗口仍存在；跳过登录和入口点击，直接恢复截图阶段。" -f $state.Stage)
+        Bring-ToFront $main
+    }
+    else {
+        if ($null -ne $state) {
+            Write-Step ("当前状态为 {0}，无法直接从列表恢复；将执行登录/进入列表流程。" -f $state.Stage)
+        }
+        Invoke-LoginAndEnterList
+    }
+    Capture-NameSeries
 }
 
 #endregion
 
+#endregion
+
+Apply-AppConfig
+
 switch ($Mode) {
     'Probe' { Probe-Environment }
     'Calibrate' { Invoke-Calibration }
+    'LoginCalibrate' { Invoke-LoginCalibration }
+    'CalibrateAll' { Invoke-AllCalibration }
     'Prototype' {
         if ($Limit -le 0) { $Limit = 5 }
         Capture-Details -EffectiveLimit $Limit
@@ -1606,5 +2269,6 @@ switch ($Mode) {
     'Batch' { Capture-Details -EffectiveLimit $Limit; Review-Output }
     'Search' { Capture-NameSeries }
     'SearchNames' { Capture-NameSeries }
+    'LoginAndSearchNames' { Invoke-LoginAndCaptureNames }
     'Review' { Review-Output }
 }

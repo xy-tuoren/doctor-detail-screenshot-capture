@@ -1,0 +1,30 @@
+{
+  "appPath": "C:\\Program Files\\示例\\医师系统.lnk",
+  "loginUser": "your_account",
+  "loginPassword": "your_password",
+  "names": [
+    { "name": "张三", "idCard": "110101199001011234" },
+    { "name": "李四", "idCard": "110101199002021234" }
+  ],
+  "loginCalibration": {
+    "SwitchLoginX": 0,
+    "SwitchLoginY": 0,
+    "UserX": 0,
+    "UserY": 0,
+    "PasswordX": 0,
+    "PasswordY": 0,
+    "LoginButtonX": 0,
+    "LoginButtonY": 0,
+    "MainInstitutionX": 0,
+    "MainInstitutionY": 0,
+    "SavedAt": ""
+  },
+  "listCalibration": {
+    "SearchBoxX": 0,
+    "SearchBoxY": 0,
+    "NameX": 0,
+    "FirstRowY": 0,
+    "RowHeight": 31,
+    "SavedAt": ""
+  }
+}
