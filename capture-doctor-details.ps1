@@ -595,28 +595,12 @@ function Write-CaptureState {
         [string]$CurrentIdCard = '',
         [string]$Message = ''
     )
-    if ($DisableStateResume) { return }
-    $state = [pscustomobject]@{
-        Stage = $Stage
-        CurrentName = $CurrentName
-        CurrentRow = $CurrentRow
-        CurrentIdCard = $CurrentIdCard
-        Message = $Message
-        UpdatedAt = (Get-Date).ToString('s')
-    }
-    [System.IO.File]::WriteAllText($StatePath, ($state | ConvertTo-Json), (Get-Utf8Encoding))
+    # 状态恢复已关闭：保留函数空实现，避免分散调用影响主流程。
+    return
 }
 
 function Read-CaptureState {
-    if ($DisableStateResume -or -not (Test-Path $StatePath)) { return $null }
-    try {
-        $json = [System.IO.File]::ReadAllText($StatePath, (Get-Utf8Encoding))
-        return ($json | ConvertFrom-Json)
-    }
-    catch {
-        Write-Step ("Warning: 无法读取状态文件 {0}：{1}" -f $StatePath, $_.Exception.Message)
-        return $null
-    }
+    return $null
 }
 
 function Clear-CaptureState {
@@ -1786,28 +1770,9 @@ function Capture-NameSeries {
         $personList.Count, (-not $NoOcr), $cfg.SearchBoxX, $cfg.SearchBoxY, $cfg.NameX, $cfg.FirstRowY, $cfg.RowHeight)
 
     $totalSaved = 0
-    $resumeState = Read-CaptureState
-    $resumeName = ''
-    $resumeRow = 0
-    $resumeNameReached = $true
-    if ((Test-StateStageWithinName -State $resumeState) -and -not [string]::IsNullOrWhiteSpace([string]$resumeState.CurrentName)) {
-        $resumeName = [string]$resumeState.CurrentName
-        $resumeRow = [int]$resumeState.CurrentRow
-        $resumeNameReached = $false
-        Write-Step ("将按状态文件恢复：姓名={0}，行号={1}，阶段={2}" -f $resumeName, ($resumeRow + 1), $resumeState.Stage)
-    }
-
     $groups = $personList | Group-Object -Property Name
     foreach ($group in $groups) {
         $searchName = [string]$group.Name
-        if (-not $resumeNameReached) {
-            if ($searchName -ne $resumeName) {
-                Write-Step ("按状态恢复：跳过已越过的姓名 {0}" -f $searchName)
-                continue
-            }
-            $resumeNameReached = $true
-        }
-
         $remaining = New-Object System.Collections.Generic.List[object]
         foreach ($person in $group.Group) { $remaining.Add($person) }
 
@@ -1824,12 +1789,7 @@ function Capture-NameSeries {
 
         $rowSavedForName = 0
         $seenSignatures = @{}
-        $startRow = 0
-        if ($searchName -eq $resumeName -and $resumeRow -gt 0) {
-            $startRow = $resumeRow
-            Write-Step ("按状态恢复：{0} 从第 {1} 行继续。" -f $searchName, ($startRow + 1))
-        }
-        for ($row = $startRow; $row -lt $MaxRowsPerName -and $remaining.Count -gt 0; $row++) {
+        for ($row = 0; $row -lt $MaxRowsPerName -and $remaining.Count -gt 0; $row++) {
             $x = [int]$cfg.NameX
             $y = [int]$cfg.FirstRowY + ($row * [int]$cfg.RowHeight)
 
@@ -2232,21 +2192,10 @@ function Invoke-LoginAndEnterList {
 function Invoke-LoginAndCaptureNames {
     if ($ResetState) {
         Clear-CaptureState
-        Write-Step '已清除上次执行状态，将从登录开始。'
+        Write-Step '已清除上次状态文件。'
     }
-
-    $state = Read-CaptureState
-    $main = Find-MainApplicationWindow $MainWindowTitleRegex
-    if ((Test-StateStageAtOrAfterList -State $state) -and $null -ne $main) {
-        Write-Step ("检测到上次状态为 {0}，且主窗口仍存在；跳过登录和入口点击，直接恢复截图阶段。" -f $state.Stage)
-        Bring-ToFront $main
-    }
-    else {
-        if ($null -ne $state) {
-            Write-Step ("当前状态为 {0}，无法直接从列表恢复；将执行登录/进入列表流程。" -f $state.Stage)
-        }
-        Invoke-LoginAndEnterList
-    }
+    Write-Step '状态恢复已关闭：本次将从登录/进入列表流程开始。'
+    Invoke-LoginAndEnterList
     Capture-NameSeries
 }
 
