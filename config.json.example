@@ -6,6 +6,9 @@
     { "name": "张三", "idCard": "110101199001011234" },
     { "name": "李四", "idCard": "110101199002021234" }
   ],
+  "namesMulti": [
+    { "name": "王五", "idCard": "110101199003031234" }
+  ],
   "loginCalibration": {
     "SwitchLoginX": 0,
     "SwitchLoginY": 0,
@@ -17,6 +20,8 @@
     "LoginButtonY": 0,
     "MainInstitutionX": 0,
     "MainInstitutionY": 0,
+    "MultiInstitutionX": 0,
+    "MultiInstitutionY": 0,
     "SavedAt": ""
   },
   "listCalibration": {

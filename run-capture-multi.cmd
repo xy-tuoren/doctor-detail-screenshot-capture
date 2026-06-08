@@ -1,7 +1,7 @@
 @echo off
 cd /d "%~dp0"
 echo ========================================
-echo   Auto capture [Main]: zhu zhi ye ji gou zai ben yuan yi shi
+echo   Auto capture [Multi]: wai yuan zai ben yuan duo zhi ye yi shi
 echo ========================================
 echo.
 if not exist "%~dp0config.json" (
@@ -12,8 +12,8 @@ if not exist "%~dp0config.json" (
 )
 echo All settings will be read from config.json.
 echo If coordinates are not calibrated, run run-calibrate.cmd first.
-echo Entry: zhu zhi ye ji gou zai ben yuan yi shi
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0capture-doctor-details.ps1" -Mode LoginAndSearchNames -ListEntry Main
+echo Entry: wai yuan zai ben yuan duo zhi ye yi shi
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0capture-doctor-details.ps1" -Mode LoginAndSearchNames -ListEntry Multi
 echo.
 echo Done.
 pause

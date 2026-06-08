@@ -2,6 +2,10 @@
     [ValidateSet('Probe','Prototype','Batch','Search','SearchNames','Calibrate','LoginCalibrate','CalibrateAll','LoginToHome','OpenListAndSearchNames','LoginAndSearchNames','Review')]
     [string]$Mode = 'Probe',
 
+    # 列表入口：Main=主执业机构在本院医师；Multi=外院在本院多执业医师
+    [ValidateSet('Main','Multi')]
+    [string]$ListEntry = 'Main',
+
     [string]$MainWindowTitleRegex = '8\.9\.4|医师电子化注册信息系统',
     [string]$DetailWindowTitleRegex = '信息展示|执业信息|详细信息',
     [string]$ViewDetailButtonRegex = '查看详',
@@ -73,6 +77,18 @@ try {
 }
 catch { }
 
+# 主执业 / 多执业截图分别保存到 captures 子目录（未显式指定 -OutputDir 时）
+$defaultCapturesDir = Join-Path $PSScriptRoot 'captures'
+try {
+    $resolvedOutput = [System.IO.Path]::GetFullPath($OutputDir)
+    $resolvedDefault = [System.IO.Path]::GetFullPath($defaultCapturesDir)
+    if ($resolvedOutput -eq $resolvedDefault) {
+        $subFolder = if ($ListEntry -eq 'Multi') { '多执业' } else { '主执业' }
+        $OutputDir = Join-Path $defaultCapturesDir $subFolder
+    }
+}
+catch { }
+
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Drawing
@@ -111,6 +127,7 @@ if ($Elevate -and -not (Test-IsAdministrator)) {
         '-ExecutionPolicy', 'Bypass',
         '-File', (Quote-Arg $PSCommandPath),
         '-Mode', $Mode,
+        '-ListEntry', $ListEntry,
         '-MainWindowTitleRegex', (Quote-Arg $MainWindowTitleRegex),
         '-DetailWindowTitleRegex', (Quote-Arg $DetailWindowTitleRegex),
         '-ViewDetailButtonRegex', (Quote-Arg $ViewDetailButtonRegex),
@@ -826,7 +843,16 @@ function Apply-AppConfig {
         $script:LoginPassword = [string]$cfgLoginPassword
     }
 
-    $cfgNames = Get-ConfigProperty -Config $cfg -Names @('names', 'Names')
+    if ($ListEntry -eq 'Multi') {
+        # 外院在本院多执业医师：优先读取 namesMulti
+        $cfgNames = Get-ConfigProperty -Config $cfg -Names @('namesMulti', 'NamesMulti')
+        $usedKey = 'namesMulti'
+    }
+    else {
+        # 主执业机构在本院医师：优先 namesMain，向后兼容旧的 names
+        $cfgNames = Get-ConfigProperty -Config $cfg -Names @('namesMain', 'NamesMain', 'names', 'Names')
+        $usedKey = 'namesMain/names'
+    }
     if ($null -ne $cfgNames) {
         $personList = New-Object System.Collections.Generic.List[object]
         Add-PersonsToList -List $personList -RawPersons $cfgNames
@@ -834,6 +860,7 @@ function Apply-AppConfig {
         foreach ($person in $personList) {
             $script:ConfigPersons += $person
         }
+        Write-Step ("名单来源：ListEntry={0}，读取配置项 {1}，共 {2} 人。" -f $ListEntry, $usedKey, $script:ConfigPersons.Count)
     }
 }
 
@@ -1900,7 +1927,34 @@ function Invoke-CaptureNameSeriesWithRecovery {
     }
 }
 
+function Wait-IfPauseRequested {
+    try {
+        $pressed = $false
+        while ([Console]::KeyAvailable) {
+            $key = [Console]::ReadKey($true)
+            if ($key.Key -eq 'Spacebar') { $pressed = $true }
+        }
+        if (-not $pressed) { return }
+
+        Write-Step '已暂停（按【空格】继续）...'
+        while ($true) {
+            Start-Sleep -Milliseconds 200
+            while ([Console]::KeyAvailable) {
+                $k = [Console]::ReadKey($true)
+                if ($k.Key -eq 'Spacebar') {
+                    Write-Step '已恢复运行。'
+                    return
+                }
+            }
+        }
+    }
+    catch {
+        # 控制台不可交互（如输入被重定向）时忽略暂停功能。
+    }
+}
+
 function Capture-NameSeries {
+    Write-Step '提示：运行中可按【空格】暂停，再按【空格】恢复。'
     $allPersons = @(Resolve-PersonList)
     if ($allPersons.Count -eq 0) {
         throw ("请在 config.json 的 names 中配置人员（name + idCard），或使用 -Names / -NamesFile / -SearchName 指定。配置文件：{0}" -f $ConfigPath)
@@ -1909,7 +1963,7 @@ function Capture-NameSeries {
     $pendingResult = Get-PendingPersons -Persons $allPersons
     $personList = @($pendingResult.Pending)
     if ($pendingResult.Skipped -gt 0) {
-        Write-Step ("已跳过 {0} 个已有截图的人员（按 姓名+身份证 匹配 captures 目录）。" -f $pendingResult.Skipped)
+        Write-Step ("已跳过 {0} 个已有截图的人员（按 姓名+身份证 匹配 {1}）。" -f $pendingResult.Skipped, $OutputDir)
     }
     if ($personList.Count -eq 0) {
         Write-Step '所有配置人员均已有截图，无需继续抓取。'
@@ -1929,6 +1983,7 @@ function Capture-NameSeries {
     }
 
     if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
+    Write-Step ("截图保存目录：{0}" -f $OutputDir)
     if (-not $NoOcr) { Initialize-Ocr | Out-Null }
 
     $main = Find-MainApplicationWindow $MainWindowTitleRegex
@@ -1944,6 +1999,7 @@ function Capture-NameSeries {
     $totalSaved = 0
     $groups = $personList | Group-Object -Property Name
     foreach ($group in $groups) {
+        Wait-IfPauseRequested
         $searchName = [string]$group.Name
         $remaining = New-Object System.Collections.Generic.List[object]
         foreach ($person in $group.Group) { $remaining.Add($person) }
@@ -1965,6 +2021,7 @@ function Capture-NameSeries {
         $stopCurrentName = $false
         $previousDetailHash = ''
         for ($row = 0; $row -lt $MaxRowsPerName -and $remaining.Count -gt 0; $row++) {
+            Wait-IfPauseRequested
             $x = [int]$cfg.NameX
             $y = [int]$cfg.FirstRowY + ($row * [int]$cfg.RowHeight)
 
@@ -2144,34 +2201,38 @@ function Invoke-LoginCalibration {
     Write-Step '每一步都会等待你按 Enter 后才记录坐标，并允许确认或重录。'
     Read-Host '登录页准备好后按 Enter 开始校准'
 
-    $switchLogin = Read-CursorPointWithConfirm -Title '登录校准 第1步/5：切换登录方式' -Instruction '把鼠标移到右上角【切换登录方式】链接中间。'
-    $userBox = Read-CursorPointWithConfirm -Title '登录校准 第2步/5：账号输入框' -Instruction '切换到账号登录界面后，把鼠标移到【账号输入框】中间。'
-    $passwordBox = Read-CursorPointWithConfirm -Title '登录校准 第3步/5：密码输入框' -Instruction '把鼠标移到【密码输入框】中间。'
-    $loginButton = Read-CursorPointWithConfirm -Title '登录校准 第4步/5：登录按钮' -Instruction '把鼠标移到【登录】按钮中间。'
+    $switchLogin = Read-CursorPointWithConfirm -Title '登录校准 第1步/6：切换登录方式' -Instruction '把鼠标移到右上角【切换登录方式】链接中间。'
+    $userBox = Read-CursorPointWithConfirm -Title '登录校准 第2步/6：账号输入框' -Instruction '切换到账号登录界面后，把鼠标移到【账号输入框】中间。'
+    $passwordBox = Read-CursorPointWithConfirm -Title '登录校准 第3步/6：密码输入框' -Instruction '把鼠标移到【密码输入框】中间。'
+    $loginButton = Read-CursorPointWithConfirm -Title '登录校准 第4步/6：登录按钮' -Instruction '把鼠标移到【登录】按钮中间。'
 
-    Write-Step '第5步需要校准登录后的主页入口。'
+    Write-Step '第5、6步需要校准登录后的两个列表入口。'
     Write-Step '请先手动登录，等待主页加载完成，然后继续。'
     Read-Host '主页已经加载完成后按 Enter 继续'
-    $mainEntry = Read-CursorPointWithConfirm -Title '登录校准 第5步/5：主执业机构在本院医师入口' -Instruction '把鼠标移到主页左侧【主执业机构在本院医师】入口中间。'
+    $mainEntry = Read-CursorPointWithConfirm -Title '登录校准 第5步/6：主执业机构在本院医师入口' -Instruction '把鼠标移到主页左侧【主执业机构在本院医师】入口中间。'
+    $multiEntry = Read-CursorPointWithConfirm -Title '登录校准 第6步/6：外院在本院多执业医师入口' -Instruction '把鼠标移到【外院在本院多执业医师】入口中间。'
 
     $section = @{
-        SwitchLoginX     = [int]$switchLogin.X
-        SwitchLoginY     = [int]$switchLogin.Y
-        UserX            = [int]$userBox.X
-        UserY            = [int]$userBox.Y
-        PasswordX        = [int]$passwordBox.X
-        PasswordY        = [int]$passwordBox.Y
-        LoginButtonX     = [int]$loginButton.X
-        LoginButtonY     = [int]$loginButton.Y
-        MainInstitutionX = [int]$mainEntry.X
-        MainInstitutionY = [int]$mainEntry.Y
-        SavedAt          = (Get-Date).ToString('s')
+        SwitchLoginX      = [int]$switchLogin.X
+        SwitchLoginY      = [int]$switchLogin.Y
+        UserX             = [int]$userBox.X
+        UserY             = [int]$userBox.Y
+        PasswordX         = [int]$passwordBox.X
+        PasswordY         = [int]$passwordBox.Y
+        LoginButtonX      = [int]$loginButton.X
+        LoginButtonY      = [int]$loginButton.Y
+        MainInstitutionX  = [int]$mainEntry.X
+        MainInstitutionY  = [int]$mainEntry.Y
+        MultiInstitutionX = [int]$multiEntry.X
+        MultiInstitutionY = [int]$multiEntry.Y
+        SavedAt           = (Get-Date).ToString('s')
     }
     Set-ConfigSection -SectionName 'loginCalibration' -SectionData $section
     Write-Step ("登录坐标已保存到 {0} 的 loginCalibration" -f $ConfigPath)
-    Write-Step ("切换=({0},{1}) 账号=({2},{3}) 密码=({4},{5}) 登录=({6},{7}) 入口=({8},{9})" -f `
+    Write-Step ("切换=({0},{1}) 账号=({2},{3}) 密码=({4},{5}) 登录=({6},{7}) 主执业入口=({8},{9}) 外院多执业入口=({10},{11})" -f `
         $section.SwitchLoginX, $section.SwitchLoginY, $section.UserX, $section.UserY, $section.PasswordX, $section.PasswordY, `
-        $section.LoginButtonX, $section.LoginButtonY, $section.MainInstitutionX, $section.MainInstitutionY)
+        $section.LoginButtonX, $section.LoginButtonY, $section.MainInstitutionX, $section.MainInstitutionY, `
+        $section.MultiInstitutionX, $section.MultiInstitutionY)
 }
 
 function Invoke-AllCalibration {
@@ -2398,9 +2459,32 @@ function Invoke-EnterListFromHome {
         }
     }
 
-    Write-CaptureState -Stage 'OpenList' -Message '点击主执业机构入口'
-    Write-Step '点击“主执业机构在本院医师”。'
-    Invoke-ScreenClick -X ([int]$loginCfg.MainInstitutionX) -Y ([int]$loginCfg.MainInstitutionY) -FocusWindow $main
+    Write-Step '激活并最大化医师系统窗口。'
+    Bring-ToFront $main
+    Maximize-Window $main
+    $main = Find-MainApplicationWindow $MainWindowTitleRegex
+    if ($null -eq $main) {
+        throw '最大化窗口后主窗口丢失。'
+    }
+    Bring-ToFront $main
+    Wait-RectStable -Rect $main.Current.BoundingRectangle -TimeoutSeconds $PostLoginWaitSeconds -StableChecks 2 | Out-Null
+
+    if ($ListEntry -eq 'Multi') {
+        $entryX = [int](Get-ConfigProperty -Config $loginCfg -Names @('MultiInstitutionX'))
+        $entryY = [int](Get-ConfigProperty -Config $loginCfg -Names @('MultiInstitutionY'))
+        if ($entryX -le 0 -and $entryY -le 0) {
+            throw '未找到【外院在本院多执业医师】入口坐标。请先运行 run-calibrate.cmd 完成第6步坐标校准。'
+        }
+        Write-CaptureState -Stage 'OpenList' -Message '点击外院在本院多执业医师入口'
+        Write-Step '点击“外院在本院多执业医师”。'
+    }
+    else {
+        $entryX = [int]$loginCfg.MainInstitutionX
+        $entryY = [int]$loginCfg.MainInstitutionY
+        Write-CaptureState -Stage 'OpenList' -Message '点击主执业机构入口'
+        Write-Step '点击“主执业机构在本院医师”。'
+    }
+    Invoke-ScreenClick -X $entryX -Y $entryY -FocusWindow $main
     Start-Sleep -Seconds 2
     $main = Find-MainApplicationWindow $MainWindowTitleRegex
     if ($null -eq $main) {
