@@ -12,8 +12,6 @@ if not exist "%~dp0config.json" (
 )
 echo Please make sure the app is already on the home page.
 echo This will click the doctor list entry and continue screenshots.
-echo Press any key to start...
-pause >nul
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0capture-doctor-details.ps1" -Mode OpenListAndSearchNames
 echo.
 echo Done.

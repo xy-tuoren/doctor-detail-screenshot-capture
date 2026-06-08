@@ -38,6 +38,14 @@
     [int]$CaptureRestMinutes = 5,
     [switch]$NoOcr,
 
+    # 接口异常弹窗自动恢复相关
+    [string]$ErrorLogPath = (Join-Path $PSScriptRoot 'error-popup-log.csv'),
+    [string]$ErrorPopupTextRegex = '非法访问用户身份|禁止\s*Web\s*服务调用|获取详细信息时发生错误|服务调用\(1\)',
+    [string]$ErrorPopupTitleRegex = '提示|错误|异常|警告',
+    [int]$MaxAutoRestarts = 100,
+    [int]$RestartWaitSeconds = 5,
+    [switch]$NoAutoRestart,
+
     # 登录自动化相关
     [string]$AppPath = '',
     [string]$LoginUser = '',
@@ -132,7 +140,12 @@ if ($Elevate -and -not (Test-IsAdministrator)) {
         '-LoginWaitSeconds', $LoginWaitSeconds,
         '-PostLoginWaitSeconds', $PostLoginWaitSeconds,
         '-CaptureRestInterval', $CaptureRestInterval,
-        '-CaptureRestMinutes', $CaptureRestMinutes
+        '-CaptureRestMinutes', $CaptureRestMinutes,
+        '-ErrorLogPath', (Quote-Arg $ErrorLogPath),
+        '-ErrorPopupTextRegex', (Quote-Arg $ErrorPopupTextRegex),
+        '-ErrorPopupTitleRegex', (Quote-Arg $ErrorPopupTitleRegex),
+        '-MaxAutoRestarts', $MaxAutoRestarts,
+        '-RestartWaitSeconds', $RestartWaitSeconds
     )
     if ($Names -and $Names.Count -gt 0) {
         foreach ($n in $Names) { $argParts += '-Names'; $argParts += (Quote-Arg $n) }
@@ -145,6 +158,7 @@ if ($Elevate -and -not (Test-IsAdministrator)) {
     if ($Resume) { $argParts += '-Resume' }
     if ($NoScroll) { $argParts += '-NoScroll' }
     if ($KeepDetailWindowOpen) { $argParts += '-KeepDetailWindowOpen' }
+    if ($NoAutoRestart) { $argParts += '-NoAutoRestart' }
     $argParts = @('-NoExit') + $argParts
     Start-Process powershell.exe -Verb RunAs -ArgumentList ($argParts -join ' ')
     Write-Step '已启动管理员 PowerShell 窗口。请在 UAC 中点「是」，并在新窗口中查看运行日志（窗口会保留，勿在运行中关闭）。'
@@ -1752,6 +1766,140 @@ function Invoke-CaptureBatchRest {
     Write-Step '休息结束，继续抓取。'
 }
 
+$script:NeedRestart = $false
+$script:ErrorPopupCount = 0
+$script:LastErrorPopupTime = $null
+$script:CapturedSinceLastPopup = 0
+$script:ErrorPopupStatsReady = $false
+
+function Append-CsvRowToPath {
+    param(
+        [string]$Path,
+        [pscustomobject]$Row
+    )
+    $enc = Get-Utf8Encoding
+    $csv = @($Row | ConvertTo-Csv -NoTypeInformation)
+    if (Test-Path $Path) {
+        [System.IO.File]::AppendAllText($Path, $csv[1] + [Environment]::NewLine, $enc)
+    }
+    else {
+        [System.IO.File]::WriteAllText($Path, $csv[0] + [Environment]::NewLine + $csv[1] + [Environment]::NewLine, $enc)
+    }
+}
+
+function Initialize-ErrorPopupStats {
+    if ($script:ErrorPopupStatsReady) { return }
+    $script:ErrorPopupStatsReady = $true
+    if (-not (Test-Path $ErrorLogPath)) { return }
+    try {
+        $rows = @(Import-Csv $ErrorLogPath)
+        if ($rows.Count -gt 0) {
+            $script:ErrorPopupCount = $rows.Count
+            try { $script:LastErrorPopupTime = [datetime]$rows[-1].Timestamp } catch { }
+        }
+    }
+    catch { }
+}
+
+function Find-ErrorPopup {
+    foreach ($win in Get-RootWindows) {
+        if ($win.Current.IsOffscreen) { continue }
+        $title = [string]$win.Current.Name
+        $text = ''
+        try { $text = Get-ElementTextSummary $win } catch { }
+        $combined = ($title + ' | ' + $text)
+        if ($combined -match $ErrorPopupTextRegex) {
+            return [pscustomobject]@{ Window = $win; Title = $title; Text = $combined }
+        }
+    }
+    return $null
+}
+
+function Write-ErrorPopupLog {
+    param(
+        [string]$Context = '',
+        [string]$PopupText = ''
+    )
+    Initialize-ErrorPopupStats
+    $now = Get-Date
+    $script:ErrorPopupCount++
+    $secondsSinceLast = ''
+    if ($null -ne $script:LastErrorPopupTime) {
+        $secondsSinceLast = [int]((New-TimeSpan -Start $script:LastErrorPopupTime -End $now).TotalSeconds)
+    }
+    $cleanText = ($PopupText -replace '\s+', ' ').Trim()
+    if ($cleanText.Length -gt 200) { $cleanText = $cleanText.Substring(0, 200) }
+    Append-CsvRowToPath -Path $ErrorLogPath -Row ([pscustomobject]@{
+        Timestamp         = $now.ToString('s')
+        Count             = $script:ErrorPopupCount
+        SecondsSinceLast  = $secondsSinceLast
+        CapturedSinceLast = $script:CapturedSinceLastPopup
+        Context           = $Context
+        PopupText         = $cleanText
+    })
+    Write-Step ("接口异常弹窗第 {0} 次：距上次 {1} 秒，期间成功截图 {2} 张。" -f `
+        $script:ErrorPopupCount, $(if ($secondsSinceLast -eq '') { '—' } else { $secondsSinceLast }), $script:CapturedSinceLastPopup)
+    $script:LastErrorPopupTime = $now
+    $script:CapturedSinceLastPopup = 0
+}
+
+function Stop-DoctorApplication {
+    Write-Step '关闭医师系统应用...'
+    $killed = 0
+    foreach ($proc in Get-Process -ErrorAction SilentlyContinue) {
+        try {
+            $t = $proc.MainWindowTitle
+            if (-not [string]::IsNullOrWhiteSpace($t) -and ($t -match $MainWindowTitleRegex -or $t -match $LoginWindowTitleRegex)) {
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                $killed++
+            }
+        }
+        catch { }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($AppPath) -and (Test-Path $AppPath)) {
+        $procName = [IO.Path]::GetFileNameWithoutExtension($AppPath)
+        foreach ($proc in (Get-Process -Name $procName -ErrorAction SilentlyContinue)) {
+            try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue; $killed++ } catch { }
+        }
+    }
+    Write-Step ("已结束 {0} 个相关进程。" -f $killed)
+    Start-Sleep -Seconds 3
+}
+
+function Restart-DoctorAndEnterList {
+    if ([string]::IsNullOrWhiteSpace($AppPath)) {
+        throw '未配置 appPath，无法自动重启应用。请在 config.json 设置 appPath。'
+    }
+    Stop-DoctorApplication
+    Start-Sleep -Seconds $RestartWaitSeconds
+    Invoke-LoginAndEnterList
+}
+
+function Invoke-CaptureNameSeriesWithRecovery {
+    Initialize-ErrorPopupStats
+    for ($attempt = 0; ; $attempt++) {
+        $script:NeedRestart = $false
+        Capture-NameSeries
+        if (-not $script:NeedRestart) { break }
+        if ($NoAutoRestart) {
+            Write-Step '检测到接口异常弹窗，但已禁用自动重启（-NoAutoRestart），停止。'
+            break
+        }
+        if ($attempt -ge $MaxAutoRestarts) {
+            Write-Step ("已达到最大自动重启次数 {0}，停止。" -f $MaxAutoRestarts)
+            break
+        }
+        Write-Step ("第 {0} 次自动重启：重启应用并恢复抓取..." -f ($attempt + 1))
+        try {
+            Restart-DoctorAndEnterList
+        }
+        catch {
+            Write-Step ("重启失败：{0}" -f $_.Exception.Message)
+            break
+        }
+    }
+}
+
 function Capture-NameSeries {
     $allPersons = @(Resolve-PersonList)
     if ($allPersons.Count -eq 0) {
@@ -1833,6 +1981,13 @@ function Capture-NameSeries {
             }
 
             if ($null -eq $detail) {
+                $popup = Find-ErrorPopup
+                if ($null -ne $popup) {
+                    Write-ErrorPopupLog -Context ("name={0};row={1}" -f $searchName, ($row + 1)) -PopupText $popup.Text
+                    Write-Step '  检测到接口异常弹窗，将重启应用并恢复抓取。'
+                    $script:NeedRestart = $true
+                    return
+                }
                 if ($row -eq 0) { Write-Step ("  未出现详情窗口，'{0}' 可能无结果。" -f $searchName) }
                 else { Write-Step ("  第 {0} 行无更多结果，结束该姓名。" -f ($row + 1)) }
                 break
@@ -1865,7 +2020,7 @@ function Capture-NameSeries {
                             $targetPerson = $remaining[0]
                         }
                         else {
-                            $targetPerson = Find-PersonByOcrIdCard -Candidates @($remaining) -OcrIdCard $ocrIdCard
+                            $targetPerson = Find-PersonByOcrIdCard -Candidates $remaining.ToArray() -OcrIdCard $ocrIdCard
                             if ($null -eq $targetPerson) {
                                 $isUnmatched = $true
                                 Write-Step ("  第 {0} 行未匹配到待抓取身份证（OCR={1}），继续下一行。" -f ($row + 1), $(if ($ocrIdCard) { $ocrIdCard } else { '未识别' }))
@@ -1919,6 +2074,7 @@ function Capture-NameSeries {
                     Write-Step ("  已保存：{0}" -f $fileName)
                     $totalSaved++
                     $rowSavedForName++
+                    $script:CapturedSinceLastPopup++
                     Invoke-CaptureBatchRest -TotalSaved $totalSaved
                 }
             }
@@ -2273,7 +2429,7 @@ function Invoke-OpenListAndCaptureNames {
     }
     Write-Step '将从当前主页点击入口进入列表，然后开始姓名截图。'
     Invoke-EnterListFromHome
-    Capture-NameSeries
+    Invoke-CaptureNameSeriesWithRecovery
 }
 
 function Invoke-LoginAndCaptureNames {
@@ -2283,7 +2439,7 @@ function Invoke-LoginAndCaptureNames {
     }
     Write-Step '状态恢复已关闭：本次将从登录/进入列表流程开始。'
     Invoke-LoginAndEnterList
-    Capture-NameSeries
+    Invoke-CaptureNameSeriesWithRecovery
 }
 
 #endregion
