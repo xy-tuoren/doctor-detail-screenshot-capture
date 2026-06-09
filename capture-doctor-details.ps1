@@ -911,6 +911,53 @@ function Test-ConfigSection {
     return $true
 }
 
+function Get-SectionInt {
+    param(
+        $Section,
+        [string]$FieldName,
+        [int]$Default = 0
+    )
+    if ($null -eq $Section) { return $Default }
+    $val = Get-ConfigProperty -Config $Section -Names @($FieldName)
+    if ($null -eq $val) { return $Default }
+    try { return [int]$val } catch { return $Default }
+}
+
+function Test-CalibrationPointValid {
+    param(
+        [int]$X,
+        [int]$Y
+    )
+    return ($X -gt 0 -and $Y -gt 0)
+}
+
+function Get-CalibrationPointFromSection {
+    param(
+        $Section,
+        [string]$XField,
+        [string]$YField
+    )
+    return [pscustomobject]@{
+        X = (Get-SectionInt -Section $Section -FieldName $XField)
+        Y = (Get-SectionInt -Section $Section -FieldName $YField)
+    }
+}
+
+function Read-CalibrationSkipChoice {
+    param(
+        [string]$Prompt,
+        [switch]$AllowQuit
+    )
+    while ($true) {
+        $hint = if ($AllowQuit) { 'S 跳过，Enter 重新记录，Q 退出' } else { 'S 跳过，Enter 重新记录' }
+        $answer = (Read-Host ("  {0}（{1}）" -f $Prompt, $hint)).Trim().ToUpperInvariant()
+        if ($answer -eq 'S') { return 'Skip' }
+        if ($answer -eq '' -or $answer -eq 'ENTER') { return 'Record' }
+        if ($AllowQuit -and $answer -eq 'Q') { return 'Quit' }
+        Write-Host '  无效输入，请重新选择。'
+    }
+}
+
 function Read-LegacyJsonFile {
     param([string]$Path)
     if (-not (Test-Path $Path)) { return $null }
@@ -1703,16 +1750,32 @@ function Read-CursorPointWithConfirm {
     param(
         [string]$Title,
         [string]$Instruction,
-        [int]$Seconds = $CalibrateCountdown
+        [int]$Seconds = $CalibrateCountdown,
+        [int]$ExistingX = 0,
+        [int]$ExistingY = 0
     )
+
+    $hasExisting = (Test-CalibrationPointValid -X $ExistingX -Y $ExistingY)
 
     while ($true) {
         Write-Host ''
         Write-Step $Title
         Write-Host ("  {0}" -f $Instruction)
-        Write-Host ("  按 Enter 后会开始 {0} 秒倒计时。" -f $Seconds)
-        Write-Host '  倒计时期间请把鼠标移动到目标位置，不要点击；倒计时结束自动记录。'
-        Read-Host '  准备开始时按 Enter' | Out-Null
+        if ($hasExisting) {
+            Write-Host ("  已有坐标：({0},{1})" -f $ExistingX, $ExistingY)
+            $choice = Read-CalibrationSkipChoice -Prompt '准备开始时' -AllowQuit
+            if ($choice -eq 'Skip') {
+                Write-Step ("  已跳过，保留已有坐标：({0},{1})" -f $ExistingX, $ExistingY)
+                return [pscustomobject]@{ X = $ExistingX; Y = $ExistingY }
+            }
+            if ($choice -eq 'Quit') { throw '用户取消坐标校准。' }
+        }
+        else {
+            Write-Host ("  按 Enter 后会开始 {0} 秒倒计时。" -f $Seconds)
+            Write-Host '  倒计时期间请把鼠标移动到目标位置，不要点击；倒计时结束自动记录。'
+            $startChoice = (Read-Host '  准备开始时按 Enter（Q 退出）').Trim().ToUpperInvariant()
+            if ($startChoice -eq 'Q') { throw '用户取消坐标校准。' }
+        }
 
         for ($i = $Seconds; $i -ge 1; $i--) {
             Write-Host ("  {0}..." -f $i)
@@ -1732,19 +1795,89 @@ function Read-CursorPointWithConfirm {
     }
 }
 
+function Read-RowHeightWithConfirm {
+    param(
+        [string]$Title,
+        [string]$Instruction,
+        [int]$FirstRowY,
+        [int]$ExistingRowHeight = 0,
+        [int]$Seconds = $CalibrateCountdown
+    )
+
+    $hasExisting = ($ExistingRowHeight -ge 8)
+
+    while ($true) {
+        Write-Host ''
+        Write-Step $Title
+        Write-Host ("  {0}" -f $Instruction)
+        if ($hasExisting) {
+            Write-Host ("  已有行高：{0}px" -f $ExistingRowHeight)
+            $choice = Read-CalibrationSkipChoice -Prompt '准备开始时' -AllowQuit
+            if ($choice -eq 'Skip') {
+                Write-Step ("  已跳过，保留已有行高：{0}px" -f $ExistingRowHeight)
+                return [pscustomobject]@{
+                    Y = [int]($FirstRowY + $ExistingRowHeight)
+                    RowHeight = [int]$ExistingRowHeight
+                }
+            }
+            if ($choice -eq 'Quit') { throw '用户取消坐标校准。' }
+        }
+        else {
+            Write-Host ("  按 Enter 后会开始 {0} 秒倒计时。" -f $Seconds)
+            Write-Host '  倒计时期间请把鼠标移动到目标位置，不要点击；倒计时结束自动记录。'
+            $startChoice = (Read-Host '  准备开始时按 Enter（Q 退出）').Trim().ToUpperInvariant()
+            if ($startChoice -eq 'Q') { throw '用户取消坐标校准。' }
+        }
+
+        for ($i = $Seconds; $i -ge 1; $i--) {
+            Write-Host ("  {0}..." -f $i)
+            Start-Sleep -Seconds 1
+        }
+
+        $cursor = [System.Windows.Forms.Cursor]::Position
+        $p = [pscustomobject]@{
+            Y = [int]$cursor.Y
+        }
+        Write-Step ("  已记录坐标：Y={0}" -f $p.Y)
+        $answer = (Read-Host '  确认使用这个坐标吗？输入 Y 确认，R 重新记录，Q 退出').Trim().ToUpperInvariant()
+        if ($answer -eq '' -or $answer -eq 'Y') { return $p }
+        if ($answer -eq 'Q') { throw '用户取消坐标校准。' }
+        Write-Step '  将重新记录该步骤。'
+    }
+}
+
 function Invoke-Calibration {
+    $existing = Get-ConfigProperty -Config (Get-AppConfig) -Names @('listCalibration', 'ListCalibration')
+    if ($null -eq $existing) {
+        $existing = Read-LegacyJsonFile -Path $CalibrationPath
+    }
+
     Write-Step '列表坐标校准开始。请保证医师系统已打开，并停留在医师列表页。'
     Write-Step '请先随便搜索一个常见姓名/姓氏，让列表至少显示两行结果。'
+    Write-Step '已有坐标的步骤可输入 S 跳过。'
     Read-Host '列表准备好后按 Enter 开始校准'
 
-    $search = Read-CursorPointWithConfirm -Title '列表校准 第1步/3：医师姓名输入框' -Instruction '把鼠标移到【医师姓名】输入框中间。'
-    $row1 = Read-CursorPointWithConfirm -Title '列表校准 第2步/3：第1行姓名单元格' -Instruction '把鼠标移到列表【第 1 行】的【姓名】单元格中间。'
-    $row2 = Read-CursorPointWithConfirm -Title '列表校准 第3步/3：第2行姓名单元格' -Instruction '把鼠标移到列表【第 2 行】的【姓名】单元格中间。'
+    $existingSearch = Get-CalibrationPointFromSection -Section $existing -XField 'SearchBoxX' -YField 'SearchBoxY'
+    $search = Read-CursorPointWithConfirm -Title '列表校准 第1步/3：医师姓名输入框' -Instruction '把鼠标移到【医师姓名】输入框中间。' `
+        -ExistingX $existingSearch.X -ExistingY $existingSearch.Y
 
-    $rowHeight = [Math]::Abs($row2.Y - $row1.Y)
-    if ($rowHeight -lt 8) {
-        Write-Step ("警告：两行间距太小（{0}px），将使用默认行高 {1}。请确认第1、2行选对了。" -f $rowHeight, $TableRowHeight)
-        $rowHeight = $TableRowHeight
+    $existingRow1 = Get-CalibrationPointFromSection -Section $existing -XField 'NameX' -YField 'FirstRowY'
+    $row1 = Read-CursorPointWithConfirm -Title '列表校准 第2步/3：第1行姓名单元格' -Instruction '把鼠标移到列表【第 1 行】的【姓名】单元格中间。' `
+        -ExistingX $existingRow1.X -ExistingY $existingRow1.Y
+
+    $existingRowHeight = Get-SectionInt -Section $existing -FieldName 'RowHeight'
+    $row2 = Read-RowHeightWithConfirm -Title '列表校准 第3步/3：第2行姓名单元格' -Instruction '把鼠标移到列表【第 2 行】的【姓名】单元格中间。' `
+        -FirstRowY ([int]$row1.Y) -ExistingRowHeight $existingRowHeight
+
+    if ($row2.PSObject.Properties.Name -contains 'RowHeight') {
+        $rowHeight = [int]$row2.RowHeight
+    }
+    else {
+        $rowHeight = [Math]::Abs($row2.Y - $row1.Y)
+        if ($rowHeight -lt 8) {
+            Write-Step ("警告：两行间距太小（{0}px），将使用默认行高 {1}。请确认第1、2行选对了。" -f $rowHeight, $TableRowHeight)
+            $rowHeight = $TableRowHeight
+        }
     }
 
     $section = @{
@@ -2197,20 +2330,43 @@ function Get-LoginCalibration {
 }
 
 function Invoke-LoginCalibration {
+    $existing = Get-ConfigProperty -Config (Get-AppConfig) -Names @('loginCalibration', 'LoginCalibration')
+    if ($null -eq $existing) {
+        $existing = Read-LegacyJsonFile -Path $LoginConfigPath
+    }
+
     Write-Step '登录坐标校准开始。请打开医师系统登录页。'
     Write-Step '每一步都会等待你按 Enter 后才记录坐标，并允许确认或重录。'
+    Write-Step '已有坐标的步骤可输入 S 跳过。'
     Read-Host '登录页准备好后按 Enter 开始校准'
 
-    $switchLogin = Read-CursorPointWithConfirm -Title '登录校准 第1步/6：切换登录方式' -Instruction '把鼠标移到右上角【切换登录方式】链接中间。'
-    $userBox = Read-CursorPointWithConfirm -Title '登录校准 第2步/6：账号输入框' -Instruction '切换到账号登录界面后，把鼠标移到【账号输入框】中间。'
-    $passwordBox = Read-CursorPointWithConfirm -Title '登录校准 第3步/6：密码输入框' -Instruction '把鼠标移到【密码输入框】中间。'
-    $loginButton = Read-CursorPointWithConfirm -Title '登录校准 第4步/6：登录按钮' -Instruction '把鼠标移到【登录】按钮中间。'
+    $existingSwitchLogin = Get-CalibrationPointFromSection -Section $existing -XField 'SwitchLoginX' -YField 'SwitchLoginY'
+    $switchLogin = Read-CursorPointWithConfirm -Title '登录校准 第1步/6：切换登录方式' -Instruction '把鼠标移到右上角【切换登录方式】链接中间。' `
+        -ExistingX $existingSwitchLogin.X -ExistingY $existingSwitchLogin.Y
+
+    $existingUser = Get-CalibrationPointFromSection -Section $existing -XField 'UserX' -YField 'UserY'
+    $userBox = Read-CursorPointWithConfirm -Title '登录校准 第2步/6：账号输入框' -Instruction '切换到账号登录界面后，把鼠标移到【账号输入框】中间。' `
+        -ExistingX $existingUser.X -ExistingY $existingUser.Y
+
+    $existingPassword = Get-CalibrationPointFromSection -Section $existing -XField 'PasswordX' -YField 'PasswordY'
+    $passwordBox = Read-CursorPointWithConfirm -Title '登录校准 第3步/6：密码输入框' -Instruction '把鼠标移到【密码输入框】中间。' `
+        -ExistingX $existingPassword.X -ExistingY $existingPassword.Y
+
+    $existingLoginButton = Get-CalibrationPointFromSection -Section $existing -XField 'LoginButtonX' -YField 'LoginButtonY'
+    $loginButton = Read-CursorPointWithConfirm -Title '登录校准 第4步/6：登录按钮' -Instruction '把鼠标移到【登录】按钮中间。' `
+        -ExistingX $existingLoginButton.X -ExistingY $existingLoginButton.Y
 
     Write-Step '第5、6步需要校准登录后的两个列表入口。'
     Write-Step '请先手动登录，等待主页加载完成，然后继续。'
     Read-Host '主页已经加载完成后按 Enter 继续'
-    $mainEntry = Read-CursorPointWithConfirm -Title '登录校准 第5步/6：主执业机构在本院医师入口' -Instruction '把鼠标移到主页左侧【主执业机构在本院医师】入口中间。'
-    $multiEntry = Read-CursorPointWithConfirm -Title '登录校准 第6步/6：外院在本院多执业医师入口' -Instruction '把鼠标移到【外院在本院多执业医师】入口中间。'
+
+    $existingMainEntry = Get-CalibrationPointFromSection -Section $existing -XField 'MainInstitutionX' -YField 'MainInstitutionY'
+    $mainEntry = Read-CursorPointWithConfirm -Title '登录校准 第5步/6：主执业机构在本院医师入口' -Instruction '把鼠标移到主页左侧【主执业机构在本院医师】入口中间。' `
+        -ExistingX $existingMainEntry.X -ExistingY $existingMainEntry.Y
+
+    $existingMultiEntry = Get-CalibrationPointFromSection -Section $existing -XField 'MultiInstitutionX' -YField 'MultiInstitutionY'
+    $multiEntry = Read-CursorPointWithConfirm -Title '登录校准 第6步/6：外院在本院多执业医师入口' -Instruction '把鼠标移到【外院在本院多执业医师】入口中间。' `
+        -ExistingX $existingMultiEntry.X -ExistingY $existingMultiEntry.Y
 
     $section = @{
         SwitchLoginX      = [int]$switchLogin.X
@@ -2238,7 +2394,7 @@ function Invoke-LoginCalibration {
 function Invoke-AllCalibration {
     Write-Step '统一坐标校准开始。'
     Write-Step '本流程会依次完成：登录坐标校准 -> 列表截图坐标校准。'
-    Write-Step '每个点位都需要你按 Enter 开始记录，并可以确认或重录。'
+    Write-Step '每个点位都可以确认或重录；已有有效坐标的步骤可输入 S 跳过。'
     Read-Host '准备好后按 Enter 开始登录坐标校准'
     Invoke-LoginCalibration
 
