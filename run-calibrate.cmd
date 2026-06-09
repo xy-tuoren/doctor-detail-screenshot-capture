@@ -13,7 +13,7 @@ if not exist "%~dp0config.json" (
 echo Open the doctor app login page first.
 echo The script will guide you through each calibration step.
 echo.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0capture-doctor-details.ps1" -Mode CalibrateAll
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\capture-doctor-details.ps1" -Mode CalibrateAll
 if errorlevel 1 (
   echo.
   echo [ERROR] Calibration failed. See messages above.

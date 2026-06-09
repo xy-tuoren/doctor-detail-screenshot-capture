@@ -11,7 +11,7 @@ if not exist "%~dp0config.json" (
   exit /b 1
 )
 echo All settings will be read from config.json.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0capture-doctor-details.ps1" -Mode LoginToHome
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\capture-doctor-details.ps1" -Mode LoginToHome
 echo.
 echo Done. The app should now be on the home page.
 pause

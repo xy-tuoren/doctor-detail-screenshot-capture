@@ -10,12 +10,12 @@
     [string]$DetailWindowTitleRegex = '信息展示|执业信息|详细信息',
     [string]$ViewDetailButtonRegex = '查看详',
 
-    [string]$OutputDir = (Join-Path $PSScriptRoot 'captures'),
-    [string]$LogPath = (Join-Path $PSScriptRoot 'capture-log.csv'),
-    [string]$CalibrationPath = (Join-Path $PSScriptRoot 'calibration.json'),
-    [string]$LoginConfigPath = (Join-Path $PSScriptRoot 'login-calibration.json'),
-    [string]$ConfigPath = (Join-Path $PSScriptRoot 'config.json'),
-    [string]$StatePath = (Join-Path $PSScriptRoot 'capture-state.json'),
+    [string]$OutputDir = '',
+    [string]$LogPath = '',
+    [string]$CalibrationPath = '',
+    [string]$LoginConfigPath = '',
+    [string]$ConfigPath = '',
+    [string]$StatePath = '',
 
     [int]$StartIndex = 1,
     [int]$Limit = 0,
@@ -43,7 +43,7 @@
     [switch]$NoOcr,
 
     # 接口异常弹窗自动恢复相关
-    [string]$ErrorLogPath = (Join-Path $PSScriptRoot 'error-popup-log.csv'),
+    [string]$ErrorLogPath = '',
     [string]$ErrorPopupTextRegex = '非法访问用户身份|禁止\s*Web\s*服务调用|获取详细信息时发生错误|服务调用\(1\)',
     [string]$ErrorPopupTitleRegex = '提示|错误|异常|警告',
     [int]$MaxAutoRestarts = 100,
@@ -77,8 +77,21 @@ try {
 }
 catch { }
 
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
+$LogsDir = Join-Path $ProjectRoot 'logs'
+if (-not (Test-Path $LogsDir)) {
+    New-Item -ItemType Directory -Path $LogsDir -Force | Out-Null
+}
+if ([string]::IsNullOrWhiteSpace($OutputDir)) { $OutputDir = Join-Path $ProjectRoot 'captures' }
+if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = Join-Path $LogsDir 'capture-log.csv' }
+if ([string]::IsNullOrWhiteSpace($CalibrationPath)) { $CalibrationPath = Join-Path $ProjectRoot 'calibration.json' }
+if ([string]::IsNullOrWhiteSpace($LoginConfigPath)) { $LoginConfigPath = Join-Path $ProjectRoot 'login-calibration.json' }
+if ([string]::IsNullOrWhiteSpace($ConfigPath)) { $ConfigPath = Join-Path $ProjectRoot 'config.json' }
+if ([string]::IsNullOrWhiteSpace($StatePath)) { $StatePath = Join-Path $LogsDir 'capture-state.json' }
+if ([string]::IsNullOrWhiteSpace($ErrorLogPath)) { $ErrorLogPath = Join-Path $LogsDir 'error-popup-log.csv' }
+
 # 主执业 / 多执业截图分别保存到 captures 子目录（未显式指定 -OutputDir 时）
-$defaultCapturesDir = Join-Path $PSScriptRoot 'captures'
+$defaultCapturesDir = Join-Path $ProjectRoot 'captures'
 try {
     $resolvedOutput = [System.IO.Path]::GetFullPath($OutputDir)
     $resolvedDefault = [System.IO.Path]::GetFullPath($defaultCapturesDir)
@@ -1629,9 +1642,15 @@ function Get-DetailFieldsFromOcrText {
         $name = $Matches[1]
     }
 
-    $idMatches = [regex]::Matches($Text, '(?<!\d)\d{17}[\dXx](?!\d)')
+    $idMatches = [regex]::Matches($Text, '(?<![\dXx])(?:\d{17}[\dXx]|\d{15})(?![\dXx])')
     if ($idMatches.Count -gt 0) {
-        $idCard = $idMatches[0].Value.ToUpperInvariant()
+        $eighteen = @($idMatches | ForEach-Object { $_.Value } | Where-Object { $_.Length -eq 18 })
+        if ($eighteen.Count -gt 0) {
+            $idCard = $eighteen[0].ToUpperInvariant()
+        }
+        else {
+            $idCard = $idMatches[0].Value.ToUpperInvariant()
+        }
     }
 
     $digits = [regex]::Matches($Text, '\d+') | ForEach-Object { $_.Value }
@@ -2150,6 +2169,7 @@ function Capture-NameSeries {
 
         $rowSavedForName = 0
         $seenSignatures = @{}
+        $seenOcrIdCards = @{}
         $consecutiveRowFailures = 0
         $stopCurrentName = $false
         $previousDetailHash = ''
@@ -2206,15 +2226,33 @@ function Capture-NameSeries {
                             $ocrIdCard = $fields.IdCard
                         }
 
-                        if ($remaining.Count -eq 1) {
+                        if (-not $NoOcr) {
+                            if ([string]::IsNullOrWhiteSpace($ocrIdCard)) {
+                                $isUnmatched = $true
+                                Write-Step ("  第 {0} 行未识别到身份证号，跳过。" -f ($row + 1))
+                            }
+                            else {
+                                $normOcrId = Normalize-IdCard $ocrIdCard
+                                if ($seenOcrIdCards.ContainsKey($normOcrId)) {
+                                    $isUnmatched = $true
+                                    Write-Step ("  第 {0} 行列表重复出现身份证 {1}，跳过。" -f ($row + 1), $normOcrId)
+                                }
+                                else {
+                                    $targetPerson = Find-PersonByOcrIdCard -Candidates $remaining.ToArray() -OcrIdCard $ocrIdCard
+                                    if ($null -eq $targetPerson) {
+                                        $isUnmatched = $true
+                                        Write-Step ("  第 {0} 行身份证 {1} 不在待抓取名单，跳过。" -f ($row + 1), $normOcrId)
+                                    }
+                                }
+                            }
+                        }
+                        elseif ($remaining.Count -eq 1) {
                             $targetPerson = $remaining[0]
+                            Write-Step ("  警告：未启用 OCR，按待抓取顺序保存第 1 人。")
                         }
                         else {
-                            $targetPerson = Find-PersonByOcrIdCard -Candidates $remaining.ToArray() -OcrIdCard $ocrIdCard
-                            if ($null -eq $targetPerson) {
-                                $isUnmatched = $true
-                                Write-Step ("  第 {0} 行未匹配到待抓取身份证（OCR={1}），继续下一行。" -f ($row + 1), $(if ($ocrIdCard) { $ocrIdCard } else { '未识别' }))
-                            }
+                            $isUnmatched = $true
+                            Write-Step ("  第 {0} 行同名待抓取 {1} 人，未启用 OCR 无法区分，跳过。" -f ($row + 1), $remaining.Count)
                         }
 
                         if ($null -ne $targetPerson) {
@@ -2238,6 +2276,9 @@ function Capture-NameSeries {
                                 $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
                                 $fileName = [IO.Path]::GetFileName($path)
                                 [void]$remaining.Remove($targetPerson)
+                                if (-not $NoOcr) {
+                                    $seenOcrIdCards[(Normalize-IdCard $targetPerson.IdCard)] = $true
+                                }
                                 Write-CaptureState -Stage 'SearchName' -CurrentName $searchName -CurrentRow ($row + 1) -CurrentIdCard $targetPerson.IdCard -Message '已保存当前人员，继续下一行'
                             }
                         }

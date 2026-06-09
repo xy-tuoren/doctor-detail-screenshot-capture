@@ -12,7 +12,7 @@ if not exist "%~dp0config.json" (
 )
 echo Please make sure the app is already on the home page.
 echo Entry: zhu zhi ye ji gou zai ben yuan yi shi (reads names / namesMain)
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0capture-doctor-details.ps1" -Mode OpenListAndSearchNames -ListEntry Main
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\capture-doctor-details.ps1" -Mode OpenListAndSearchNames -ListEntry Main
 echo.
 echo Done.
 pause

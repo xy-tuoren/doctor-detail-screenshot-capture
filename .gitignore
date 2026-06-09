@@ -1,11 +1,16 @@
 # 截图输出
 captures/
 
-# 运行日志
-capture-log.csv
+# 运行日志与校验报告
+logs/
+
+# Python OCR 环境
+.venv/
+scripts/__pycache__/
 
 # 本地校准配置（窗口坐标因机器而异）
 calibration.json
+login-calibration.json
 
 # 姓名输入列表（敏感数据）
 name.txt
