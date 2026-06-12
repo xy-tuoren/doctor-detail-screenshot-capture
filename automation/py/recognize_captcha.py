@@ -168,7 +168,7 @@ def main() -> int:
     try:
         text = recognize_captcha(path)
     except ImportError:
-        print("ddddocr not installed. Run scripts/setup-ocr-env.ps1 first.", file=sys.stderr)
+        print("ddddocr not installed. Run automation\\ps1\\setup-ocr-env.ps1 first.", file=sys.stderr)
         return 1
 
     if text:

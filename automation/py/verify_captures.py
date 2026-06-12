@@ -529,7 +529,7 @@ def threads_per_worker(workers: int) -> int:
 
 def main() -> int:
     args = build_parser().parse_args()
-    project_root = Path(__file__).resolve().parent.parent
+    project_root = Path(__file__).resolve().parent.parent.parent
     captures_dir = (project_root / args.captures_dir).resolve()
     report_path = (project_root / args.report).resolve()
     report_path.parent.mkdir(parents=True, exist_ok=True)

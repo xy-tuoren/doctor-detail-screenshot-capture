@@ -31,5 +31,18 @@
     "FirstRowY": 0,
     "RowHeight": 31,
     "SavedAt": ""
+  },
+  "doctorApi": {
+    "_note": "上层 API 业务配置，由 src/api 与 cmd/api 使用",
+    "baseUrl": "http://imax.lianouyiyuan.com",
+    "nonce": "1486837976",
+    "timestamp": "1597991281",
+    "sign": "09149C743CDEEB7FB8E688701AD0349F013AF2FB",
+    "headerSign": "lo",
+    "pageSize": 100,
+    "outputDir": "exports",
+    "requestTimeoutSeconds": 60,
+    "retryCount": 3,
+    "retryDelaySeconds": 2
   }
 }

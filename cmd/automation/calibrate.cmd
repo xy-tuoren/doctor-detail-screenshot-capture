@@ -1,5 +1,5 @@
 @echo off
-set "ROOT=%~dp0.."
+set "ROOT=%~dp0..\.."
 cd /d "%ROOT%"
 echo ========================================
 echo   Coordinate calibration (login + list)
@@ -14,7 +14,7 @@ if not exist "%ROOT%\config.json" (
 echo Open the doctor app login page first.
 echo The script will guide you through each calibration step.
 echo.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\scripts\capture-doctor-details.ps1" -Mode CalibrateAll
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\automation\ps1\capture-doctor-details.ps1" -Mode CalibrateAll
 if errorlevel 1 (
   echo.
   echo [ERROR] Calibration failed. See messages above.
@@ -22,5 +22,5 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
-echo Calibration done. You can run cmd\run-capture.cmd to start capture.
+echo Calibration done. You can run cmd\automation\capture.cmd to start capture.
 pause

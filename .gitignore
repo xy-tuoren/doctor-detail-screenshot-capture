@@ -6,7 +6,7 @@ logs/
 
 # Python OCR 环境
 .venv/
-scripts/__pycache__/
+**/__pycache__/
 
 # 本地校准配置（窗口坐标因机器而异）
 calibration.json

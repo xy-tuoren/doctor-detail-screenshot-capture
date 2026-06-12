@@ -83,7 +83,8 @@ try {
 }
 catch { }
 
-$ProjectRoot = Split-Path -Parent $PSScriptRoot
+$AutomationRoot = Split-Path -Parent $PSScriptRoot
+$ProjectRoot = Split-Path -Parent $AutomationRoot
 $LogsDir = Join-Path $ProjectRoot 'logs'
 if (-not (Test-Path $LogsDir)) {
     New-Item -ItemType Directory -Path $LogsDir -Force | Out-Null
@@ -395,7 +396,7 @@ function Write-MainWindowNotFoundHelp {
     Write-Step 'Main window not found.'
     if (Test-IsAdministrator) {
         Write-Step 'This PowerShell is elevated (Administrator). If the doctor app is a normal window, Windows blocks automation across privilege levels.'
-        Write-Step 'Close the admin window and run: .\cmd\run-capture.cmd'
+        Write-Step 'Close the admin window and run: .\cmd\automation\capture.cmd'
     }
     else {
         Write-Step 'Open the doctor registration app and stay on the list page, then run again.'
@@ -2191,7 +2192,7 @@ function Invoke-Calibration {
     Set-ConfigSection -SectionName 'listCalibration' -SectionData $section
     Write-Step ("列表坐标已保存到 {0} 的 listCalibration" -f $ConfigPath)
     Write-Step ("搜索框=({0},{1}) 姓名列X={2} 首行Y={3} 行高={4}" -f $section.SearchBoxX, $section.SearchBoxY, $section.NameX, $section.FirstRowY, $section.RowHeight)
-    Write-Step '现在可以运行： .\\cmd\\run-capture.cmd'
+    Write-Step '现在可以运行： .\\cmd\\automation\\capture.cmd'
 }
 
 function Invoke-NameSearchInput {
@@ -2520,7 +2521,7 @@ function Capture-NameSeries {
 
     $cfg = Get-Calibration
     if ($null -eq $cfg) {
-        Write-Step ("未找到有效列表坐标，请在 config.json 的 listCalibration 中配置，或运行 cmd\run-calibrate.cmd。")
+        Write-Step ("未找到有效列表坐标，请在 config.json 的 listCalibration 中配置，或运行 cmd\automation\calibrate.cmd。")
         throw 'Calibration required.'
     }
 
@@ -2635,14 +2636,21 @@ function Capture-NameSeries {
                             else {
                                 $normOcrId = Normalize-IdCard $ocrIdCard
                                 if ($seenOcrIdCards.ContainsKey($normOcrId)) {
-                                    $isUnmatched = $true
-                                    Write-Step ("  第 {0} 行列表重复出现身份证 {1}，跳过。" -f ($row + 1), $normOcrId)
+                                    $stopCurrentName = $true
+                                    Write-Step ("  第 {0} 行再次出现身份证 {1}，判定列表无更多新结果，结束该姓名。" -f ($row + 1), $normOcrId)
                                 }
                                 else {
+                                    $seenOcrIdCards[$normOcrId] = $true
                                     $targetPerson = Find-PersonByOcrIdCard -Candidates $remaining.ToArray() -OcrIdCard $ocrIdCard
                                     if ($null -eq $targetPerson) {
                                         $isUnmatched = $true
                                         Write-Step ("  第 {0} 行身份证 {1} 不在待抓取名单，跳过。" -f ($row + 1), $normOcrId)
+                                        $capturedProbe = [pscustomobject]@{ Name = $searchName; IdCard = $normOcrId }
+                                        if ($remaining.Count -eq 1 -and (Test-PersonAlreadyCaptured -Person $capturedProbe)) {
+                                            $stopCurrentName = $true
+                                            $pendingId = Normalize-IdCard $remaining[0].IdCard
+                                            Write-Step ("  搜索结果为已截图人员；待抓取的 {0} 未出现在列表中，结束该姓名。" -f $pendingId)
+                                        }
                                     }
                                 }
                             }
@@ -2677,9 +2685,6 @@ function Capture-NameSeries {
                                 $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
                                 $fileName = [IO.Path]::GetFileName($path)
                                 [void]$remaining.Remove($targetPerson)
-                                if (-not $NoOcr) {
-                                    $seenOcrIdCards[(Normalize-IdCard $targetPerson.IdCard)] = $true
-                                }
                                 Write-CaptureState -Stage 'SearchName' -CurrentName $searchName -CurrentRow ($row + 1) -CurrentIdCard $targetPerson.IdCard -Message '已保存当前人员，继续下一行'
                             }
                         }
@@ -2978,7 +2983,7 @@ function Invoke-LoginToHome {
     Write-CaptureState -Stage 'Login' -Message '准备登录'
     $loginCfg = Get-LoginCalibration
     if ($null -eq $loginCfg) {
-        Write-Step ("未找到有效登录坐标，请在 config.json 的 loginCalibration 中配置，或运行 cmd\run-calibrate.cmd。")
+        Write-Step ("未找到有效登录坐标，请在 config.json 的 loginCalibration 中配置，或运行 cmd\automation\calibrate.cmd。")
         throw 'Login calibration required.'
     }
     if ([string]::IsNullOrWhiteSpace($LoginUser)) {
@@ -3048,7 +3053,7 @@ function Invoke-EnterListFromHome {
 
     $loginCfg = Get-LoginCalibration
     if ($null -eq $loginCfg) {
-        Write-Step ("未找到有效登录坐标，请在 config.json 的 loginCalibration 中配置，或运行 cmd\run-calibrate.cmd。")
+        Write-Step ("未找到有效登录坐标，请在 config.json 的 loginCalibration 中配置，或运行 cmd\automation\calibrate.cmd。")
         throw 'Login calibration required.'
     }
 
@@ -3075,7 +3080,7 @@ function Invoke-EnterListFromHome {
         $entryX = [int](Get-ConfigProperty -Config $loginCfg -Names @('MultiInstitutionX'))
         $entryY = [int](Get-ConfigProperty -Config $loginCfg -Names @('MultiInstitutionY'))
         if ($entryX -le 0 -and $entryY -le 0) {
-            throw '未找到【外院在本院多执业医师】入口坐标。请先运行 cmd\run-calibrate.cmd 完成第6步坐标校准。'
+            throw '未找到【外院在本院多执业医师】入口坐标。请先运行 cmd\automation\calibrate.cmd 完成第6步坐标校准。'
         }
         Write-CaptureState -Stage 'OpenList' -Message '点击外院在本院多执业医师入口'
         Write-Step '点击“外院在本院多执业医师”。'
@@ -3205,9 +3210,9 @@ function Start-CaptchaOcrServer {
     }
 
     $python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
-    $ocrScript = Join-Path $PSScriptRoot 'recognize_captcha.py'
+    $ocrScript = Join-Path $AutomationRoot 'py\recognize_captcha.py'
     if (-not (Test-Path $python)) {
-        throw 'OCR venv not found. Run scripts\setup-ocr-env.ps1 first.'
+        throw 'OCR venv not found. Run automation\ps1\setup-ocr-env.ps1 first.'
     }
     if (-not (Test-Path $ocrScript)) {
         throw "Missing captcha OCR script: $ocrScript"
@@ -3252,7 +3257,7 @@ function Invoke-CaptchaOcrDirect {
     param([string]$ImagePath)
 
     $python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
-    $ocrScript = Join-Path $PSScriptRoot 'recognize_captcha.py'
+    $ocrScript = Join-Path $AutomationRoot 'py\recognize_captcha.py'
     $output = & $python $ocrScript $ImagePath 2>$null
     if ($null -eq $output) { return '' }
     return ([string]($output | Select-Object -Last 1)).Trim()
@@ -4403,7 +4408,7 @@ function Invoke-MainExportFlow {
 
         $exportCfg = Get-ExportCalibration
         if ($null -eq $exportCfg) {
-            throw '未找到有效导出坐标。请先运行 cmd\run-export-calibrate.cmd 完成校准。'
+            throw '未找到有效导出坐标。请先运行 cmd\automation\export-calibrate.cmd 完成校准。'
         }
 
         $outDir = Get-ExportOutputDir
@@ -4448,7 +4453,7 @@ function Invoke-MainExportFlow {
         Bring-ToFront $main
 
         if (-not (Wait-UntilListReadyForExport -MainWindow $main -ExportCfg $exportCfg)) {
-            throw '验证码仍未关闭或列表未就绪，无法导出。请重新运行 cmd\run-export.cmd。'
+            throw '验证码仍未关闭或列表未就绪，无法导出。请重新运行 cmd\automation\export.cmd。'
         }
 
         Write-Step '点击【导出】。'
@@ -4461,7 +4466,7 @@ function Invoke-MainExportFlow {
             $state = Get-ExportFlowState -MainWindow $main -ExportCfg $exportCfg -DeepCheck
             Write-ExportFlowState $state
             if ($state.State -eq 'CaptchaDialog') {
-                throw '验证码输入错误，导出未开始。请重新运行 cmd\run-export.cmd。'
+                throw '验证码输入错误，导出未开始。请重新运行 cmd\automation\export.cmd。'
             }
             throw '保存导出文件失败，请检查另存为对话框或导出目录权限。'
         }
@@ -4483,7 +4488,7 @@ function Invoke-MultiExportFlow {
 
     $exportCfg = Get-ExportCalibration -RequireMulti
     if ($null -eq $exportCfg) {
-        throw '未找到多执业导出坐标（MultiExportX/Y）。请运行 cmd\run-export-calibrate.cmd 完成第 8 步校准。'
+        throw '未找到多执业导出坐标（MultiExportX/Y）。请运行 cmd\automation\export-calibrate.cmd 完成第 8 步校准。'
     }
 
     $outDir = Get-ExportOutputDir

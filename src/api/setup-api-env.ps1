@@ -1,5 +1,5 @@
 param(
-    [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot)
+    [string]$ProjectRoot = (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 )
 
 Set-StrictMode -Version 2.0
@@ -30,7 +30,7 @@ function Find-PythonExecutable {
 }
 
 $venvPython = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
-$requirements = Join-Path $ProjectRoot 'scripts\requirements-ocr.txt'
+$requirements = Join-Path $ProjectRoot 'requirements\api.txt'
 
 if (-not (Test-Path $requirements)) {
     throw "Missing requirements file: $requirements"
@@ -49,11 +49,11 @@ if (-not (Test-Path $venvPython)) {
     }
 }
 
-Write-Step 'Installing OCR dependencies into project .venv ...'
+Write-Step 'Installing API export dependencies into project .venv ...'
 & $venvPython -m pip install --upgrade pip
 & $venvPython -m pip install -r $requirements
 if ($LASTEXITCODE -ne 0) {
-    throw 'Failed to install OCR dependencies'
+    throw 'Failed to install API dependencies'
 }
 
-Write-Step 'OCR environment ready.'
+Write-Step 'API environment ready.'

@@ -1,6 +1,7 @@
-$ProjectRoot = Split-Path -Parent $PSScriptRoot
+$AutomationRoot = Split-Path -Parent $PSScriptRoot
+$ProjectRoot = Split-Path -Parent $AutomationRoot
 $python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
-$ocrScript = Join-Path $PSScriptRoot 'recognize_captcha.py'
+$ocrScript = Join-Path $AutomationRoot 'py\recognize_captcha.py'
 $img = Join-Path $ProjectRoot 'logs\captcha-last.png'
 
 Write-Host "python: $python"
