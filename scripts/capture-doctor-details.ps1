@@ -1,5 +1,5 @@
 ﻿param(
-    [ValidateSet('Probe','Prototype','Batch','Search','SearchNames','Calibrate','LoginCalibrate','CalibrateAll','LoginToHome','OpenListAndSearchNames','LoginAndSearchNames','Review')]
+    [ValidateSet('Probe','Prototype','Batch','Search','SearchNames','Calibrate','LoginCalibrate','CalibrateAll','LoginToHome','OpenListAndSearchNames','LoginAndSearchNames','Review','Export','ExportCalibrate')]
     [string]$Mode = 'Probe',
 
     # 列表入口：Main=主执业机构在本院医师；Multi=外院在本院多执业医师
@@ -41,6 +41,12 @@
     [int]$CaptureRestInterval = 100,
     [int]$CaptureRestMinutes = 5,
     [switch]$NoOcr,
+
+    # 数据导出相关
+    [string]$ExportDir = '',
+    [int]$MaxCaptchaRetries = 6,
+    [int]$LoadingWaitSeconds = 120,
+    [switch]$KeepAppOpen,
 
     # 接口异常弹窗自动恢复相关
     [string]$ErrorLogPath = '',
@@ -115,6 +121,112 @@ public static class NativeWin32 {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    public const int VK_SPACE = 0x20;
+    public const int VK_CONTROL = 0x11;
+}
+"@
+
+Add-Type -ReferencedAssemblies System.Windows.Forms,System.Drawing @"
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
+
+public static class CapturePauseSignal {
+    static int _toggleRequested;
+    public static void RequestToggle() {
+        Interlocked.Exchange(ref _toggleRequested, 1);
+    }
+    public static bool ConsumeToggleRequest() {
+        return Interlocked.Exchange(ref _toggleRequested, 0) == 1;
+    }
+}
+
+public class GlobalPauseHotkeyForm : Form {
+    const int WM_HOTKEY = 0x0312;
+    const int HotkeyId = 0x4CA1;
+    const uint ModControl = 0x0002;
+    const uint ModNoRepeat = 0x4000;
+    const uint VkSpace = 0x20;
+
+    [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+    [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+    protected override void OnLoad(EventArgs e) {
+        base.OnLoad(e);
+        RegisterHotKey(Handle, HotkeyId, ModControl | ModNoRepeat, VkSpace);
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e) {
+        UnregisterHotKey(Handle, HotkeyId);
+        base.OnFormClosed(e);
+    }
+
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HotkeyId) {
+            CapturePauseSignal.RequestToggle();
+            return;
+        }
+        base.WndProc(ref m);
+    }
+
+    protected override CreateParams CreateParams {
+        get {
+            CreateParams cp = base.CreateParams;
+            cp.ExStyle |= 0x80;
+            return cp;
+        }
+    }
+}
+
+public static class GlobalPauseHotkeyHost {
+    static Thread _thread;
+    static GlobalPauseHotkeyForm _form;
+    static volatile bool _started;
+
+    public static bool Start() {
+        if (_started) { return true; }
+        _thread = new Thread(() => {
+            Application.EnableVisualStyles();
+            _form = new GlobalPauseHotkeyForm();
+            _form.ShowInTaskbar = false;
+            _form.FormBorderStyle = FormBorderStyle.FixedToolWindow;
+            _form.StartPosition = FormStartPosition.Manual;
+            _form.Location = new Point(-32000, -32000);
+            _form.Size = new Size(1, 1);
+            _form.Opacity = 0;
+            Application.Run(_form);
+        });
+        _thread.IsBackground = true;
+        _thread.SetApartmentState(ApartmentState.STA);
+        _thread.Start();
+        for (int i = 0; i < 100; i++) {
+            if (_form != null && _form.IsHandleCreated) {
+                _started = true;
+                return true;
+            }
+            Thread.Sleep(20);
+        }
+        return false;
+    }
+
+    public static void Stop() {
+        if (!_started) { return; }
+        try {
+            if (_form != null && _form.IsHandleCreated) {
+                _form.Invoke(new Action(() => {
+                    _form.Close();
+                    Application.ExitThread();
+                }));
+            }
+        }
+        catch { }
+        _started = false;
+        _form = null;
+        _thread = null;
+    }
 }
 "@
 
@@ -553,6 +665,39 @@ function Invoke-ScreenClick {
         [NativeWin32]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
         [NativeWin32]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
     }
+}
+
+function Move-CursorAway {
+    <#
+        把鼠标移到一个中性空白位置，避免停留在按钮上触发软件的悬停提示浮窗。
+        优先依据主窗口计算列表空白区域，失败则退回主屏左下角。
+    #>
+    param([System.Windows.Automation.AutomationElement]$MainWindow = $null)
+
+    $x = $null; $y = $null
+    try {
+        if ($null -ne $MainWindow) {
+            $rect = $MainWindow.Current.BoundingRectangle
+            if ($null -ne $rect -and $rect.Width -gt 0 -and $rect.Height -gt 0 `
+                    -and -not [double]::IsInfinity($rect.Width)) {
+                # 列表左下方空白处：远离顶部工具栏按钮，也避开居中的验证码弹窗
+                $x = [int]($rect.Left + 30)
+                $y = [int]($rect.Top + ($rect.Height * 0.85))
+            }
+        }
+    }
+    catch { $x = $null; $y = $null }
+
+    if ($null -eq $x -or $null -eq $y) {
+        $screen = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $x = [int]($screen.Left + 20)
+        $y = [int]($screen.Top + $screen.Height - 60)
+    }
+
+    try {
+        [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point($x, $y)
+    }
+    catch { }
 }
 
 function Wait-DetailSurface {
@@ -1625,6 +1770,87 @@ function Get-OcrTextFromBitmap {
     }
 }
 
+function Convert-OcrTokenToIdCard {
+    # 把一段疑似身份证号的 OCR 文本（可能夹杂被误读为字母的数字）纠正为标准身份证号。
+    # 仅当能整理出 15 位或 18 位（18 位末尾可为 X）时返回，否则返回 $null。
+    param([string]$Token)
+    if ([string]::IsNullOrWhiteSpace($Token)) { return $null }
+
+    $chars = $Token.ToUpperInvariant().ToCharArray()
+    $map = @{
+        'O' = '0'; 'Q' = '0'; 'D' = '0';
+        'I' = '1'; 'L' = '1'; '|' = '1'; '!' = '1';
+        'Z' = '2';
+        'A' = '4';
+        'S' = '5';
+        'G' = '6';
+        'T' = '7';
+        'B' = '8';
+        'X' = 'X'
+    }
+
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $chars) {
+        $c = [string]$ch
+        if ($c -match '\d') {
+            [void]$sb.Append($c)
+        }
+        elseif ($map.ContainsKey($c)) {
+            [void]$sb.Append($map[$c])
+        }
+        # 其它字符（中文、空格、标点等）作为分隔符忽略。
+    }
+    $cleaned = $sb.ToString()
+
+    # 末位若为 X，仅当整体长度为 18 时才合法（18 位身份证校验位可为 X）。
+    if ($cleaned.Length -eq 18 -and $cleaned -match '^\d{17}[\dX]$') {
+        return $cleaned
+    }
+    if ($cleaned.Length -eq 15 -and $cleaned -match '^\d{15}$') {
+        return $cleaned
+    }
+    # 长度偏长时尝试截取标签后紧邻的合法前缀（应对把后一字段数字粘连进来的情况）。
+    if ($cleaned.Length -gt 18) {
+        $m = [regex]::Match($cleaned, '^\d{17}[\dX]')
+        if ($m.Success) { return $m.Value }
+        $m15 = [regex]::Match($cleaned, '^\d{15}')
+        if ($m15.Success) { return $m15.Value }
+    }
+    return $null
+}
+
+function Get-IdCardFromOcrText {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $compact = ($Text -replace '\s+', '')
+
+    # 1) 优先：以“身份证(号/号码)”标签锚定，截取其后一段字母数字串再纠错。
+    #    号码后面通常紧跟中文字段（执业信息/医师照片等），故以非字母数字为边界。
+    $labelMatch = [regex]::Match($compact, '身份证(?:号码|号|證)?[:：]?\s*([0-9A-Za-z|!]{14,25})')
+    if ($labelMatch.Success) {
+        $id = Convert-OcrTokenToIdCard -Token $labelMatch.Groups[1].Value
+        if (-not [string]::IsNullOrWhiteSpace($id)) { return $id }
+    }
+
+    # 2) 回退：在去空格文本中查找任意“独立”的 18/15 位号码（前后不接数字/X，避免命中资格证书编号子串）。
+    $idMatches = [regex]::Matches($compact, '(?<![\dXx])(?:\d{17}[\dXx]|\d{15})(?![\dXx])')
+    if ($idMatches.Count -gt 0) {
+        $eighteen = @($idMatches | ForEach-Object { $_.Value } | Where-Object { $_.Length -eq 18 })
+        if ($eighteen.Count -gt 0) { return $eighteen[0].ToUpperInvariant() }
+        return $idMatches[0].Value.ToUpperInvariant()
+    }
+
+    # 3) 兜底：原始文本（保留空格）再扫一次，兼容罕见换行/分段情况。
+    $rawMatches = [regex]::Matches($Text, '(?<![\dXx])(?:\d{17}[\dXx]|\d{15})(?![\dXx])')
+    if ($rawMatches.Count -gt 0) {
+        $eighteen = @($rawMatches | ForEach-Object { $_.Value } | Where-Object { $_.Length -eq 18 })
+        if ($eighteen.Count -gt 0) { return $eighteen[0].ToUpperInvariant() }
+        return $rawMatches[0].Value.ToUpperInvariant()
+    }
+
+    return $null
+}
+
 function Get-DetailFieldsFromOcrText {
     param([string]$Text)
     $name = $null
@@ -1642,18 +1868,9 @@ function Get-DetailFieldsFromOcrText {
         $name = $Matches[1]
     }
 
-    $idMatches = [regex]::Matches($Text, '(?<![\dXx])(?:\d{17}[\dXx]|\d{15})(?![\dXx])')
-    if ($idMatches.Count -gt 0) {
-        $eighteen = @($idMatches | ForEach-Object { $_.Value } | Where-Object { $_.Length -eq 18 })
-        if ($eighteen.Count -gt 0) {
-            $idCard = $eighteen[0].ToUpperInvariant()
-        }
-        else {
-            $idCard = $idMatches[0].Value.ToUpperInvariant()
-        }
-    }
+    $idCard = Get-IdCardFromOcrText -Text $Text
 
-    $digits = [regex]::Matches($Text, '\d+') | ForEach-Object { $_.Value }
+    $digits = @([regex]::Matches($Text, '\d+') | ForEach-Object { $_.Value })
     if ($digits.Count -gt 0) {
         $code = $digits | Where-Object { $_.Length -ge 20 } | Sort-Object Length -Descending | Select-Object -First 1
         if ([string]::IsNullOrWhiteSpace($code)) {
@@ -1707,6 +1924,69 @@ function Capture-WindowBitmap {
     return $bitmap
 }
 
+function Test-LoadingText {
+    # 判断 OCR 文本中是否仍存在“正在查询/请稍后/加载中”等加载提示。
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    return ($Text -match '正在查询|正在加载|加载中|请稍[后候]|数据加载|获取最新数据|正在获取|loading|Loading')
+}
+
+function Wait-DetailContentReady {
+    <#
+        等待详情窗口内容渲染完成再返回，避免截到“正在查询，请稍后...”的加载层。
+        策略：
+          1) 画面哈希稳定（连续两帧一致）——加载动画播放时帧会变化，加载完成后趋于静止；
+          2) 启用 OCR 时再确认文本中不含加载提示，且已识别到身份证号。
+        返回： @{ Bitmap = <stable bitmap>; OcrText = <ocr text or $null> }
+        调用方负责 Dispose 返回的 Bitmap。
+    #>
+    param(
+        [System.Windows.Automation.AutomationElement]$Window,
+        [int]$TimeoutSeconds = 12
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $prevHash = ''
+    $stableCount = 0
+    $lastBitmap = $null
+    $lastOcrText = $null
+
+    while ((Get-Date) -lt $deadline) {
+        Wait-IfPauseRequested
+
+        $bmp = Capture-WindowBitmap -Window $Window
+        $hash = Get-BitmapHash -Bitmap $bmp
+
+        if ($hash -eq $prevHash) { $stableCount++ }
+        else { $stableCount = 0; $prevHash = $hash }
+
+        if ($null -ne $lastBitmap) { $lastBitmap.Dispose() }
+        $lastBitmap = $bmp
+        $lastOcrText = $null
+
+        if ($stableCount -ge 1) {
+            if ($NoOcr) {
+                # 未启用 OCR：仅以画面静止为准。
+                return @{ Bitmap = $lastBitmap; OcrText = $null }
+            }
+
+            $lastOcrText = Get-OcrTextFromBitmap -Bitmap $lastBitmap
+            if (-not (Test-LoadingText -Text $lastOcrText)) {
+                $id = Get-IdCardFromOcrText -Text $lastOcrText
+                if (-not [string]::IsNullOrWhiteSpace($id)) {
+                    # 内容已加载且能读到身份证号，视为渲染完成。
+                    return @{ Bitmap = $lastBitmap; OcrText = $lastOcrText }
+                }
+            }
+        }
+
+        Start-SleepWithPause -Milliseconds 350
+    }
+
+    # 超时：返回当前最后一帧（可能仍含加载层），由上层按未识别处理。
+    return @{ Bitmap = $lastBitmap; OcrText = $lastOcrText }
+}
+
 function Invoke-ScreenDoubleClick {
     param(
         [int]$X,
@@ -1744,6 +2024,7 @@ function Wait-DetailWindowByTitle {
             $isNew = (-not $BeforeHandles.ContainsKey($handle))
             if ($titleMatch -or $isNew) { return $win }
         }
+        Wait-IfPauseRequested
         Start-Sleep -Milliseconds 200
     } while ((Get-Date) -lt $deadline)
     return $null
@@ -1941,7 +2222,7 @@ function Invoke-CaptureBatchRest {
     $restSeconds = $CaptureRestMinutes * 60
     Write-CaptureState -Stage 'Rest' -Message ("已抓取 {0} 次，休息 {1} 分钟" -f $TotalSaved, $CaptureRestMinutes)
     Write-Step ("已累计成功截图 {0} 张，休息 {1} 分钟..." -f $TotalSaved, $CaptureRestMinutes)
-    Start-Sleep -Seconds $restSeconds
+    Start-SleepSecondsWithPause -Seconds $restSeconds
     Write-Step '休息结束，继续抓取。'
 }
 
@@ -1950,6 +2231,10 @@ $script:ErrorPopupCount = 0
 $script:LastErrorPopupTime = $null
 $script:CapturedSinceLastPopup = 0
 $script:ErrorPopupStatsReady = $false
+$script:IsCapturePaused = $false
+$script:LastCtrlSpaceDown = $false
+$script:GlobalPauseHotkeyStarted = $false
+$script:ExportDebugTiming = (-not [string]::IsNullOrWhiteSpace($env:EXPORT_DEBUG_TIMING))
 
 function Append-CsvRowToPath {
     param(
@@ -2023,6 +2308,8 @@ function Write-ErrorPopupLog {
 }
 
 function Stop-DoctorApplication {
+    param([int]$PostWaitSeconds = 1)
+
     Write-Step '关闭医师系统应用...'
     $killed = 0
     foreach ($proc in Get-Process -ErrorAction SilentlyContinue) {
@@ -2042,7 +2329,9 @@ function Stop-DoctorApplication {
         }
     }
     Write-Step ("已结束 {0} 个相关进程。" -f $killed)
-    Start-Sleep -Seconds 3
+    if ($PostWaitSeconds -gt 0) {
+        Start-Sleep -Seconds $PostWaitSeconds
+    }
 }
 
 function Restart-DoctorAndEnterList {
@@ -2079,34 +2368,135 @@ function Invoke-CaptureNameSeriesWithRecovery {
     }
 }
 
+function Test-CtrlSpaceKeyEdge {
+    try {
+        $ctrlDown = ([NativeWin32]::GetAsyncKeyState([NativeWin32]::VK_CONTROL) -band 0x8000) -ne 0
+        $spaceDown = ([NativeWin32]::GetAsyncKeyState([NativeWin32]::VK_SPACE) -band 0x8000) -ne 0
+        $comboDown = $ctrlDown -and $spaceDown
+    }
+    catch {
+        return $false
+    }
+    $edge = $comboDown -and (-not $script:LastCtrlSpaceDown)
+    $script:LastCtrlSpaceDown = $comboDown
+    return $edge
+}
+
+function Read-CtrlSpaceFromConsoleBuffer {
+    $pressed = $false
+    while ([Console]::KeyAvailable) {
+        $key = [Console]::ReadKey($true)
+        if ($key.Key -eq 'Spacebar' -and ($key.Modifiers -band [ConsoleModifiers]::Control)) {
+            $pressed = $true
+        }
+    }
+    return $pressed
+}
+
+function Start-GlobalPauseHotkey {
+    if ($script:GlobalPauseHotkeyStarted) { return $true }
+    try {
+        $ok = [GlobalPauseHotkeyHost]::Start()
+        if ($ok) {
+            $script:GlobalPauseHotkeyStarted = $true
+            return $true
+        }
+        Write-Step '全局 Ctrl+空格 热键注册失败，将仅使用键盘轮询作为备用。'
+        return $false
+    }
+    catch {
+        Write-Step ("全局 Ctrl+空格 热键启动失败：{0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
+function Stop-GlobalPauseHotkey {
+    if (-not $script:GlobalPauseHotkeyStarted) { return }
+    try {
+        [GlobalPauseHotkeyHost]::Stop()
+    }
+    catch { }
+    finally {
+        $script:GlobalPauseHotkeyStarted = $false
+        [CapturePauseSignal]::ConsumeToggleRequest() | Out-Null
+    }
+}
+
+function Test-PauseToggleRequested {
+    if ([CapturePauseSignal]::ConsumeToggleRequest()) { return $true }
+    if (Read-CtrlSpaceFromConsoleBuffer) { return $true }
+    if (Test-CtrlSpaceKeyEdge) { return $true }
+    return $false
+}
+
 function Wait-IfPauseRequested {
     try {
-        $pressed = $false
-        while ([Console]::KeyAvailable) {
-            $key = [Console]::ReadKey($true)
-            if ($key.Key -eq 'Spacebar') { $pressed = $true }
+        if (Test-PauseToggleRequested) {
+            $script:IsCapturePaused = -not $script:IsCapturePaused
         }
-        if (-not $pressed) { return }
+        if (-not $script:IsCapturePaused) { return }
 
-        Write-Step '已暂停（按【空格】继续）...'
-        while ($true) {
-            Start-Sleep -Milliseconds 200
-            while ([Console]::KeyAvailable) {
-                $k = [Console]::ReadKey($true)
-                if ($k.Key -eq 'Spacebar') {
-                    Write-Step '已恢复运行。'
-                    return
-                }
+        Write-Step '已暂停（按【Ctrl+空格】继续，无需切换回控制台）...'
+        while ($script:IsCapturePaused) {
+            Start-Sleep -Milliseconds 150
+            if (Test-PauseToggleRequested) {
+                $script:IsCapturePaused = $false
             }
         }
+        Write-Step '已恢复运行。'
     }
     catch {
         # 控制台不可交互（如输入被重定向）时忽略暂停功能。
     }
 }
 
+function Start-SleepWithPause {
+    param([int]$Milliseconds)
+    if ($Milliseconds -le 0) { return }
+    $deadline = (Get-Date).AddMilliseconds($Milliseconds)
+    while ((Get-Date) -lt $deadline) {
+        Wait-IfPauseRequested
+        $remainingMs = [int](($deadline - (Get-Date)).TotalMilliseconds)
+        if ($remainingMs -le 0) { break }
+        Start-Sleep -Milliseconds ([Math]::Min(150, $remainingMs))
+    }
+}
+
+function Start-SleepSecondsWithPause {
+    param([double]$Seconds)
+    Start-SleepWithPause -Milliseconds ([int]([Math]::Max(0, $Seconds * 1000)))
+}
+
+function Initialize-PauseHotkey {
+    param([switch]$DeferGlobalHotkey)
+
+    $script:IsCapturePaused = $false
+    try {
+        $ctrlDown = ([NativeWin32]::GetAsyncKeyState([NativeWin32]::VK_CONTROL) -band 0x8000) -ne 0
+        $spaceDown = ([NativeWin32]::GetAsyncKeyState([NativeWin32]::VK_SPACE) -band 0x8000) -ne 0
+        $script:LastCtrlSpaceDown = $ctrlDown -and $spaceDown
+    }
+    catch {
+        $script:LastCtrlSpaceDown = $false
+    }
+    [CapturePauseSignal]::ConsumeToggleRequest() | Out-Null
+    if (-not $DeferGlobalHotkey) {
+        Start-GlobalPauseHotkey | Out-Null
+        Write-Step '提示：运行中随时按【Ctrl+空格】暂停/恢复（全局热键，控制台被遮挡也有效）。'
+    }
+    else {
+        Write-Step '提示：运行中随时按【Ctrl+空格】暂停/恢复（按键轮询，焦点在医师系统时最稳）。'
+    }
+}
+
+function Enable-GlobalPauseHotkey {
+    if ($script:GlobalPauseHotkeyStarted) { return }
+    Start-GlobalPauseHotkey | Out-Null
+}
+
 function Capture-NameSeries {
-    Write-Step '提示：运行中可按【空格】暂停，再按【空格】恢复。'
+    Initialize-PauseHotkey
+    try {
     $allPersons = @(Resolve-PersonList)
     if ($allPersons.Count -eq 0) {
         throw ("请在 config.json 的 names 中配置人员（name + idCard），或使用 -Names / -NamesFile / -SearchName 指定。配置文件：{0}" -f $ConfigPath)
@@ -2165,7 +2555,7 @@ function Capture-NameSeries {
             Write-Step ("输入姓名失败：{0}" -f $_.Exception.Message)
             continue
         }
-        Start-Sleep -Seconds $SearchWaitSeconds
+        Start-SleepSecondsWithPause -Seconds $SearchWaitSeconds
 
         $rowSavedForName = 0
         $seenSignatures = @{}
@@ -2184,7 +2574,7 @@ function Capture-NameSeries {
             $detail = Wait-DetailWindowByTitle -BeforeHandles $before -MainHandle $mainHandle -TitleRegex $DetailWindowTitleRegex -TimeoutSeconds $DetailWaitSeconds
 
             if ($null -eq $detail -and $row -eq 0) {
-                Start-Sleep -Seconds 1
+                Start-SleepSecondsWithPause -Seconds 1
                 $before = Get-WindowHandles
                 Invoke-ScreenDoubleClick -X $x -Y $y -FocusWindow $main
                 $detail = Wait-DetailWindowByTitle -BeforeHandles $before -MainHandle $mainHandle -TitleRegex $DetailWindowTitleRegex -TimeoutSeconds $DetailWaitSeconds
@@ -2209,7 +2599,9 @@ function Capture-NameSeries {
             $isUnmatched = $false
             try {
                 Write-CaptureState -Stage 'CaptureDetail' -CurrentName $searchName -CurrentRow $row -Message ("截图第 {0} 行详情" -f ($row + 1))
-                $bitmap = Capture-WindowBitmap -Window $detail
+                $ready = Wait-DetailContentReady -Window $detail -TimeoutSeconds $DetailWaitSeconds
+                $bitmap = $ready.Bitmap
+                $readyOcrText = $ready.OcrText
                 try {
                     $detailHash = Get-BitmapHash -Bitmap $bitmap
                     if (-not [string]::IsNullOrWhiteSpace($previousDetailHash) -and $detailHash -eq $previousDetailHash) {
@@ -2221,9 +2613,18 @@ function Capture-NameSeries {
                         $previousDetailHash = $detailHash
                         $ocrIdCard = $null
                         if (-not $NoOcr) {
-                            $ocrText = Get-OcrTextFromBitmap -Bitmap $bitmap
-                            $fields = Get-DetailFieldsFromOcrText -Text $ocrText
-                            $ocrIdCard = $fields.IdCard
+                            Wait-IfPauseRequested
+                            if ($null -ne $readyOcrText) { $ocrText = $readyOcrText }
+                            else { $ocrText = Get-OcrTextFromBitmap -Bitmap $bitmap }
+                            if (Test-LoadingText -Text $ocrText) {
+                                Write-Step ("  第 {0} 行仍处于加载中（正在查询/请稍后），跳过以避免截到加载弹窗。" -f ($row + 1))
+                                $ocrIdCard = $null
+                            }
+                            else {
+                                Wait-IfPauseRequested
+                                $fields = Get-DetailFieldsFromOcrText -Text $ocrText
+                                $ocrIdCard = $fields.IdCard
+                            }
                         }
 
                         if (-not $NoOcr) {
@@ -2331,9 +2732,9 @@ function Capture-NameSeries {
             }
             finally {
                 Close-WindowWithAltF4 $detail
-                Start-Sleep -Milliseconds 250
+                Start-SleepWithPause -Milliseconds 250
                 Bring-ToFront $main
-                Start-Sleep -Milliseconds 150
+                Start-SleepWithPause -Milliseconds 150
             }
 
             if ($stopCurrentName) { break }
@@ -2350,6 +2751,10 @@ function Capture-NameSeries {
     Write-Step ("全部完成，共截图 {0} 张。" -f $totalSaved)
     Write-CaptureState -Stage 'Completed' -Message '全部完成'
     Review-Output
+    }
+    finally {
+        Stop-GlobalPauseHotkey
+    }
 }
 
 #region 登录自动化（启动应用 + 坐标登录 + 进入列表页）
@@ -2725,6 +3130,1540 @@ function Invoke-LoginAndCaptureNames {
 
 #endregion
 
+#region 数据导出自动化
+
+function Get-ExportCalibration {
+    param([switch]$RequireMulti)
+
+    $cfg = Get-AppConfig
+    if ($null -eq $cfg) { return $null }
+
+    $section = Get-ConfigProperty -Config $cfg -Names @('exportCalibration', 'ExportCalibration')
+    if ($null -eq $section) { return $null }
+
+    if ($RequireMulti) {
+        if (Test-ConfigSection -Section $section -RequiredFields @('MultiExportX', 'MultiExportY')) {
+            $mx = Get-SectionInt -Section $section -FieldName 'MultiExportX'
+            $my = Get-SectionInt -Section $section -FieldName 'MultiExportY'
+            if ($mx -gt 0 -and $my -gt 0) { return $section }
+        }
+        return $null
+    }
+
+    if (Test-ConfigSection -Section $section -RequiredFields @(
+            'GetLatestX', 'GetLatestY',
+            'CaptchaImgLeft', 'CaptchaImgTop', 'CaptchaImgRight', 'CaptchaImgBottom',
+            'CaptchaInputX', 'CaptchaInputY',
+            'ConfirmX', 'ConfirmY',
+            'RefreshCaptchaX', 'RefreshCaptchaY',
+            'ExportX', 'ExportY')) {
+        return $section
+    }
+    return $null
+}
+
+function Save-ScreenRectPng {
+    param(
+        [int]$Left,
+        [int]$Top,
+        [int]$Right,
+        [int]$Bottom,
+        [string]$Path
+    )
+
+    $left = [Math]::Min($Left, $Right)
+    $top = [Math]::Min($Top, $Bottom)
+    $width = [Math]::Abs($Right - $Left)
+    $height = [Math]::Abs($Bottom - $Top)
+    if ($width -lt 4 -or $height -lt 4) {
+        throw "Screenshot rectangle is too small: ($Left,$Top)-($Right,$Bottom)"
+    }
+
+    $bitmap = New-Object System.Drawing.Bitmap($width, $height)
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $graphics.CopyFromScreen($left, $top, 0, 0, (New-Object System.Drawing.Size($width, $height)))
+        $dir = Split-Path -Parent $Path
+        if (-not [string]::IsNullOrWhiteSpace($dir) -and -not (Test-Path $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+    }
+    finally {
+        $graphics.Dispose()
+        $bitmap.Dispose()
+    }
+}
+
+$script:CaptchaOcrProcess = $null
+$script:CaptchaOcrWriter = $null
+$script:CaptchaOcrReader = $null
+
+function Start-CaptchaOcrServer {
+    if ($null -ne $script:CaptchaOcrProcess -and -not $script:CaptchaOcrProcess.HasExited) {
+        return
+    }
+
+    $python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+    $ocrScript = Join-Path $PSScriptRoot 'recognize_captcha.py'
+    if (-not (Test-Path $python)) {
+        throw 'OCR venv not found. Run scripts\setup-ocr-env.ps1 first.'
+    }
+    if (-not (Test-Path $ocrScript)) {
+        throw "Missing captcha OCR script: $ocrScript"
+    }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $python
+    $psi.Arguments = "`"$ocrScript`" --serve"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $false
+    $psi.CreateNoWindow = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+
+    $script:CaptchaOcrProcess = [System.Diagnostics.Process]::Start($psi)
+    $script:CaptchaOcrWriter = $script:CaptchaOcrProcess.StandardInput
+    $script:CaptchaOcrReader = $script:CaptchaOcrProcess.StandardOutput
+    Start-Sleep -Milliseconds 300
+}
+
+function Stop-CaptchaOcrServer {
+    if ($null -eq $script:CaptchaOcrProcess) { return }
+    try {
+        if (-not $script:CaptchaOcrProcess.HasExited) {
+            $script:CaptchaOcrWriter.WriteLine('__quit__')
+            $script:CaptchaOcrWriter.Flush()
+            if (-not $script:CaptchaOcrProcess.WaitForExit(3000)) {
+                $script:CaptchaOcrProcess.Kill()
+            }
+        }
+    }
+    catch { }
+    finally {
+        $script:CaptchaOcrProcess = $null
+        $script:CaptchaOcrWriter = $null
+        $script:CaptchaOcrReader = $null
+    }
+}
+
+function Invoke-CaptchaOcrDirect {
+    param([string]$ImagePath)
+
+    $python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+    $ocrScript = Join-Path $PSScriptRoot 'recognize_captcha.py'
+    $output = & $python $ocrScript $ImagePath 2>$null
+    if ($null -eq $output) { return '' }
+    return ([string]($output | Select-Object -Last 1)).Trim()
+}
+
+function Invoke-CaptchaOcr {
+    param(
+        [string]$ImagePath,
+        [int]$TimeoutSeconds = 8
+    )
+
+    try {
+        if ($null -ne $script:CaptchaOcrProcess -and -not $script:CaptchaOcrProcess.HasExited) {
+            $script:CaptchaOcrWriter.WriteLine($ImagePath)
+            $script:CaptchaOcrWriter.Flush()
+
+            # 带超时的 ReadLine，避免 python 子进程无响应时永久阻塞
+            $readTask = $script:CaptchaOcrReader.ReadLineAsync()
+            if ($readTask.Wait([int]($TimeoutSeconds * 1000))) {
+                $line = $readTask.Result
+                if ($null -ne $line -and -not [string]::IsNullOrWhiteSpace($line)) {
+                    return $line.Trim()
+                }
+            }
+            else {
+                # 子进程未在限定时间内返回：判定为不可用，重建服务
+                Write-Step ("  验证码 OCR 服务 {0}s 未响应，重启服务并改用直接调用。" -f $TimeoutSeconds)
+                Stop-CaptchaOcrServer
+                return (Invoke-CaptchaOcrDirect -ImagePath $ImagePath)
+            }
+        }
+    }
+    catch {
+        Stop-CaptchaOcrServer
+    }
+
+    return (Invoke-CaptchaOcrDirect -ImagePath $ImagePath)
+}
+
+function Save-CaptchaDebugImage {
+    param([string]$SourcePath)
+
+    if (-not (Test-Path $SourcePath)) { return }
+    $debugPath = Join-Path $LogsDir 'captcha-last.png'
+    try {
+        Copy-Item -Path $SourcePath -Destination $debugPath -Force
+    }
+    catch { }
+}
+
+function Test-CaptchaCodeValid {
+    param([string]$Code)
+    return (-not [string]::IsNullOrWhiteSpace($Code) -and $Code -match '^[A-Z0-9]{3,8}$')
+}
+
+function Get-CaptchaCodeFromImageFile {
+    param(
+        [string]$ImagePath,
+        [switch]$LogInvalidOcr
+    )
+
+    $code = Invoke-CaptchaOcr -ImagePath $ImagePath
+    if (Test-CaptchaCodeValid -Code $code) { return $code }
+
+    if ($LogInvalidOcr -and -not [string]::IsNullOrWhiteSpace($code)) {
+        Write-Step ("  OCR 原始结果无效：{0}" -f $code)
+    }
+    return $null
+}
+
+function Get-CaptchaCodeFromScreen {
+    param(
+        $ExportCfg,
+        [switch]$LogInvalidOcr
+    )
+
+    if ($null -eq $ExportCfg) { return $null }
+
+    if ($script:ExportDebugTiming) { Write-Step '  [debug] GetCode: 查找主窗口/置前 开始' }
+    $main = Find-MainApplicationWindow $MainWindowTitleRegex
+    if ($null -ne $main) { Bring-ToFront $main }
+    if ($script:ExportDebugTiming) { Write-Step '  [debug] GetCode: 查找主窗口/置前 结束' }
+
+    $baseLeft = [int]$ExportCfg.CaptchaImgLeft
+    $baseTop = [int]$ExportCfg.CaptchaImgTop
+    $baseRight = [int]$ExportCfg.CaptchaImgRight
+    $baseBottom = [int]$ExportCfg.CaptchaImgBottom
+
+    $cropPlans = @(
+        @{ Name = 'calibrated'; Left = $baseLeft; Top = $baseTop; Right = $baseRight; Bottom = $baseBottom },
+        @{ Name = 'padded'; Left = ($baseLeft - 12); Top = ($baseTop - 8); Right = ($baseRight + 12); Bottom = ($baseBottom + 8) },
+        @{ Name = 'dialog'; Left = ($baseLeft - 40); Top = ($baseTop - 30); Right = ($baseRight + 40); Bottom = ($baseBottom + 30) }
+    )
+
+    $tempImg = Join-Path $env:TEMP ("captcha_{0}.png" -f [Guid]::NewGuid().ToString('N'))
+    try {
+        foreach ($plan in $cropPlans) {
+            if ($script:ExportDebugTiming) { Write-Step ("  [debug] GetCode: 截图+OCR plan={0} 开始" -f $plan.Name) }
+            Save-ScreenRectPng -Left $plan.Left -Top $plan.Top -Right $plan.Right -Bottom $plan.Bottom -Path $tempImg
+            Save-CaptchaDebugImage -SourcePath $tempImg
+
+            $code = Get-CaptchaCodeFromImageFile -ImagePath $tempImg -LogInvalidOcr:$LogInvalidOcr
+            if ($script:ExportDebugTiming) { Write-Step ("  [debug] GetCode: plan={0} -> '{1}'" -f $plan.Name, $code) }
+            if (-not [string]::IsNullOrWhiteSpace($code)) { return $code }
+        }
+        return $null
+    }
+    catch {
+        return $null
+    }
+    finally {
+        if (Test-Path $tempImg) {
+            Remove-Item $tempImg -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Wait-ForCaptchaCode {
+    param(
+        $ExportCfg,
+        [int]$TimeoutSeconds = 30
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $nextLog = (Get-Date).AddSeconds(3)
+
+    if ($script:ExportDebugTiming) { Write-Step '  [debug] 进入 Wait-ForCaptchaCode 循环' }
+    do {
+        Wait-IfPauseRequested
+        $code = Get-CaptchaCodeFromScreen -ExportCfg $ExportCfg -LogInvalidOcr
+        if (-not [string]::IsNullOrWhiteSpace($code)) { return $code }
+
+        if ((Get-Date) -ge $nextLog) {
+            $elapsed = [int]($TimeoutSeconds - ($deadline - (Get-Date)).TotalSeconds)
+            Write-Step ("  等待验证码识别... 已等待 {0}s（调试图：logs\captcha-last.png）" -f $elapsed)
+            $nextLog = (Get-Date).AddSeconds(3)
+        }
+        Start-SleepWithPause -Milliseconds 450
+    } while ((Get-Date) -lt $deadline)
+
+    Write-Step ("验证码识别超时，最近截图已保存到 {0}" -f (Join-Path $LogsDir 'captcha-last.png'))
+    return $null
+}
+
+function Get-CaptchaDialogScreenRect {
+    param($ExportCfg)
+
+    return @{
+        Left   = [Math]::Max(0, [int]$ExportCfg.CaptchaImgLeft - 140)
+        Top    = [Math]::Max(0, [int]$ExportCfg.CaptchaImgTop - 90)
+        Right  = [int]$ExportCfg.CaptchaImgRight + 160
+        Bottom = [int]$ExportCfg.CaptchaImgBottom + 160
+    }
+}
+
+function Capture-ScreenRectBitmap {
+    param(
+        [int]$Left,
+        [int]$Top,
+        [int]$Right,
+        [int]$Bottom
+    )
+
+    $left = [Math]::Min($Left, $Right)
+    $top = [Math]::Min($Top, $Bottom)
+    $width = [Math]::Abs($Right - $Left)
+    $height = [Math]::Abs($Bottom - $Top)
+    if ($width -lt 4 -or $height -lt 4) {
+        throw "Screenshot rectangle is too small: ($Left,$Top)-($Right,$Bottom)"
+    }
+
+    $bitmap = New-Object System.Drawing.Bitmap($width, $height)
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $graphics.CopyFromScreen($left, $top, 0, 0, (New-Object System.Drawing.Size($width, $height)))
+    }
+    finally {
+        $graphics.Dispose()
+    }
+    return $bitmap
+}
+
+function Get-CaptchaRegionHash {
+    param($ExportCfg)
+
+    if ($null -eq $ExportCfg) { return $null }
+
+    $left = [int]$ExportCfg.CaptchaImgLeft
+    $top = [int]$ExportCfg.CaptchaImgTop
+    $right = [int]$ExportCfg.CaptchaImgRight
+    $bottom = [int]$ExportCfg.CaptchaImgBottom
+    $width = [Math]::Abs($right - $left)
+    $height = [Math]::Abs($bottom - $top)
+    if ($width -lt 20 -or $height -lt 12) { return $null }
+
+    $bmp = Capture-ScreenRectBitmap -Left $left -Top $top -Right $right -Bottom $bottom
+    try {
+        return (Get-BitmapHash -Bitmap $bmp)
+    }
+    finally {
+        $bmp.Dispose()
+    }
+}
+
+function Test-CaptchaRegionAppeared {
+    param(
+        $ExportCfg,
+        [string]$BaselineHash
+    )
+
+    if ([string]::IsNullOrWhiteSpace($BaselineHash)) { return $false }
+    $current = Get-CaptchaRegionHash -ExportCfg $ExportCfg
+    if ([string]::IsNullOrWhiteSpace($current)) { return $false }
+    return ($current -ne $BaselineHash)
+}
+
+function Test-CaptchaDialogByRegionOcr {
+    param($ExportCfg)
+
+    if ($null -eq $ExportCfg) { return $false }
+
+    Initialize-Ocr | Out-Null
+    $rect = Get-CaptchaDialogScreenRect -ExportCfg $ExportCfg
+    $bmp = Capture-ScreenRectBitmap -Left $rect.Left -Top $rect.Top -Right $rect.Right -Bottom $rect.Bottom
+    try {
+        if ($script:ExportDebugTiming) { Write-Step '  [debug] WinRT OCR(dialog) 开始' }
+        $text = Get-OcrTextFromBitmap -Bitmap $bmp
+        if ($script:ExportDebugTiming) { Write-Step '  [debug] WinRT OCR(dialog) 结束' }
+        return ($text -match '请输入验证码|请输入图片中的验证码|刷新验证码|验证码')
+    }
+    finally {
+        $bmp.Dispose()
+    }
+}
+
+function Test-CaptchaPresentFast {
+    if ($null -ne (Find-WindowByAnyTitle -TitleRegex '请输入验证码')) { return $true }
+    return $false
+}
+
+function Test-CaptchaPresent {
+    param($ExportCfg)
+
+    if ($null -eq $ExportCfg) { return $false }
+
+    if (Test-CaptchaPresentFast) { return $true }
+
+    if (Test-CaptchaDialogByRegionOcr -ExportCfg $ExportCfg) { return $true }
+
+    return $false
+}
+
+function Get-CaptchaInputErrorIconRect {
+    param($ExportCfg)
+
+    $cx = [int]$ExportCfg.CaptchaInputX
+    $cy = [int]$ExportCfg.CaptchaInputY
+    # 错误小 x 出现在输入框右侧，以校准点为中心向右截取
+    return @{
+        Left   = $cx + 20
+        Top    = $cy - 16
+        Right  = $cx + 108
+        Bottom = $cy + 16
+    }
+}
+
+function Test-BitmapHasUiBluePixels {
+    param(
+        [System.Drawing.Bitmap]$Bitmap,
+        [int]$MinBluePixels = 8
+    )
+
+    $blueCount = 0
+    for ($y = 0; $y -lt $Bitmap.Height; $y++) {
+        for ($x = 0; $x -lt $Bitmap.Width; $x++) {
+            $c = $Bitmap.GetPixel($x, $y)
+            if ($c.B -ge 90 -and ($c.B - $c.R) -ge 35 -and ($c.B - $c.G) -ge 20) {
+                $blueCount++
+                if ($blueCount -ge $MinBluePixels) { return $true }
+            }
+        }
+    }
+    return $false
+}
+
+function Test-CaptchaInputErrorIcon {
+    param($ExportCfg)
+
+    if ($null -eq $ExportCfg) { return $false }
+
+    $rect = Get-CaptchaInputErrorIconRect -ExportCfg $ExportCfg
+    $width = [Math]::Abs($rect.Right - $rect.Left)
+    $height = [Math]::Abs($rect.Bottom - $rect.Top)
+    if ($width -lt 8 -or $height -lt 8) { return $false }
+
+    $bmp = Capture-ScreenRectBitmap -Left $rect.Left -Top $rect.Top -Right $rect.Right -Bottom $rect.Bottom
+    try {
+        return (Test-BitmapHasUiBluePixels -Bitmap $bmp)
+    }
+    finally {
+        $bmp.Dispose()
+    }
+}
+
+function Test-CaptchaInputRejected {
+    param($ExportCfg)
+
+    if ($null -eq $ExportCfg) { return $false }
+    if (-not (Test-CaptchaPresent -ExportCfg $ExportCfg)) { return $false }
+    return (Test-CaptchaInputErrorIcon -ExportCfg $ExportCfg)
+}
+
+function Test-CaptchaStillVisible {
+    param($ExportCfg)
+    return (Test-CaptchaPresent -ExportCfg $ExportCfg)
+}
+
+function Get-ShallowWindowText {
+    <#
+        只做浅层、有界的文本提取，避免对超大窗口（如含数千行表格的主窗口）
+        调用 FindAll(Descendants) 导致 UI Automation 卡死。
+    #>
+    param(
+        [System.Windows.Automation.AutomationElement]$Element,
+        [int]$MaxItems = 12
+    )
+    $parts = New-Object System.Collections.Generic.List[string]
+    $selfName = $Element.Current.Name
+    if (-not [string]::IsNullOrWhiteSpace($selfName)) { $parts.Add($selfName.Trim()) }
+
+    try {
+        $cond = [System.Windows.Automation.Condition]::TrueCondition
+        # 仅遍历直接子级，不递归整棵子树
+        $children = $Element.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)
+        foreach ($child in $children) {
+            $name = $child.Current.Name
+            if (-not [string]::IsNullOrWhiteSpace($name)) { $parts.Add($name.Trim()) }
+            if ($parts.Count -ge $MaxItems) { break }
+        }
+    }
+    catch { }
+
+    return (($parts | Select-Object -Unique) -join ' | ')
+}
+
+function Find-CaptchaErrorPopup {
+    $errRegex = '验证码错误|验证码不正确|验证码有误|验证码已过期|请输入正确'
+    foreach ($win in Get-RootWindows) {
+        if ($win.Current.IsOffscreen) { continue }
+
+        $title = [string]$win.Current.Name
+        # 标题命中即可直接判定，无需读取子级
+        if ($title -match $errRegex) {
+            return [pscustomobject]@{ Window = $win; Text = $title }
+        }
+
+        # 跳过主程序窗口与大窗口：它们子树庞大，深扫会卡死，且错误弹窗一定是独立小窗
+        if (-not [string]::IsNullOrWhiteSpace($title) -and $title -match $MainWindowTitleRegex) { continue }
+        $rect = $win.Current.BoundingRectangle
+        if ($rect.Width -gt 900 -or $rect.Height -gt 700) { continue }
+
+        $text = ''
+        try { $text = Get-ShallowWindowText -Element $win } catch { }
+        $combined = ($title + ' | ' + $text)
+        if ($combined -match $errRegex) {
+            return [pscustomobject]@{ Window = $win; Text = $combined }
+        }
+    }
+    return $null
+}
+
+function Find-CaptchaInputError {
+    param(
+        $ExportCfg,
+        [switch]$CaptchaVisible
+    )
+
+    $popup = Find-CaptchaErrorPopup
+    if ($null -ne $popup) {
+        return [pscustomobject]@{
+            Kind   = 'popup'
+            Detail = [string]$popup.Text
+        }
+    }
+
+    if (-not $CaptchaVisible) { return $null }
+
+    if (Test-CaptchaInputErrorIcon -ExportCfg $ExportCfg) {
+        return [pscustomobject]@{
+            Kind   = 'input_icon'
+            Detail = '验证码输入框右侧出现错误图标（小 x）'
+        }
+    }
+
+    return $null
+}
+
+function Clear-CaptchaErrorPopup {
+    $popup = Find-CaptchaErrorPopup
+    if ($null -eq $popup) { return $false }
+    Write-Step '  检测到验证码错误文字弹窗，关闭后重试。'
+    try {
+        Bring-ToFront $popup.Window
+        Start-Sleep -Milliseconds 150
+        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+        Start-Sleep -Milliseconds 200
+    }
+    catch { }
+    return $true
+}
+
+function Test-CaptchaRegionClosed {
+    param(
+        $ExportCfg,
+        [string]$ListBaselineHash
+    )
+
+    if ($null -eq $ExportCfg) { return $false }
+    if ([string]::IsNullOrWhiteSpace($ListBaselineHash)) { return $false }
+
+    $current = Get-CaptchaRegionHash -ExportCfg $ExportCfg
+    if ([string]::IsNullOrWhiteSpace($current)) { return $false }
+    return ($current -eq $ListBaselineHash)
+}
+
+function Report-CaptchaInputError {
+    param(
+        $ExportCfg,
+        [switch]$CaptchaVisible
+    )
+
+    $err = Find-CaptchaInputError -ExportCfg $ExportCfg -CaptchaVisible:$CaptchaVisible
+    if ($null -eq $err) { return $false }
+
+    if ($err.Kind -eq 'popup') {
+        Clear-CaptchaErrorPopup | Out-Null
+    }
+    else {
+        Write-Step ("  {0}" -f $err.Detail)
+    }
+    return $true
+}
+
+function Wait-CaptchaSubmitSuccess {
+    param(
+        $ExportCfg,
+        [System.Windows.Automation.AutomationElement]$MainWindow,
+        [string]$ListBaselineHash = '',
+        [int]$TimeoutSeconds = 30
+    )
+
+    Start-SleepWithPause -Milliseconds 600
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $goneStreak = 0
+    $errorStreak = 0
+
+    while ((Get-Date) -lt $deadline) {
+        Wait-IfPauseRequested
+
+        # 验证码弹窗是否仍然显示：独立验证码窗口，或验证码区域仍能识别出验证码图片。
+        # 注意：不能用“区域恢复到列表基线”判断，因为验证码通过后“获取最新”会进入数据加载，
+        # 加载期间该区域既不是验证码也不是基线。
+        $captchaShown = (Test-CaptchaPresentFast) -or (Test-CaptchaImageReady -ExportCfg $ExportCfg)
+
+        if ($captchaShown) {
+            $goneStreak = 0
+            # 仅当验证码确实仍在显示时，错误小 x 才判定为识别错误；
+            # 要求连续两次命中，避免弹窗关闭瞬间或列表蓝色控件造成误判。
+            if (Test-CaptchaInputErrorIcon -ExportCfg $ExportCfg) {
+                $errorStreak++
+                if ($errorStreak -ge 2) {
+                    Write-Step '  验证码输入框右侧出现错误图标（小 x），判定为识别错误。'
+                    return $false
+                }
+            }
+            else {
+                $errorStreak = 0
+            }
+        }
+        else {
+            $errorStreak = 0
+            $goneStreak++
+            if ($goneStreak -ge 2) {
+                # 验证码弹窗已关闭，说明验证码通过；等待“获取最新”数据加载完成。
+                Write-Step '  验证码弹窗已关闭，等待数据加载...'
+                Wait-LoadingGone -MainWindow $MainWindow -TimeoutSeconds $LoadingWaitSeconds -Fast -MinWaitMilliseconds 150
+                return $true
+            }
+        }
+        Start-SleepWithPause -Milliseconds 350
+    }
+
+    # 超时兜底：若验证码确实已不在，按通过处理（覆盖数据加载较久的情况）。
+    if (-not ((Test-CaptchaPresentFast) -or (Test-CaptchaImageReady -ExportCfg $ExportCfg))) {
+        Wait-LoadingGone -MainWindow $MainWindow -TimeoutSeconds $LoadingWaitSeconds -Fast -MinWaitMilliseconds 150
+        return $true
+    }
+    return $false
+}
+
+function Test-CaptchaImageReady {
+    param($ExportCfg)
+
+    if ($null -eq $ExportCfg) { return $false }
+
+    $left = [int]$ExportCfg.CaptchaImgLeft
+    $top = [int]$ExportCfg.CaptchaImgTop
+    $right = [int]$ExportCfg.CaptchaImgRight
+    $bottom = [int]$ExportCfg.CaptchaImgBottom
+    $width = [Math]::Abs($right - $left)
+    $height = [Math]::Abs($bottom - $top)
+    if ($width -lt 20 -or $height -lt 12) { return $false }
+
+    $tempImg = Join-Path $env:TEMP ("captcha_probe_{0}.png" -f [Guid]::NewGuid().ToString('N'))
+    try {
+        Save-ScreenRectPng -Left $left -Top $top -Right $right -Bottom $bottom -Path $tempImg
+        if ($script:ExportDebugTiming) { Write-Step '  [debug] ddddocr(probe) 开始' }
+        $code = Invoke-CaptchaOcr -ImagePath $tempImg
+        if ($script:ExportDebugTiming) { Write-Step '  [debug] ddddocr(probe) 结束' }
+        return ($code -match '^[A-Z0-9]{3,8}$')
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if (Test-Path $tempImg) {
+            Remove-Item $tempImg -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Test-IsCaptchaDialogVisible {
+    param(
+        [System.Windows.Automation.AutomationElement]$MainWindow = $null,
+        $ExportCfg = $null,
+        [string]$BaselineHash = '',
+        [switch]$FastOnly
+    )
+
+    # 少数情况下验证码会是独立顶层窗口
+    $win = Find-WindowByAnyTitle -TitleRegex '验证码|请输入验证码'
+    if ($null -ne $win) { return $true }
+
+    if ($null -ne $ExportCfg) {
+        if (Test-CaptchaRegionAppeared -ExportCfg $ExportCfg -BaselineHash $BaselineHash) { return $true }
+        if (Test-CaptchaDialogByRegionOcr -ExportCfg $ExportCfg) { return $true }
+        if (-not $FastOnly) {
+            return (Test-CaptchaImageReady -ExportCfg $ExportCfg)
+        }
+    }
+
+    return $false
+}
+
+function Initialize-CaptchaOcrWarmup {
+    Write-Step '预热验证码 OCR 模型...'
+    Start-CaptchaOcrServer
+
+    $warmImg = Join-Path $env:TEMP 'captcha_warmup.png'
+    try {
+        $bmp = New-Object System.Drawing.Bitmap(120, 40)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        try {
+            $g.Clear([System.Drawing.Color]::White)
+            $g.DrawString('TEST12', (New-Object System.Drawing.Font('Arial', 14)), [System.Drawing.Brushes]::Black, 10, 8)
+        }
+        finally { $g.Dispose() }
+        $bmp.Save($warmImg, [System.Drawing.Imaging.ImageFormat]::Png)
+        $bmp.Dispose()
+        $null = Invoke-CaptchaOcr -ImagePath $warmImg
+    }
+    catch { }
+    finally {
+        if (Test-Path $warmImg) { Remove-Item $warmImg -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Wait-ForCaptchaDialog {
+    param(
+        [System.Windows.Automation.AutomationElement]$MainWindow,
+        $ExportCfg = $null,
+        [string]$BaselineHash = '',
+        [int]$TimeoutSeconds = 30
+    )
+
+    Write-Step '等待验证码弹窗出现...'
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $nextLog = (Get-Date).AddSeconds(3)
+    $poll = 0
+    $lastLoggedState = ''
+
+    do {
+        Wait-IfPauseRequested
+        $poll++
+        $deepCheck = (($poll % 2) -eq 0)
+        $state = Get-ExportFlowState -MainWindow $MainWindow -ExportCfg $ExportCfg `
+            -BaselineHash $BaselineHash -DeepCheck:$deepCheck
+
+        switch ($state.State) {
+            'CaptchaDialog' {
+                Write-ExportFlowState $state
+                Start-SleepWithPause -Milliseconds 350
+                return $true
+            }
+            'CaptchaError' {
+                Write-ExportFlowState $state
+                Report-CaptchaInputError -ExportCfg $ExportCfg | Out-Null
+            }
+            default {
+                if ($state.State -ne $lastLoggedState -or (Get-Date) -ge $nextLog) {
+                    Write-ExportFlowState $state
+                    $lastLoggedState = $state.State
+                    $elapsed = [int]($TimeoutSeconds - ($deadline - (Get-Date)).TotalSeconds)
+                    if ($state.State -eq 'Loading') {
+                        Write-Step ("  数据加载中，已等待 {0}s..." -f $elapsed)
+                    }
+                    else {
+                        Write-Step ("  仍在等待验证码弹窗... 已等待 {0}s" -f $elapsed)
+                    }
+                    $nextLog = (Get-Date).AddSeconds(3)
+                }
+            }
+        }
+
+        Start-SleepWithPause -Milliseconds 350
+    } while ((Get-Date) -lt $deadline)
+
+    return $false
+}
+
+function Get-LoadingCheckScreenRect {
+    param([System.Windows.Automation.AutomationElement]$MainWindow)
+
+    $cx = $null; $cy = $null
+    try {
+        if ($null -ne $MainWindow) {
+            $rect = $MainWindow.Current.BoundingRectangle
+            if ($null -ne $rect -and $rect.Width -gt 0 -and $rect.Height -gt 0 `
+                    -and -not [double]::IsInfinity($rect.Width)) {
+                $cx = $rect.Left + ($rect.Width / 2)
+                $cy = $rect.Top + ($rect.Height / 2)
+            }
+        }
+    }
+    catch { $cx = $null; $cy = $null }
+
+    if ($null -eq $cx -or $null -eq $cy) {
+        $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $cx = $screen.Left + ($screen.Width / 2)
+        $cy = $screen.Top + ($screen.Height / 2)
+    }
+
+    return @{
+        Left   = [int]($cx - 220)
+        Top    = [int]($cy - 90)
+        Right  = [int]($cx + 220)
+        Bottom = [int]($cy + 90)
+    }
+}
+
+function Write-ExportFlowState {
+    param($State)
+    if ($null -eq $State) { return }
+    Write-Step ("[状态] {0} — {1}（检测：{2}）" -f $State.State, $State.Detail, $State.Method)
+}
+
+function Get-ExportFlowState {
+    param(
+        [System.Windows.Automation.AutomationElement]$MainWindow = $null,
+        $ExportCfg = $null,
+        [string]$BaselineHash = '',
+        [switch]$DeepCheck,
+        [switch]$QuickCheck
+    )
+
+    if ($null -eq $MainWindow) {
+        $MainWindow = Find-MainApplicationWindow $MainWindowTitleRegex
+    }
+
+    if ($null -ne (Find-WindowByAnyTitle -TitleRegex '导出数据至Excel|另存为|Save As')) {
+        return [pscustomobject]@{
+            State  = 'ExportSaveDialog'
+            Detail = '检测到另存为/导出对话框'
+            Method = 'window_title'
+        }
+    }
+
+    if (Test-CaptchaPresentFast) {
+        return [pscustomobject]@{
+            State  = 'CaptchaDialog'
+            Detail = '独立顶层验证码窗口'
+            Method = 'window_title'
+        }
+    }
+
+    if ($QuickCheck) {
+        return [pscustomobject]@{
+            State  = 'ListReady'
+            Detail = '列表页就绪（快速检测）'
+            Method = 'quick_check'
+        }
+    }
+
+    $captchaDialogByOcr = $false
+    if ($null -ne $ExportCfg) {
+        if (-not [string]::IsNullOrWhiteSpace($BaselineHash)) {
+            if (Test-CaptchaRegionAppeared -ExportCfg $ExportCfg -BaselineHash $BaselineHash) {
+                return [pscustomobject]@{
+                    State  = 'CaptchaDialog'
+                    Detail = '验证码区域画面相对点击前已变化'
+                    Method = 'region_hash'
+                }
+            }
+        }
+
+        $captchaDialogByOcr = Test-CaptchaDialogByRegionOcr -ExportCfg $ExportCfg
+        if ($captchaDialogByOcr) {
+            $inputErr = Find-CaptchaInputError -ExportCfg $ExportCfg -CaptchaVisible
+            if ($null -ne $inputErr) {
+                $method = if ($inputErr.Kind -eq 'popup') { 'error_popup' } else { 'input_error_icon' }
+                return [pscustomobject]@{
+                    State  = 'CaptchaError'
+                    Detail = [string]$inputErr.Detail
+                    Method = $method
+                }
+            }
+            return [pscustomobject]@{
+                State  = 'CaptchaDialog'
+                Detail = '弹窗区域含验证码相关文字'
+                Method = 'dialog_ocr'
+            }
+        }
+
+        if ($DeepCheck -and (Test-CaptchaImageReady -ExportCfg $ExportCfg)) {
+            return [pscustomobject]@{
+                State  = 'CaptchaDialog'
+                Detail = 'ddddocr 识别到验证码图片'
+                Method = 'captcha_ocr'
+            }
+        }
+    }
+
+    $inputErr = Find-CaptchaInputError -ExportCfg $ExportCfg
+    if ($null -ne $inputErr) {
+        $method = if ($inputErr.Kind -eq 'popup') { 'error_popup' } else { 'input_error_icon' }
+        return [pscustomobject]@{
+            State  = 'CaptchaError'
+            Detail = [string]$inputErr.Detail
+            Method = $method
+        }
+    }
+
+    if ($null -ne $MainWindow) {
+        Initialize-Ocr | Out-Null
+        $region = Get-LoadingCheckScreenRect -MainWindow $MainWindow
+        $bmp = Capture-ScreenRectBitmap -Left $region.Left -Top $region.Top -Right $region.Right -Bottom $region.Bottom
+        try {
+            $text = Get-OcrTextFromBitmap -Bitmap $bmp
+            if (Test-LoadingText -Text $text) {
+                $snippet = ($text -replace '\s+', ' ').Trim()
+                if ($snippet.Length -gt 60) { $snippet = $snippet.Substring(0, 60) + '...' }
+                return [pscustomobject]@{
+                    State  = 'Loading'
+                    Detail = $snippet
+                    Method = 'loading_ocr'
+                }
+            }
+        }
+        finally {
+            $bmp.Dispose()
+        }
+    }
+
+    return [pscustomobject]@{
+        State  = 'ListReady'
+        Detail = '列表页就绪，无验证码弹窗'
+        Method = 'default'
+    }
+}
+
+function Wait-UntilListReadyForExport {
+    param(
+        [System.Windows.Automation.AutomationElement]$MainWindow,
+        $ExportCfg = $null,
+        [int]$TimeoutSeconds = 30
+    )
+
+    Write-Step '等待列表页就绪（验证码已关闭）...'
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $nextLog = (Get-Date).AddSeconds(3)
+
+    do {
+        Wait-IfPauseRequested
+        $state = Get-ExportFlowState -MainWindow $MainWindow -ExportCfg $ExportCfg -DeepCheck
+        switch ($state.State) {
+            'ListReady' {
+                Write-ExportFlowState $state
+                return $true
+            }
+            'Loading' {
+                if ((Get-Date) -ge $nextLog) {
+                    Write-ExportFlowState $state
+                    $nextLog = (Get-Date).AddSeconds(3)
+                }
+            }
+            'CaptchaDialog' {
+                Write-ExportFlowState $state
+                return $false
+            }
+            'CaptchaError' {
+                Write-ExportFlowState $state
+                Report-CaptchaInputError -ExportCfg $ExportCfg | Out-Null
+            }
+            default {
+                if ((Get-Date) -ge $nextLog) {
+                    Write-ExportFlowState $state
+                    $nextLog = (Get-Date).AddSeconds(3)
+                }
+            }
+        }
+        Start-SleepWithPause -Milliseconds 350
+    } while ((Get-Date) -lt $deadline)
+
+    $final = Get-ExportFlowState -MainWindow $MainWindow -ExportCfg $ExportCfg -DeepCheck
+    Write-ExportFlowState $final
+    return ($final.State -eq 'ListReady')
+}
+
+function Wait-LoadingGone {
+    param(
+        [System.Windows.Automation.AutomationElement]$MainWindow,
+        [int]$TimeoutSeconds = 180,
+        [int]$MinWaitMilliseconds = 500,
+        [switch]$Fast
+    )
+
+    if ($null -eq $MainWindow) {
+        Write-Step 'Warning: 主窗口不可用，跳过 loading 等待。'
+        return $false
+    }
+
+    Initialize-Ocr | Out-Null
+    Start-SleepWithPause -Milliseconds $(if ($Fast) { [Math]::Min($MinWaitMilliseconds, 200) } else { $MinWaitMilliseconds })
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $prevHash = ''
+    $stableCount = 0
+    $pollMs = if ($Fast) { 250 } else { 700 }
+
+    while ((Get-Date) -lt $deadline) {
+        Wait-IfPauseRequested
+        if ($Fast) {
+            $region = Get-LoadingCheckScreenRect -MainWindow $MainWindow
+            $bmp = Capture-ScreenRectBitmap -Left $region.Left -Top $region.Top -Right $region.Right -Bottom $region.Bottom
+        }
+        else {
+            $bmp = Capture-WindowBitmap -Window $MainWindow
+        }
+        try {
+            $text = Get-OcrTextFromBitmap -Bitmap $bmp
+            if (-not (Test-LoadingText -Text $text)) {
+                if ($Fast) {
+                    Write-Step 'Loading 已消失。'
+                    return $true
+                }
+                $hash = Get-BitmapHash -Bitmap $bmp
+                if ($hash -eq $prevHash) { $stableCount++ }
+                else { $stableCount = 0 }
+                $prevHash = $hash
+                if ($stableCount -ge 1) {
+                    Write-Step 'Loading 已消失，页面稳定。'
+                    return $true
+                }
+            }
+            elseif (-not $Fast) {
+                $stableCount = 0
+                $prevHash = Get-BitmapHash -Bitmap $bmp
+            }
+        }
+        finally {
+            $bmp.Dispose()
+        }
+        Start-SleepWithPause -Milliseconds $pollMs
+    }
+
+    Write-Step 'Warning: 等待 loading 超时，继续执行。'
+    return $false
+}
+
+function Wait-ExportSaveDialog {
+    param([int]$TimeoutSeconds = 90)
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $nextLog = (Get-Date).AddSeconds(5)
+    do {
+        Wait-IfPauseRequested
+        $dialog = Find-WindowByAnyTitle -TitleRegex '导出数据至Excel|导出数据|另存为|另存為|Save As'
+        if ($null -ne $dialog) { return $dialog }
+        if ((Get-Date) -ge $nextLog) {
+            Write-Step '  正在生成导出文件，等待另存为对话框出现...'
+            $nextLog = (Get-Date).AddSeconds(5)
+        }
+        Start-SleepWithPause -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    return $null
+}
+
+function Find-DescendantByControlType {
+    <#
+        在窗口内查找指定 ControlType 的后代控件；可选按名称正则过滤。
+        返回首个匹配元素，未找到返回 $null。
+    #>
+    param(
+        [System.Windows.Automation.AutomationElement]$Root,
+        [System.Windows.Automation.ControlType]$ControlType,
+        [string]$NameRegex = ''
+    )
+
+    if ($null -eq $Root) { return $null }
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ControlType)
+    try {
+        $found = $Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+    }
+    catch { return $null }
+
+    foreach ($el in $found) {
+        if ([string]::IsNullOrWhiteSpace($NameRegex)) { return $el }
+        if ([string]$el.Current.Name -match $NameRegex) { return $el }
+    }
+    return $null
+}
+
+function Set-SaveDialogFileName {
+    <#
+        在另存为对话框中，用 UI Automation 直接给“文件名”编辑框赋值。
+        成功返回 $true。
+    #>
+    param(
+        [System.Windows.Automation.AutomationElement]$Dialog,
+        [string]$FullPath
+    )
+
+    if ($null -eq $Dialog) { return $false }
+
+    # 文件名输入框：经典另存为对话框为 ComboBox(AutomationId 1148) 内含 Edit。
+    $edit = Find-DescendantByControlType -Root $Dialog -ControlType ([System.Windows.Automation.ControlType]::Edit)
+    if ($null -eq $edit) {
+        # 退而求其次：找可编辑的 ComboBox
+        $edit = Find-DescendantByControlType -Root $Dialog -ControlType ([System.Windows.Automation.ControlType]::ComboBox)
+    }
+    if ($null -eq $edit) { return $false }
+
+    try {
+        $edit.SetFocus()
+    }
+    catch { }
+
+    try {
+        $vp = $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+        if ($null -ne $vp) {
+            $vp.SetValue($FullPath)
+            return $true
+        }
+    }
+    catch { }
+
+    # ValuePattern 不可用时，聚焦后用剪贴板粘贴
+    try {
+        $edit.SetFocus()
+        Start-SleepWithPause -Milliseconds 80
+        Set-Clipboard -Value $FullPath
+        Start-SleepWithPause -Milliseconds 60
+        [System.Windows.Forms.SendKeys]::SendWait('^a')
+        Start-SleepWithPause -Milliseconds 40
+        [System.Windows.Forms.SendKeys]::SendWait('^v')
+        return $true
+    }
+    catch { }
+
+    return $false
+}
+
+function Invoke-SaveDialogSaveButton {
+    param([System.Windows.Automation.AutomationElement]$Dialog)
+
+    if ($null -eq $Dialog) { return $false }
+    $btn = Find-DescendantByControlType -Root $Dialog `
+        -ControlType ([System.Windows.Automation.ControlType]::Button) -NameRegex '保存|确定|Save|OK'
+    if ($null -eq $btn) { return $false }
+
+    try {
+        $ip = $btn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+        if ($null -ne $ip) {
+            $ip.Invoke()
+            return $true
+        }
+    }
+    catch { }
+    return $false
+}
+
+function Save-ExportDialog {
+    param(
+        [string]$FullPath,
+        [int]$TimeoutSeconds = 90
+    )
+
+    $dialog = Wait-ExportSaveDialog -TimeoutSeconds $TimeoutSeconds
+    if ($null -ne $dialog) {
+        Write-Step ("检测到另存为对话框：{0}" -f $dialog.Current.Name)
+        Bring-ToFront $dialog
+        Start-SleepWithPause -Milliseconds 250
+
+        $filled = Set-SaveDialogFileName -Dialog $dialog -FullPath $FullPath
+        if ($filled) {
+            Write-Step ("已填入保存路径：{0}" -f $FullPath)
+            Start-SleepWithPause -Milliseconds 200
+            if (-not (Invoke-SaveDialogSaveButton -Dialog $dialog)) {
+                # 找不到保存按钮则回车提交
+                [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+            }
+        }
+        else {
+            Write-Step '无法定位文件名输入框，改用焦点粘贴方式。'
+            Start-SleepWithPause -Milliseconds 120
+            Set-Clipboard -Value $FullPath
+            Start-SleepWithPause -Milliseconds 60
+            [System.Windows.Forms.SendKeys]::SendWait('^a')
+            Start-SleepWithPause -Milliseconds 40
+            [System.Windows.Forms.SendKeys]::SendWait('^v')
+            Start-SleepWithPause -Milliseconds 80
+            [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+        }
+    }
+    else {
+        Write-Step '未检测到另存为窗口标题，尝试直接向当前焦点粘贴路径。'
+        Start-SleepWithPause -Milliseconds 120
+        Set-Clipboard -Value $FullPath
+        Start-SleepWithPause -Milliseconds 60
+        [System.Windows.Forms.SendKeys]::SendWait('^a')
+        Start-SleepWithPause -Milliseconds 40
+        [System.Windows.Forms.SendKeys]::SendWait('^v')
+        Start-SleepWithPause -Milliseconds 80
+        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+    }
+
+    # 等待文件落盘；若有覆盖确认弹窗，回车确认
+    $deadline = (Get-Date).AddSeconds(20)
+    $confirmed = $false
+    do {
+        Wait-IfPauseRequested
+        if (Test-Path $FullPath) { return $true }
+        if (-not $confirmed) {
+            $overwrite = Find-WindowByAnyTitle -TitleRegex '确认另存为|替换|覆盖|Confirm Save As'
+            if ($null -ne $overwrite) {
+                Bring-ToFront $overwrite
+                Start-SleepWithPause -Milliseconds 100
+                [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+                $confirmed = $true
+            }
+        }
+        Start-SleepWithPause -Milliseconds 200
+    } while ((Get-Date) -lt $deadline)
+
+    return $false
+}
+
+function Invoke-ExportCalibration {
+    $existing = Get-ConfigProperty -Config (Get-AppConfig) -Names @('exportCalibration', 'ExportCalibration')
+
+    Write-Step '导出坐标校准开始。'
+    Write-Step '请先进入【主执业机构在本院医师】列表页。'
+    Write-Step '建议先手动点击一次【获取最新】，让验证码弹窗保持打开。'
+    Read-Host '准备好后按 Enter 开始校准'
+
+    $existingGetLatest = Get-CalibrationPointFromSection -Section $existing -XField 'GetLatestX' -YField 'GetLatestY'
+    $getLatest = Read-CursorPointWithConfirm -Title '导出校准 第1步/8：获取最新按钮' `
+        -Instruction '把鼠标移到【获取最新】按钮中间。' `
+        -ExistingX $existingGetLatest.X -ExistingY $existingGetLatest.Y
+
+    $existingCaptchaLeft = Get-CalibrationPointFromSection -Section $existing -XField 'CaptchaImgLeft' -YField 'CaptchaImgTop'
+    $captchaLeft = Read-CursorPointWithConfirm -Title '导出校准 第2步/8：验证码图片左上角' `
+        -Instruction '把鼠标移到验证码图片左上角（紧贴橙色字母，不要含输入框/边框）。' `
+        -ExistingX $existingCaptchaLeft.X -ExistingY $existingCaptchaLeft.Y
+
+    $existingCaptchaRight = Get-CalibrationPointFromSection -Section $existing -XField 'CaptchaImgRight' -YField 'CaptchaImgBottom'
+    $captchaRight = Read-CursorPointWithConfirm -Title '导出校准 第3步/8：验证码图片右下角' `
+        -Instruction '把鼠标移到验证码图片右下角（紧贴橙色字母）。' `
+        -ExistingX $existingCaptchaRight.X -ExistingY $existingCaptchaRight.Y
+
+    $existingCaptchaInput = Get-CalibrationPointFromSection -Section $existing -XField 'CaptchaInputX' -YField 'CaptchaInputY'
+    $captchaInput = Read-CursorPointWithConfirm -Title '导出校准 第4步/8：验证码输入框' `
+        -Instruction '把鼠标移到验证码输入框中间。' `
+        -ExistingX $existingCaptchaInput.X -ExistingY $existingCaptchaInput.Y
+
+    $existingConfirm = Get-CalibrationPointFromSection -Section $existing -XField 'ConfirmX' -YField 'ConfirmY'
+    $confirm = Read-CursorPointWithConfirm -Title '导出校准 第5步/8：确定按钮' `
+        -Instruction '把鼠标移到验证码弹窗【确定】按钮中间。' `
+        -ExistingX $existingConfirm.X -ExistingY $existingConfirm.Y
+
+    $existingRefresh = Get-CalibrationPointFromSection -Section $existing -XField 'RefreshCaptchaX' -YField 'RefreshCaptchaY'
+    $refresh = Read-CursorPointWithConfirm -Title '导出校准 第6步/8：刷新验证码' `
+        -Instruction '把鼠标移到【刷新验证码】链接中间。' `
+        -ExistingX $existingRefresh.X -ExistingY $existingRefresh.Y
+
+    Write-Step '请关闭验证码弹窗，回到【主执业】列表页后再校准【导出】按钮。'
+    Read-Host '主执业列表页准备好后按 Enter 继续'
+
+    $existingExport = Get-CalibrationPointFromSection -Section $existing -XField 'ExportX' -YField 'ExportY'
+    $exportBtn = Read-CursorPointWithConfirm -Title '导出校准 第7步/8：主执业导出按钮' `
+        -Instruction '把鼠标移到【主执业】页面的【导出】按钮中间。' `
+        -ExistingX $existingExport.X -ExistingY $existingExport.Y
+
+    Write-Step '现在切换到【外院在本院多执业医师】列表页，校准它的【导出】按钮。'
+    Write-Step '若暂不需要多执业导出，可在该步输入 S 跳过（保留已有坐标或留空）。'
+    Read-Host '多执业列表页准备好后按 Enter 继续'
+
+    $existingMultiExport = Get-CalibrationPointFromSection -Section $existing -XField 'MultiExportX' -YField 'MultiExportY'
+    $multiExportBtn = Read-CursorPointWithConfirm -Title '导出校准 第8步/8：多执业导出按钮' `
+        -Instruction '把鼠标移到【多执业】页面的【导出】按钮中间。' `
+        -ExistingX $existingMultiExport.X -ExistingY $existingMultiExport.Y
+
+    $section = @{
+        GetLatestX        = [int]$getLatest.X
+        GetLatestY        = [int]$getLatest.Y
+        CaptchaImgLeft    = [int]$captchaLeft.X
+        CaptchaImgTop     = [int]$captchaLeft.Y
+        CaptchaImgRight   = [int]$captchaRight.X
+        CaptchaImgBottom  = [int]$captchaRight.Y
+        CaptchaInputX     = [int]$captchaInput.X
+        CaptchaInputY     = [int]$captchaInput.Y
+        ConfirmX          = [int]$confirm.X
+        ConfirmY          = [int]$confirm.Y
+        RefreshCaptchaX   = [int]$refresh.X
+        RefreshCaptchaY   = [int]$refresh.Y
+        ExportX           = [int]$exportBtn.X
+        ExportY           = [int]$exportBtn.Y
+        MultiExportX      = [int]$multiExportBtn.X
+        MultiExportY      = [int]$multiExportBtn.Y
+        SavedAt           = (Get-Date).ToString('s')
+    }
+    Set-ConfigSection -SectionName 'exportCalibration' -SectionData $section
+    Write-Step ("导出坐标已保存到 {0} 的 exportCalibration" -f $ConfigPath)
+}
+
+function Get-ExportOutputDir {
+    $outDir = $ExportDir
+    if ([string]::IsNullOrWhiteSpace($outDir)) {
+        $outDir = Join-Path $ProjectRoot 'exports'
+    }
+    if (-not (Test-Path $outDir)) {
+        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+    }
+    return $outDir
+}
+
+function Get-ExportFileName {
+    param([string]$Entry)
+    $label = if ($Entry -eq 'Multi') { '多执业导出' } else { '主执业导出' }
+    return ("{0}-{1}.xls" -f $label, (Get-Date -Format 'yyyy-MM-dd_HHmmss'))
+}
+
+function Enter-ExportListPage {
+    param([string]$EntryLabel)
+
+    $main = Find-MainApplicationWindow $MainWindowTitleRegex
+    if ($null -eq $main) {
+        $main = Invoke-LoginToHome
+    }
+    Invoke-EnterListFromHome -MainWindow $main
+
+    $main = Find-MainApplicationWindow $MainWindowTitleRegex
+    if ($null -eq $main) {
+        throw ("进入{0}列表后主窗口丢失。" -f $EntryLabel)
+    }
+    Bring-ToFront $main
+    Wait-RectStable -Rect $main.Current.BoundingRectangle -TimeoutSeconds 4 -StableChecks 1 | Out-Null
+    return $main
+}
+
+function Resolve-CaptchaForExport {
+    <#
+        在验证码弹窗已打开的前提下，识别并提交验证码，失败自动刷新重试。
+        成功返回 $true；用尽次数返回 $false。
+    #>
+    param(
+        $ExportCfg,
+        [System.Windows.Automation.AutomationElement]$MainWindow,
+        [string]$ListBaselineHash = ''
+    )
+
+    $maxRetries = if ($MaxCaptchaRetries -gt 0) { $MaxCaptchaRetries } else { 6 }
+
+    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+        Wait-IfPauseRequested
+        if ($attempt -gt 1) {
+            Write-Step '  刷新验证码后重试。'
+            Invoke-ScreenClick -X ([int]$ExportCfg.RefreshCaptchaX) -Y ([int]$ExportCfg.RefreshCaptchaY) -FocusWindow $MainWindow
+            Start-SleepWithPause -Milliseconds 700
+        }
+
+        $state = Get-ExportFlowState -MainWindow $MainWindow -ExportCfg $ExportCfg -DeepCheck
+        if ($state.State -eq 'CaptchaError') {
+            Write-ExportFlowState $state
+            Report-CaptchaInputError -ExportCfg $ExportCfg | Out-Null
+            continue
+        }
+        if ($state.State -ne 'CaptchaDialog') {
+            Write-ExportFlowState $state
+            if ($state.State -eq 'Loading') {
+                Write-Step '  等待加载完成后再识别验证码...'
+                Wait-LoadingGone -MainWindow $MainWindow -TimeoutSeconds 30 -Fast -MinWaitMilliseconds 150 | Out-Null
+            }
+            else {
+                Write-Step ("  第 {0}/{1} 次：当前不在验证码弹窗状态，跳过。" -f $attempt, $maxRetries)
+                continue
+            }
+        }
+
+        $code = Wait-ForCaptchaCode -ExportCfg $ExportCfg -TimeoutSeconds $(if ($attempt -eq 1) { 30 } else { 12 })
+        if ([string]::IsNullOrWhiteSpace($code)) {
+            Write-Step ("  第 {0}/{1} 次：未能识别验证码。" -f $attempt, $maxRetries)
+            continue
+        }
+
+        Write-Step ("  第 {0}/{1} 次：识别为 {2}，填入并确定。" -f $attempt, $maxRetries, $code)
+
+        # 清空输入框后粘贴，避免上一次残留
+        Invoke-ClickAndPasteText -X ([int]$ExportCfg.CaptchaInputX) -Y ([int]$ExportCfg.CaptchaInputY) `
+            -Text $code -FocusWindow $MainWindow
+        Start-SleepWithPause -Milliseconds 150
+
+        Invoke-ScreenClick -X ([int]$ExportCfg.ConfirmX) -Y ([int]$ExportCfg.ConfirmY) -FocusWindow $MainWindow
+
+        if (Wait-CaptchaSubmitSuccess -ExportCfg $ExportCfg -MainWindow $MainWindow -ListBaselineHash $ListBaselineHash) {
+            $state = Get-ExportFlowState -MainWindow $MainWindow -ExportCfg $ExportCfg
+            Write-ExportFlowState $state
+            Write-Step '  验证码通过。'
+            return $true
+        }
+
+        $state = Get-ExportFlowState -MainWindow $MainWindow -ExportCfg $ExportCfg -DeepCheck
+        Write-ExportFlowState $state
+        Write-Step '  验证码未通过（识别错误或弹窗仍在）。'
+    }
+
+    return $false
+}
+
+function Complete-ExportSaveDialog {
+    param(
+        [string]$Entry,
+        [string]$OutDir
+    )
+
+    $fileName = Get-ExportFileName -Entry $Entry
+    $fullPath = Join-Path $OutDir $fileName
+
+    if (-not (Save-ExportDialog -FullPath $fullPath -TimeoutSeconds 15)) {
+        return $null
+    }
+    return $fullPath
+}
+
+function Invoke-MainExportFlow {
+    try {
+        Initialize-Ocr | Out-Null
+        Initialize-CaptchaOcrWarmup
+
+        $exportCfg = Get-ExportCalibration
+        if ($null -eq $exportCfg) {
+            throw '未找到有效导出坐标。请先运行 run-export-calibrate.cmd 完成校准。'
+        }
+
+        $outDir = Get-ExportOutputDir
+        Write-Step ("导出目录：{0}" -f $outDir)
+
+        Wait-IfPauseRequested
+        $main = Enter-ExportListPage -EntryLabel '主执业'
+
+        Write-Step '检测列表页状态...'
+        $state = Get-ExportFlowState -MainWindow $main -ExportCfg $exportCfg -QuickCheck
+        Write-ExportFlowState $state
+        if ($state.State -ne 'ListReady') {
+            throw ("进入列表页后状态异常：{0} — {1}。请确认页面是否正确。" -f $state.State, $state.Detail)
+        }
+
+        Wait-IfPauseRequested
+
+        $baselineHash = Get-CaptchaRegionHash -ExportCfg $exportCfg
+        Write-Step '点击【获取最新】。'
+        Wait-IfPauseRequested
+        Invoke-ScreenClick -X ([int]$exportCfg.GetLatestX) -Y ([int]$exportCfg.GetLatestY) -FocusWindow $main
+        # 移开鼠标，避免停留在按钮上触发悬停提示浮窗，干扰验证码弹窗与状态检测
+        Move-CursorAway -MainWindow $main
+        $main = Find-MainApplicationWindow $MainWindowTitleRegex
+        if ($null -ne $main) { Bring-ToFront $main }
+
+        if (-not (Wait-ForCaptchaDialog -MainWindow $main -ExportCfg $exportCfg -BaselineHash $baselineHash)) {
+            $state = Get-ExportFlowState -MainWindow $main -ExportCfg $exportCfg -DeepCheck
+            Write-ExportFlowState $state
+            throw ("等待验证码弹窗超时，当前状态：{0} — {1}" -f $state.State, $state.Detail)
+        }
+
+        Write-Step '识别并提交验证码...'
+        if (-not (Resolve-CaptchaForExport -ExportCfg $exportCfg -MainWindow $main -ListBaselineHash $baselineHash)) {
+            $state = Get-ExportFlowState -MainWindow $main -ExportCfg $exportCfg -DeepCheck
+            Write-ExportFlowState $state
+            throw '验证码多次识别失败，请重新运行 run-export.cmd（可查看 logs\captcha-last.png 核对截图区域）。'
+        }
+
+        $main = Find-MainApplicationWindow $MainWindowTitleRegex
+        if ($null -eq $main) { throw '验证码通过后主窗口丢失。' }
+        Bring-ToFront $main
+
+        if (-not (Wait-UntilListReadyForExport -MainWindow $main -ExportCfg $exportCfg)) {
+            throw '验证码仍未关闭或列表未就绪，无法导出。请重新运行 run-export.cmd。'
+        }
+
+        Write-Step '点击【导出】。'
+        Wait-IfPauseRequested
+        Invoke-ScreenClick -X ([int]$exportCfg.ExportX) -Y ([int]$exportCfg.ExportY) -FocusWindow $main
+        Move-CursorAway -MainWindow $main
+
+        $fullPath = Complete-ExportSaveDialog -Entry 'Main' -OutDir $outDir
+        if ($null -eq $fullPath) {
+            $state = Get-ExportFlowState -MainWindow $main -ExportCfg $exportCfg -DeepCheck
+            Write-ExportFlowState $state
+            if ($state.State -eq 'CaptchaDialog') {
+                throw '验证码输入错误，导出未开始。请重新运行 run-export.cmd。'
+            }
+            throw '保存导出文件失败，请检查另存为对话框或导出目录权限。'
+        }
+
+        Write-Step ("主执业导出完成：{0}" -f $fullPath)
+
+        if (-not $KeepAppOpen) {
+            Stop-DoctorApplication
+        }
+        return $fullPath
+    }
+    finally {
+        Stop-CaptchaOcrServer
+    }
+}
+
+function Invoke-MultiExportFlow {
+    Initialize-Ocr | Out-Null
+
+    $exportCfg = Get-ExportCalibration -RequireMulti
+    if ($null -eq $exportCfg) {
+        throw '未找到多执业导出坐标（MultiExportX/Y）。请运行 run-export-calibrate.cmd 完成第 8 步校准。'
+    }
+
+    $outDir = Get-ExportOutputDir
+    Write-Step ("导出目录：{0}" -f $outDir)
+
+    Wait-IfPauseRequested
+    $main = Enter-ExportListPage -EntryLabel '多执业'
+
+    Write-Step '检测列表页状态...'
+    $state = Get-ExportFlowState -MainWindow $main -ExportCfg $exportCfg -QuickCheck
+    Write-ExportFlowState $state
+    if ($state.State -ne 'ListReady') {
+        throw ("进入列表页后状态异常：{0} — {1}。请确认页面是否正确。" -f $state.State, $state.Detail)
+    }
+
+    Wait-IfPauseRequested
+
+    Write-Step '多执业列表无需验证码，直接点击【导出】。'
+    Wait-IfPauseRequested
+    Invoke-ScreenClick -X ([int]$exportCfg.MultiExportX) -Y ([int]$exportCfg.MultiExportY) -FocusWindow $main
+    Move-CursorAway -MainWindow $main
+    Start-SleepWithPause -Milliseconds 600
+
+    # 部分情况下导出前会有短暂 loading
+    Wait-LoadingGone -MainWindow $main -TimeoutSeconds 30 -Fast -MinWaitMilliseconds 150 | Out-Null
+
+    $fullPath = Complete-ExportSaveDialog -Entry 'Multi' -OutDir $outDir
+    if ($null -eq $fullPath) {
+        throw '保存导出文件失败，请检查另存为对话框或导出目录权限。'
+    }
+
+    Write-Step ("多执业导出完成：{0}" -f $fullPath)
+
+    if (-not $KeepAppOpen) {
+        Stop-DoctorApplication
+    }
+    return $fullPath
+}
+
+function Invoke-ExportWithLogin {
+    # 导出流程不启动 WinForms 全局热键线程（避免与 WinRT/UI Automation 在 STA 线程冲突导致原生层崩溃）。
+    # 暂停/恢复改由 Wait-IfPauseRequested 中的按键轮询（GetAsyncKeyState）实现，全局有效。
+    Initialize-PauseHotkey -DeferGlobalHotkey
+    try {
+        if ($ListEntry -eq 'Multi') {
+            Invoke-MultiExportFlow | Out-Null
+        }
+        else {
+            Invoke-MainExportFlow | Out-Null
+        }
+    }
+    finally {
+        Stop-GlobalPauseHotkey
+    }
+}
+
+#endregion
+
 #endregion
 
 Apply-AppConfig
@@ -2746,4 +4685,6 @@ switch ($Mode) {
     'OpenListAndSearchNames' { Invoke-OpenListAndCaptureNames }
     'LoginAndSearchNames' { Invoke-LoginAndCaptureNames }
     'Review' { Review-Output }
+    'ExportCalibrate' { Invoke-ExportCalibration }
+    'Export' { Invoke-ExportWithLogin }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify capture PNG filenames against OCR-extracted name and ID card."""
+"""Verify capture PNG filenames against OCR-extracted ID card numbers."""
 
 from __future__ import annotations
 
@@ -20,40 +20,34 @@ from rapidocr_onnxruntime import RapidOCR
 
 # 同时匹配 18 位（含 X 结尾）与 15 位老身份证号
 ID_CARD_PATTERN = re.compile(r"(?<![\dXx])(?:\d{17}[\dXx]|\d{15})(?![\dXx])")
-NAME_PATTERNS = [
-    re.compile(r"姓名[:：]?\s*([\u4e00-\u9fa5·]{2,8})(?=性别|民族|出生|身份证|医师|$)"),
-    re.compile(r"姓名[:：]?\s*([\u4e00-\u9fa5·]{2,8})"),
-]
-STANDALONE_NAME_PATTERN = re.compile(r"^[\u4e00-\u9fa5·]{2,4}$")
-NAME_FIELD_SUFFIXES = ("性别", "民族", "出生日期", "出生", "身份证", "医师照片", "医师")
-NOT_NAME_TOKENS = frozenset(
-    {
-        "性别",
-        "民族",
-        "姓名",
-        "出生",
-        "汉族",
-        "男",
-        "女",
-        "基本信息",
-        "执业信息",
-        "信息展示",
-        "医师照片",
-        "出生日期",
-        "身份证号",
-        "请求更正",
-    }
+ID_LABEL_PATTERN = re.compile(
+    r"身份证(?:号码|号|證)?[:：]?\s*([0-9A-Za-z|!]{14,25})"
 )
 FILENAME_PATTERN = re.compile(r"^(.+)_(.{15,18})$")
+
+OCR_CHAR_MAP = {
+    "O": "0",
+    "Q": "0",
+    "D": "0",
+    "I": "1",
+    "L": "1",
+    "|": "1",
+    "!": "1",
+    "Z": "2",
+    "A": "4",
+    "S": "5",
+    "G": "6",
+    "T": "7",
+    "B": "8",
+    "X": "X",
+}
 
 REPORT_COLUMNS = {
     "file": "文件路径",
     "subfolder": "子目录",
     "expected_name": "文件名姓名",
     "expected_id_card": "文件名身份证",
-    "ocr_name": "OCR识别姓名",
     "ocr_id_card": "OCR识别身份证",
-    "name_match": "姓名比对",
     "id_match": "身份证比对",
     "overall": "总体结论",
     "ocr_confidence": "OCR置信度",
@@ -69,11 +63,12 @@ MATCH_LABELS = {
 
 OVERALL_LABELS = {
     "OK": "通过",
-    "NAME_MISMATCH": "姓名不匹配",
     "ID_MISMATCH": "身份证不匹配",
-    "BOTH_MISMATCH": "姓名和身份证均不匹配",
     "BAD_FILENAME": "文件名格式错误",
 }
+
+REVERSE_MATCH_LABELS = {label: code for code, label in MATCH_LABELS.items()}
+REVERSE_OVERALL_LABELS = {label: code for code, label in OVERALL_LABELS.items()}
 
 
 @dataclass
@@ -84,11 +79,9 @@ class ExpectedInfo:
 
 @dataclass
 class OcrInfo:
-    name: str | None
     id_card: str | None
     text: str
     confidence: float
-    name_candidates: list[str]
 
 
 @dataclass
@@ -97,9 +90,7 @@ class VerifyResult:
     subfolder: str
     expected_name: str
     expected_id_card: str
-    ocr_name: str
     ocr_id_card: str
-    name_match: str
     id_match: str
     overall: str
     ocr_confidence: str
@@ -112,73 +103,50 @@ def normalize_id_card(value: str | None) -> str:
     return value.strip().upper().replace(" ", "")
 
 
-def normalize_name(value: str | None) -> str:
-    if not value:
-        return ""
-    return value.strip().replace(" ", "")
-
-
-def clean_extracted_name(value: str | None) -> str | None:
-    if not value:
+def convert_ocr_token_to_id_card(token: str | None) -> str | None:
+    if not token:
         return None
-    name = normalize_name(value)
-    for suffix in NAME_FIELD_SUFFIXES:
-        idx = name.find(suffix)
-        if idx > 0:
-            name = name[:idx]
-    match = re.fullmatch(r"[\u4e00-\u9fa5·]{2,8}", name)
-    if match:
-        return name
-    match = re.match(r"([\u4e00-\u9fa5·]{2,8})", name)
-    if match:
-        return match.group(1)
+
+    cleaned_chars: list[str] = []
+    for ch in token.upper():
+        if ch.isdigit():
+            cleaned_chars.append(ch)
+        elif ch in OCR_CHAR_MAP:
+            cleaned_chars.append(OCR_CHAR_MAP[ch])
+
+    cleaned = "".join(cleaned_chars)
+    if len(cleaned) == 18 and re.fullmatch(r"\d{17}[\dX]", cleaned):
+        return cleaned
+    if len(cleaned) == 15 and re.fullmatch(r"\d{15}", cleaned):
+        return cleaned
+    if len(cleaned) > 18:
+        match = re.match(r"\d{17}[\dX]", cleaned)
+        if match:
+            return match.group(0)
+        match = re.match(r"\d{15}", cleaned)
+        if match:
+            return match.group(0)
     return None
 
 
-def extract_name_candidates(text: str) -> list[str]:
+def extract_id_from_text(text: str) -> str | None:
     if not text:
-        return []
+        return None
 
     compact = re.sub(r"\s+", "", text)
-    candidates: list[str] = []
+    label_match = ID_LABEL_PATTERN.search(compact)
+    if label_match:
+        normalized = convert_ocr_token_to_id_card(label_match.group(1))
+        if normalized:
+            return normalized
 
-    for pattern in NAME_PATTERNS:
-        for match in pattern.finditer(compact):
-            cleaned = clean_extracted_name(match.group(1))
-            if cleaned:
-                candidates.append(cleaned)
-
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    for index, line in enumerate(lines):
-        compact_line = re.sub(r"\s+", "", line)
-        if "姓名" not in compact_line:
-            continue
-        inline = re.search(
-            r"姓名[:：]?\s*([\u4e00-\u9fa5·]{2,8})(?=性别|民族|出生|身份证|$)",
-            compact_line,
-        )
-        if inline:
-            cleaned = clean_extracted_name(inline.group(1))
-            if cleaned:
-                candidates.append(cleaned)
-        for next_line in lines[index + 1 : index + 4]:
-            if (
-                STANDALONE_NAME_PATTERN.fullmatch(next_line)
-                and next_line not in NOT_NAME_TOKENS
-            ):
-                candidates.append(next_line)
-
-    for line in lines:
-        if STANDALONE_NAME_PATTERN.fullmatch(line) and line not in NOT_NAME_TOKENS:
-            candidates.append(line)
-
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        if candidate not in seen:
-            seen.add(candidate)
-            deduped.append(candidate)
-    return deduped
+    for source in (compact, text):
+        matches = ID_CARD_PATTERN.findall(source)
+        if matches:
+            eighteen = [m for m in matches if len(m) == 18]
+            chosen = eighteen[0] if eighteen else matches[0]
+            return normalize_id_card(chosen)
+    return None
 
 
 def parse_filename(path: Path) -> ExpectedInfo | None:
@@ -206,15 +174,9 @@ def maybe_upscale(region: np.ndarray, min_size: int = 600) -> np.ndarray:
 
 
 def crop_basic_info_region(image: np.ndarray) -> np.ndarray:
-    """基本信息整块：同时包含姓名与身份证号，单次 OCR 即可。"""
+    """基本信息整块：通常同时包含身份证号。"""
     height, width = image.shape[:2]
     return image[int(height * 0.06) : int(height * 0.44), 0 : int(width * 0.78)]
-
-
-def crop_name_region(image: np.ndarray) -> np.ndarray:
-    """姓名补扫区（仅在整块未识别到姓名时使用）。"""
-    height, width = image.shape[:2]
-    return image[int(height * 0.08) : int(height * 0.32), 0 : int(width * 0.55)]
 
 
 def crop_id_card_region(image: np.ndarray) -> np.ndarray:
@@ -242,47 +204,14 @@ def run_ocr(engine: RapidOCR, image: np.ndarray) -> tuple[str, float]:
     return "\n".join(lines), avg_score
 
 
-def extract_id_from_text(text: str) -> str | None:
-    if not text:
-        return None
-    for source in (text, re.sub(r"\s+", "", text)):
-        matches = ID_CARD_PATTERN.findall(source)
-        if matches:
-            eighteen = [m for m in matches if len(m) == 18]
-            chosen = eighteen[0] if eighteen else matches[0]
-            return normalize_id_card(chosen)
-    return None
-
-
-def extract_fields(text: str) -> tuple[str | None, str | None]:
-    if not text:
-        return None, None
-
-    name_candidates = extract_name_candidates(text)
-    name = name_candidates[0] if name_candidates else None
-    id_card = extract_id_from_text(text)
-    return name, id_card
-
-
 def ocr_image(engine: RapidOCR, path: Path) -> OcrInfo:
     image = load_image(path)
 
-    # 默认一次 OCR：基本信息整块同时含姓名与身份证号
     base_text, base_conf = run_ocr(engine, maybe_upscale(crop_basic_info_region(image)))
     texts = [base_text] if base_text else []
     confidences = [base_conf] if base_conf > 0 else []
 
-    name_candidates = extract_name_candidates(base_text)
     best_id = extract_id_from_text(base_text)
-
-    # 仅在缺失时补扫对应小区域，避免不必要的推理
-    if not name_candidates:
-        name_text, name_conf = run_ocr(engine, maybe_upscale(crop_name_region(image)))
-        if name_text:
-            texts.append(name_text)
-            if name_conf > 0:
-                confidences.append(name_conf)
-            name_candidates = extract_name_candidates(name_text)
 
     if not best_id:
         id_text, id_conf = run_ocr(engine, maybe_upscale(crop_id_card_region(image)))
@@ -292,44 +221,14 @@ def ocr_image(engine: RapidOCR, path: Path) -> OcrInfo:
                 confidences.append(id_conf)
             best_id = extract_id_from_text(id_text)
 
-    best_name = name_candidates[0] if name_candidates else None
     avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
     full_text = "\n".join(texts)
 
     return OcrInfo(
-        name=best_name,
         id_card=best_id,
         text=full_text,
         confidence=avg_conf,
-        name_candidates=name_candidates,
     )
-
-
-def pick_best_name(candidates: list[str], expected: str | None) -> str | None:
-    if not candidates:
-        return None
-    if expected:
-        expected_norm = normalize_name(expected)
-        for candidate in candidates:
-            if normalize_name(candidate) == expected_norm:
-                return candidate
-        for candidate in candidates:
-            candidate_norm = normalize_name(candidate)
-            if expected_norm in candidate_norm or candidate_norm in expected_norm:
-                return candidate
-    return candidates[0]
-
-
-def compare_name(expected: str, actual: str | None) -> tuple[str, str]:
-    expected_norm = normalize_name(expected)
-    actual_norm = normalize_name(clean_extracted_name(actual))
-    if not actual_norm:
-        return "MISSING", "OCR 未识别到姓名"
-    if expected_norm == actual_norm:
-        return "OK", ""
-    if expected_norm in actual_norm or actual_norm in expected_norm:
-        return "OK", ""
-    return "MISMATCH", f"文件名={expected_norm}，OCR={actual_norm}"
 
 
 def compare_id(expected: str, actual: str | None) -> tuple[str, str]:
@@ -350,18 +249,67 @@ def label_overall(value: str) -> str:
     return OVERALL_LABELS.get(value, value)
 
 
-def overall_status(name_match: str, id_match: str) -> str:
-    if name_match == "OK" and id_match == "OK":
+def overall_status(id_match: str) -> str:
+    if id_match == "OK":
         return "OK"
-    if name_match in {"MISSING", "MISMATCH"} and id_match in {"MISSING", "MISMATCH"}:
-        return "BOTH_MISMATCH"
-    if name_match != "OK":
-        return "NAME_MISMATCH"
     return "ID_MISMATCH"
 
 
 def iter_capture_files(captures_dir: Path) -> list[Path]:
     return sorted(captures_dir.rglob("*.png"))
+
+
+def make_rel_file(captures_dir: Path, file_path: Path) -> str:
+    return str(file_path.relative_to(captures_dir.parent)).replace("\\", "/")
+
+
+def row_dict_to_result(row: dict[str, str]) -> VerifyResult:
+    id_match = REVERSE_MATCH_LABELS.get(row.get(REPORT_COLUMNS["id_match"], ""), "N/A")
+    overall = REVERSE_OVERALL_LABELS.get(row.get(REPORT_COLUMNS["overall"], ""), "ID_MISMATCH")
+    return VerifyResult(
+        file=row.get(REPORT_COLUMNS["file"], "").replace("\\", "/"),
+        subfolder=row.get(REPORT_COLUMNS["subfolder"], ""),
+        expected_name=row.get(REPORT_COLUMNS["expected_name"], ""),
+        expected_id_card=row.get(REPORT_COLUMNS["expected_id_card"], ""),
+        ocr_id_card=row.get(REPORT_COLUMNS["ocr_id_card"], ""),
+        id_match=id_match,
+        overall=overall,
+        ocr_confidence=row.get(REPORT_COLUMNS["ocr_confidence"], ""),
+        notes=row.get(REPORT_COLUMNS["notes"], ""),
+    )
+
+
+def load_existing_report(report_path: Path) -> dict[str, VerifyResult]:
+    if not report_path.exists():
+        return {}
+
+    existing: dict[str, VerifyResult] = {}
+    with report_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            result = row_dict_to_result(row)
+            if result.file:
+                existing[result.file] = result
+    return existing
+
+
+def select_files_to_verify(
+    all_files: list[Path],
+    captures_dir: Path,
+    existing: dict[str, VerifyResult],
+    *,
+    force: bool,
+) -> tuple[list[Path], int]:
+    if force:
+        return all_files, 0
+
+    passed_keys = {key for key, row in existing.items() if row.overall == "OK"}
+    to_verify = [
+        file_path
+        for file_path in all_files
+        if make_rel_file(captures_dir, file_path) not in passed_keys
+    ]
+    skipped = len(all_files) - len(to_verify)
+    return to_verify, skipped
 
 
 def relative_subfolder(captures_dir: Path, file_path: Path) -> str:
@@ -375,7 +323,7 @@ def relative_subfolder(captures_dir: Path, file_path: Path) -> str:
 def verify_file(engine: RapidOCR, captures_dir: Path, file_path: Path) -> VerifyResult:
     expected = parse_filename(file_path)
     subfolder = relative_subfolder(captures_dir, file_path)
-    rel_file = str(file_path.relative_to(captures_dir.parent))
+    rel_file = make_rel_file(captures_dir, file_path)
 
     if expected is None:
         return VerifyResult(
@@ -383,9 +331,7 @@ def verify_file(engine: RapidOCR, captures_dir: Path, file_path: Path) -> Verify
             subfolder=subfolder,
             expected_name="",
             expected_id_card="",
-            ocr_name="",
             ocr_id_card="",
-            name_match="N/A",
             id_match="N/A",
             overall="BAD_FILENAME",
             ocr_confidence="",
@@ -393,23 +339,18 @@ def verify_file(engine: RapidOCR, captures_dir: Path, file_path: Path) -> Verify
         )
 
     ocr_info = ocr_image(engine, file_path)
-    resolved_name = pick_best_name(ocr_info.name_candidates, expected.name) or ocr_info.name
-    name_match, name_note = compare_name(expected.name, resolved_name)
     id_match, id_note = compare_id(expected.id_card, ocr_info.id_card)
-    notes = "; ".join(part for part in [name_note, id_note] if part)
 
     return VerifyResult(
         file=rel_file,
         subfolder=subfolder,
         expected_name=expected.name,
         expected_id_card=expected.id_card,
-        ocr_name=resolved_name or "",
         ocr_id_card=ocr_info.id_card or "",
-        name_match=name_match,
         id_match=id_match,
-        overall=overall_status(name_match, id_match),
+        overall=overall_status(id_match),
         ocr_confidence=f"{ocr_info.confidence:.3f}",
-        notes=notes,
+        notes=id_note,
     )
 
 
@@ -419,9 +360,7 @@ def result_to_report_row(row: VerifyResult) -> dict[str, str]:
         REPORT_COLUMNS["subfolder"]: row.subfolder,
         REPORT_COLUMNS["expected_name"]: row.expected_name,
         REPORT_COLUMNS["expected_id_card"]: row.expected_id_card,
-        REPORT_COLUMNS["ocr_name"]: row.ocr_name,
         REPORT_COLUMNS["ocr_id_card"]: row.ocr_id_card,
-        REPORT_COLUMNS["name_match"]: label_match(row.name_match),
         REPORT_COLUMNS["id_match"]: label_match(row.id_match),
         REPORT_COLUMNS["overall"]: label_overall(row.overall),
         REPORT_COLUMNS["ocr_confidence"]: row.ocr_confidence,
@@ -430,21 +369,42 @@ def result_to_report_row(row: VerifyResult) -> dict[str, str]:
 
 
 class IncrementalReportWriter:
-    def __init__(self, report_path: Path) -> None:
+    def __init__(
+        self,
+        report_path: Path,
+        existing_ok_rows: list[VerifyResult] | None = None,
+    ) -> None:
         self.report_path = report_path
         self.fieldnames = list(REPORT_COLUMNS.values())
+        self._problem_rows: list[VerifyResult] = []
+        self._ok_rows: list[VerifyResult] = list(existing_ok_rows or [])
         report_path.parent.mkdir(parents=True, exist_ok=True)
-        self._handle = report_path.open("w", encoding="utf-8-sig", newline="")
-        self._writer = csv.DictWriter(self._handle, fieldnames=self.fieldnames)
-        self._writer.writeheader()
-        self._handle.flush()
+        self._rewrite()
 
     def append(self, result: VerifyResult) -> None:
-        self._writer.writerow(result_to_report_row(result))
-        self._handle.flush()
+        self._ok_rows = [row for row in self._ok_rows if row.file != result.file]
+        self._problem_rows = [row for row in self._problem_rows if row.file != result.file]
+        if result.overall == "OK":
+            self._ok_rows.append(result)
+        else:
+            # 每发现一条异常，立即插到报告最上方（表头之下）。
+            self._problem_rows.insert(0, result)
+        self._rewrite()
+
+    def all_rows(self) -> list[VerifyResult]:
+        return [*self._problem_rows, *self._ok_rows]
+
+    def _rewrite(self) -> None:
+        with self.report_path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=self.fieldnames)
+            writer.writeheader()
+            for row in self._problem_rows:
+                writer.writerow(result_to_report_row(row))
+            for row in self._ok_rows:
+                writer.writerow(result_to_report_row(row))
 
     def close(self) -> None:
-        self._handle.close()
+        self._rewrite()
 
 
 def format_console_failure(result: VerifyResult) -> str:
@@ -455,12 +415,9 @@ def format_console_failure(result: VerifyResult) -> str:
         return " | ".join(parts)
 
     parts.append(
-        f"文件名姓名={result.expected_name or '无'}，OCR姓名={result.ocr_name or '未识别'}"
-    )
-    parts.append(
         f"文件名身份证={result.expected_id_card or '无'}，OCR身份证={result.ocr_id_card or '未识别'}"
     )
-    parts.append(f"姓名比对={label_match(result.name_match)}，身份证比对={label_match(result.id_match)}")
+    parts.append(f"身份证比对={label_match(result.id_match)}")
     if result.notes:
         parts.append(f"备注={result.notes}")
     return " | ".join(parts)
@@ -477,18 +434,14 @@ def print_result_line(index: int, total: int, file_path: Path, result: VerifyRes
 def print_summary(rows: list[VerifyResult]) -> None:
     total = len(rows)
     ok = sum(1 for row in rows if row.overall == "OK")
-    bad_name = sum(1 for row in rows if row.overall == "NAME_MISMATCH")
     bad_id = sum(1 for row in rows if row.overall == "ID_MISMATCH")
-    both = sum(1 for row in rows if row.overall == "BOTH_MISMATCH")
     bad_filename = sum(1 for row in rows if row.overall == "BAD_FILENAME")
 
     print("")
     print("=== OCR 校验汇总 ===")
     print(f"总计: {total}")
     print(f"通过: {ok}")
-    print(f"姓名不匹配: {bad_name}")
     print(f"身份证不匹配: {bad_id}")
-    print(f"姓名和身份证均不匹配: {both}")
     print(f"文件名格式错误: {bad_filename}")
 
     problems = [row for row in rows if row.overall != "OK"]
@@ -498,13 +451,15 @@ def print_summary(rows: list[VerifyResult]) -> None:
         for row in problems[:20]:
             print(
                 f"- {row.file}: {label_overall(row.overall)}，"
-                f"文件名={row.expected_name}/{row.expected_id_card}，"
-                f"OCR={row.ocr_name}/{row.ocr_id_card}"
+                f"文件名身份证={row.expected_id_card}，"
+                f"OCR身份证={row.ocr_id_card or '未识别'}"
             )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Verify capture PNG names against OCR content.")
+    parser = argparse.ArgumentParser(
+        description="Verify capture PNG filenames against OCR-extracted ID card numbers."
+    )
     parser.add_argument(
         "--captures-dir",
         default="captures",
@@ -526,6 +481,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Parallel worker processes (0/1 = serial, recommended; >1 to try multi-process)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-verify all files, ignoring previously passed records in the report",
     )
     return parser
 
@@ -578,24 +538,56 @@ def main() -> int:
         print(f"Captures directory not found: {captures_dir}", file=sys.stderr)
         return 1
 
-    files = iter_capture_files(captures_dir)
+    all_files = iter_capture_files(captures_dir)
+    if not all_files:
+        print(f"No PNG files found under: {captures_dir}")
+        return 0
+
+    existing = load_existing_report(report_path)
+    current_keys = {make_rel_file(captures_dir, file_path) for file_path in all_files}
+    existing = {key: row for key, row in existing.items() if key in current_keys}
+
+    files, skipped = select_files_to_verify(
+        all_files,
+        captures_dir,
+        existing,
+        force=args.force,
+    )
     if args.limit > 0:
         files = files[: args.limit]
 
-    if not files:
-        print(f"No PNG files found under: {captures_dir}")
-        return 0
+    existing_ok_rows = [] if args.force else [row for row in existing.values() if row.overall == "OK"]
+    existing_problems = [] if args.force else [row for row in existing.values() if row.overall != "OK"]
+    verify_keys = {make_rel_file(captures_dir, file_path) for file_path in files}
+    preserved_problems = [row for row in existing_problems if row.file not in verify_keys]
 
     workers = resolve_worker_count(args.workers)
     intra_threads = threads_per_worker(workers)
     total = len(files)
     print("Initializing RapidOCR (PP-OCR model)...")
-    print(f"Verifying {total} file(s) from {captures_dir}")
-    print(f"Report: {report_path} (append one row per image)")
+    print(f"PNG files under {captures_dir}: {len(all_files)}")
+    if args.force:
+        print("Mode: force re-verify all files")
+    elif skipped:
+        print(f"Skipping {skipped} previously passed file(s) from {report_path.name}")
+    print(f"Verifying {total} file(s)")
+    print(f"Report: {report_path} (异常实时插入最上方)")
     print(f"Workers: {workers} (intra-op threads/worker: {intra_threads})")
 
+    if total == 0:
+        writer = IncrementalReportWriter(report_path, existing_ok_rows=existing_ok_rows)
+        for row in preserved_problems:
+            writer.append(row)
+        writer.close()
+        print("No new files to verify.")
+        print_summary(writer.all_rows())
+        print(f"Report saved to: {report_path}")
+        return 0
+
     rows: list[VerifyResult] = []
-    writer = IncrementalReportWriter(report_path)
+    writer = IncrementalReportWriter(report_path, existing_ok_rows=existing_ok_rows)
+    for row in preserved_problems:
+        writer.append(row)
     try:
         if workers == 1:
             engine = make_engine(-1)
@@ -620,7 +612,7 @@ def main() -> int:
     finally:
         writer.close()
 
-    print_summary(rows)
+    print_summary(writer.all_rows())
     print(f"Report saved to: {report_path}")
     return 0
 
