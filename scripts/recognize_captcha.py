@@ -9,12 +9,15 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from PIL import Image, ImageEnhance, ImageOps
+
 
 def clean_captcha_text(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", value).upper()
 
 
 _OCR_ENGINE = None
+_DET_ENGINE = None
 
 
 def get_ocr_engine():
@@ -22,9 +25,17 @@ def get_ocr_engine():
     if _OCR_ENGINE is None:
         import ddddocr
 
-        # 不限制字符集，彩色字母验证码识别率更高
         _OCR_ENGINE = ddddocr.DdddOcr(show_ad=False)
     return _OCR_ENGINE
+
+
+def get_det_engine():
+    global _DET_ENGINE
+    if _DET_ENGINE is None:
+        import ddddocr
+
+        _DET_ENGINE = ddddocr.DdddOcr(det=True, ocr=False, show_ad=False)
+    return _DET_ENGINE
 
 
 def classify_image_bytes(ocr, image_bytes: bytes) -> str:
@@ -32,34 +43,97 @@ def classify_image_bytes(ocr, image_bytes: bytes) -> str:
     return clean_captcha_text(result)
 
 
-def recognize_captcha(path: Path) -> str:
-    from PIL import Image
+def image_to_bytes(img: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
+
+def recognize_by_detection(img: Image.Image) -> str:
+    """Detect each character box, then classify individually (best for scattered letters)."""
     ocr = get_ocr_engine()
-    img = Image.open(path).convert("RGB")
+    det = get_det_engine()
+    width, height = img.size
+
+    bboxes = det.detection(image_to_bytes(img))
+    if not bboxes or len(bboxes) < 3:
+        return ""
+
+    chars: list[str] = []
+    for box in sorted(bboxes, key=lambda b: b[0]):
+        x1, y1, x2, y2 = box
+        pad = 2
+        crop = img.crop(
+            (
+                max(0, x1 - pad),
+                max(0, y1 - pad),
+                min(width, x2 + pad),
+                min(height, y2 + pad),
+            )
+        )
+        cw, ch = crop.size
+        crop = crop.resize(
+            (max(cw * 5, 48), max(ch * 5, 48)),
+            Image.Resampling.LANCZOS,
+        )
+        piece = classify_image_bytes(ocr, image_to_bytes(crop))
+        if piece:
+            chars.append(piece[0])
+
+    text = "".join(chars)
+    if 4 <= len(text) <= 8:
+        return text
+    return ""
+
+
+def collect_whole_image_candidates(img: Image.Image) -> list[str]:
+    ocr = get_ocr_engine()
     width, height = img.size
     candidates: list[str] = []
 
-    # 原图
-    candidates.append(classify_image_bytes(ocr, path.read_bytes()))
+    sources: list[Image.Image] = [img]
+    sources.append(ImageEnhance.Contrast(img).enhance(2.5))
+    sources.append(ImageEnhance.Contrast(img).enhance(3.0))
+    gray = ImageOps.autocontrast(img.convert("L")).convert("RGB")
+    sources.append(gray)
 
-    # 仅放大，不做二值化（彩色验证码二值化会严重降准确率）
-    for scale in (2, 3, 4):
-        scaled = img.resize((width * scale, height * scale), Image.Resampling.LANCZOS)
-        buf = io.BytesIO()
-        scaled.save(buf, format="PNG")
-        candidates.append(classify_image_bytes(ocr, buf.getvalue()))
+    for source in sources:
+        candidates.append(classify_image_bytes(ocr, image_to_bytes(source)))
+        for scale in (2, 3, 4):
+            scaled = source.resize(
+                (width * scale, height * scale),
+                Image.Resampling.LANCZOS,
+            )
+            candidates.append(classify_image_bytes(ocr, image_to_bytes(scaled)))
+
+    return [c for c in candidates if c]
+
+
+def pick_best_candidate(candidates: list[str]) -> str:
+    if not candidates:
+        return ""
 
     valid = [c for c in candidates if 4 <= len(c) <= 8]
-    if valid:
-        return Counter(valid).most_common(1)[0][0]
+    pool = valid if valid else [c for c in candidates if 3 <= len(c) <= 8]
+    if not pool:
+        pool = candidates
 
-    valid = [c for c in candidates if 3 <= len(c) <= 8]
-    if valid:
-        return Counter(valid).most_common(1)[0][0]
+    # 该站点验证码多为 6 位；同票时优先 6 位结果
+    six = [c for c in pool if len(c) == 6]
+    if six:
+        return Counter(six).most_common(1)[0][0]
 
-    non_empty = [c for c in candidates if c]
-    return non_empty[0] if non_empty else ""
+    return Counter(pool).most_common(1)[0][0]
+
+
+def recognize_captcha(path: Path) -> str:
+    img = Image.open(path).convert("RGB")
+
+    by_det = recognize_by_detection(img)
+    if by_det:
+        return by_det
+
+    return pick_best_candidate(collect_whole_image_candidates(img))
 
 
 def serve() -> None:

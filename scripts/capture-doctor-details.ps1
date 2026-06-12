@@ -44,7 +44,7 @@
 
     # 数据导出相关
     [string]$ExportDir = '',
-    [int]$MaxCaptchaRetries = 6,
+    [int]$MaxCaptchaRetries = 0,
     [int]$LoadingWaitSeconds = 120,
     [switch]$KeepAppOpen,
 
@@ -4142,163 +4142,21 @@ function Wait-LoadingGone {
     return $false
 }
 
-function Wait-ExportSaveDialog {
-    param([int]$TimeoutSeconds = 90)
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    $nextLog = (Get-Date).AddSeconds(5)
-    do {
-        Wait-IfPauseRequested
-        $dialog = Find-WindowByAnyTitle -TitleRegex '导出数据至Excel|导出数据|另存为|另存為|Save As'
-        if ($null -ne $dialog) { return $dialog }
-        if ((Get-Date) -ge $nextLog) {
-            Write-Step '  正在生成导出文件，等待另存为对话框出现...'
-            $nextLog = (Get-Date).AddSeconds(5)
-        }
-        Start-SleepWithPause -Milliseconds 250
-    } while ((Get-Date) -lt $deadline)
-    return $null
-}
-
-function Find-DescendantByControlType {
-    <#
-        在窗口内查找指定 ControlType 的后代控件；可选按名称正则过滤。
-        返回首个匹配元素，未找到返回 $null。
-    #>
-    param(
-        [System.Windows.Automation.AutomationElement]$Root,
-        [System.Windows.Automation.ControlType]$ControlType,
-        [string]$NameRegex = ''
-    )
-
-    if ($null -eq $Root) { return $null }
-    $cond = New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ControlType)
-    try {
-        $found = $Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
-    }
-    catch { return $null }
-
-    foreach ($el in $found) {
-        if ([string]::IsNullOrWhiteSpace($NameRegex)) { return $el }
-        if ([string]$el.Current.Name -match $NameRegex) { return $el }
-    }
-    return $null
-}
-
-function Set-SaveDialogFileName {
-    <#
-        在另存为对话框中，用 UI Automation 直接给“文件名”编辑框赋值。
-        成功返回 $true。
-    #>
-    param(
-        [System.Windows.Automation.AutomationElement]$Dialog,
-        [string]$FullPath
-    )
-
-    if ($null -eq $Dialog) { return $false }
-
-    # 文件名输入框：经典另存为对话框为 ComboBox(AutomationId 1148) 内含 Edit。
-    $edit = Find-DescendantByControlType -Root $Dialog -ControlType ([System.Windows.Automation.ControlType]::Edit)
-    if ($null -eq $edit) {
-        # 退而求其次：找可编辑的 ComboBox
-        $edit = Find-DescendantByControlType -Root $Dialog -ControlType ([System.Windows.Automation.ControlType]::ComboBox)
-    }
-    if ($null -eq $edit) { return $false }
-
-    try {
-        $edit.SetFocus()
-    }
-    catch { }
-
-    try {
-        $vp = $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-        if ($null -ne $vp) {
-            $vp.SetValue($FullPath)
-            return $true
-        }
-    }
-    catch { }
-
-    # ValuePattern 不可用时，聚焦后用剪贴板粘贴
-    try {
-        $edit.SetFocus()
-        Start-SleepWithPause -Milliseconds 80
-        Set-Clipboard -Value $FullPath
-        Start-SleepWithPause -Milliseconds 60
-        [System.Windows.Forms.SendKeys]::SendWait('^a')
-        Start-SleepWithPause -Milliseconds 40
-        [System.Windows.Forms.SendKeys]::SendWait('^v')
-        return $true
-    }
-    catch { }
-
-    return $false
-}
-
-function Invoke-SaveDialogSaveButton {
-    param([System.Windows.Automation.AutomationElement]$Dialog)
-
-    if ($null -eq $Dialog) { return $false }
-    $btn = Find-DescendantByControlType -Root $Dialog `
-        -ControlType ([System.Windows.Automation.ControlType]::Button) -NameRegex '保存|确定|Save|OK'
-    if ($null -eq $btn) { return $false }
-
-    try {
-        $ip = $btn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-        if ($null -ne $ip) {
-            $ip.Invoke()
-            return $true
-        }
-    }
-    catch { }
-    return $false
-}
-
 function Save-ExportDialog {
     param(
         [string]$FullPath,
-        [int]$TimeoutSeconds = 90
+        [int]$InitialWaitMilliseconds = 800
     )
 
-    $dialog = Wait-ExportSaveDialog -TimeoutSeconds $TimeoutSeconds
-    if ($null -ne $dialog) {
-        Write-Step ("检测到另存为对话框：{0}" -f $dialog.Current.Name)
-        Bring-ToFront $dialog
-        Start-SleepWithPause -Milliseconds 250
-
-        $filled = Set-SaveDialogFileName -Dialog $dialog -FullPath $FullPath
-        if ($filled) {
-            Write-Step ("已填入保存路径：{0}" -f $FullPath)
-            Start-SleepWithPause -Milliseconds 200
-            if (-not (Invoke-SaveDialogSaveButton -Dialog $dialog)) {
-                # 找不到保存按钮则回车提交
-                [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-            }
-        }
-        else {
-            Write-Step '无法定位文件名输入框，改用焦点粘贴方式。'
-            Start-SleepWithPause -Milliseconds 120
-            Set-Clipboard -Value $FullPath
-            Start-SleepWithPause -Milliseconds 60
-            [System.Windows.Forms.SendKeys]::SendWait('^a')
-            Start-SleepWithPause -Milliseconds 40
-            [System.Windows.Forms.SendKeys]::SendWait('^v')
-            Start-SleepWithPause -Milliseconds 80
-            [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-        }
-    }
-    else {
-        Write-Step '未检测到另存为窗口标题，尝试直接向当前焦点粘贴路径。'
-        Start-SleepWithPause -Milliseconds 120
-        Set-Clipboard -Value $FullPath
-        Start-SleepWithPause -Milliseconds 60
-        [System.Windows.Forms.SendKeys]::SendWait('^a')
-        Start-SleepWithPause -Milliseconds 40
-        [System.Windows.Forms.SendKeys]::SendWait('^v')
-        Start-SleepWithPause -Milliseconds 80
-        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-    }
+    Write-Step '  正在保存导出文件，向当前焦点粘贴路径...'
+    Start-SleepWithPause -Milliseconds $InitialWaitMilliseconds
+    Set-Clipboard -Value $FullPath
+    Start-SleepWithPause -Milliseconds 60
+    [System.Windows.Forms.SendKeys]::SendWait('^a')
+    Start-SleepWithPause -Milliseconds 40
+    [System.Windows.Forms.SendKeys]::SendWait('^v')
+    Start-SleepWithPause -Milliseconds 80
+    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
 
     # 等待文件落盘；若有覆盖确认弹窗，回车确认
     $deadline = (Get-Date).AddSeconds(20)
@@ -4434,10 +4292,23 @@ function Enter-ExportListPage {
     return $main
 }
 
+function Format-CaptchaAttemptLabel {
+    param(
+        [int]$Attempt,
+        [int]$MaxRetries
+    )
+
+    if ($MaxRetries -gt 0) {
+        return ("第 {0}/{1} 次" -f $Attempt, $MaxRetries)
+    }
+    return ("第 {0} 次" -f $Attempt)
+}
+
 function Resolve-CaptchaForExport {
     <#
         在验证码弹窗已打开的前提下，识别并提交验证码，失败自动刷新重试。
-        成功返回 $true；用尽次数返回 $false。
+        MaxCaptchaRetries <= 0 时不限制次数；> 0 时达到上限返回 $false。
+        成功返回 $true。
     #>
     param(
         $ExportCfg,
@@ -4445,9 +4316,18 @@ function Resolve-CaptchaForExport {
         [string]$ListBaselineHash = ''
     )
 
-    $maxRetries = if ($MaxCaptchaRetries -gt 0) { $MaxCaptchaRetries } else { 6 }
+    $maxRetries = [Math]::Max(0, $MaxCaptchaRetries)
+    $unlimited = ($maxRetries -le 0)
+    $attempt = 0
 
-    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+    while ($true) {
+        $attempt++
+        if (-not $unlimited -and $attempt -gt $maxRetries) {
+            return $false
+        }
+
+        $attemptLabel = Format-CaptchaAttemptLabel -Attempt $attempt -MaxRetries $maxRetries
+
         Wait-IfPauseRequested
         if ($attempt -gt 1) {
             Write-Step '  刷新验证码后重试。'
@@ -4468,18 +4348,18 @@ function Resolve-CaptchaForExport {
                 Wait-LoadingGone -MainWindow $MainWindow -TimeoutSeconds 30 -Fast -MinWaitMilliseconds 150 | Out-Null
             }
             else {
-                Write-Step ("  第 {0}/{1} 次：当前不在验证码弹窗状态，跳过。" -f $attempt, $maxRetries)
+                Write-Step ("  {0}：当前不在验证码弹窗状态，跳过。" -f $attemptLabel)
                 continue
             }
         }
 
         $code = Wait-ForCaptchaCode -ExportCfg $ExportCfg -TimeoutSeconds $(if ($attempt -eq 1) { 30 } else { 12 })
         if ([string]::IsNullOrWhiteSpace($code)) {
-            Write-Step ("  第 {0}/{1} 次：未能识别验证码。" -f $attempt, $maxRetries)
+            Write-Step ("  {0}：未能识别验证码。" -f $attemptLabel)
             continue
         }
 
-        Write-Step ("  第 {0}/{1} 次：识别为 {2}，填入并确定。" -f $attempt, $maxRetries, $code)
+        Write-Step ("  {0}：识别为 {1}，填入并确定。" -f $attemptLabel, $code)
 
         # 清空输入框后粘贴，避免上一次残留
         Invoke-ClickAndPasteText -X ([int]$ExportCfg.CaptchaInputX) -Y ([int]$ExportCfg.CaptchaInputY) `
@@ -4499,8 +4379,6 @@ function Resolve-CaptchaForExport {
         Write-ExportFlowState $state
         Write-Step '  验证码未通过（识别错误或弹窗仍在）。'
     }
-
-    return $false
 }
 
 function Complete-ExportSaveDialog {
@@ -4512,7 +4390,7 @@ function Complete-ExportSaveDialog {
     $fileName = Get-ExportFileName -Entry $Entry
     $fullPath = Join-Path $OutDir $fileName
 
-    if (-not (Save-ExportDialog -FullPath $fullPath -TimeoutSeconds 15)) {
+    if (-not (Save-ExportDialog -FullPath $fullPath)) {
         return $null
     }
     return $fullPath
@@ -4562,7 +4440,7 @@ function Invoke-MainExportFlow {
         if (-not (Resolve-CaptchaForExport -ExportCfg $exportCfg -MainWindow $main -ListBaselineHash $baselineHash)) {
             $state = Get-ExportFlowState -MainWindow $main -ExportCfg $exportCfg -DeepCheck
             Write-ExportFlowState $state
-            throw '验证码多次识别失败，请重新运行 run-export.cmd（可查看 logs\captcha-last.png 核对截图区域）。'
+            throw '验证码识别失败（已用尽重试次数）。可查看 logs\captcha-last.png 核对截图区域，或去掉 -MaxCaptchaRetries 限制后重试。'
         }
 
         $main = Find-MainApplicationWindow $MainWindowTitleRegex
