@@ -1,10 +1,11 @@
 @echo off
-cd /d "%~dp0"
+set "ROOT=%~dp0.."
+cd /d "%ROOT%"
 echo ========================================
 echo   OCR verify capture filenames
 echo ========================================
 echo.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\setup-ocr-env.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\scripts\setup-ocr-env.ps1"
 if errorlevel 1 (
   echo.
   echo [ERROR] Failed to prepare OCR environment.
@@ -12,7 +13,7 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
-"%~dp0.venv\Scripts\python.exe" "%~dp0scripts\verify_captures.py" %*
+"%ROOT%\.venv\Scripts\python.exe" "%ROOT%\scripts\verify_captures.py" %*
 if errorlevel 1 (
   echo.
   echo [ERROR] OCR verification failed.

@@ -395,7 +395,7 @@ function Write-MainWindowNotFoundHelp {
     Write-Step 'Main window not found.'
     if (Test-IsAdministrator) {
         Write-Step 'This PowerShell is elevated (Administrator). If the doctor app is a normal window, Windows blocks automation across privilege levels.'
-        Write-Step 'Close the admin window and run: .\run-capture.cmd'
+        Write-Step 'Close the admin window and run: .\cmd\run-capture.cmd'
     }
     else {
         Write-Step 'Open the doctor registration app and stay on the list page, then run again.'
@@ -2191,7 +2191,7 @@ function Invoke-Calibration {
     Set-ConfigSection -SectionName 'listCalibration' -SectionData $section
     Write-Step ("列表坐标已保存到 {0} 的 listCalibration" -f $ConfigPath)
     Write-Step ("搜索框=({0},{1}) 姓名列X={2} 首行Y={3} 行高={4}" -f $section.SearchBoxX, $section.SearchBoxY, $section.NameX, $section.FirstRowY, $section.RowHeight)
-    Write-Step '现在可以运行： .\\run-capture.cmd'
+    Write-Step '现在可以运行： .\\cmd\\run-capture.cmd'
 }
 
 function Invoke-NameSearchInput {
@@ -2520,7 +2520,7 @@ function Capture-NameSeries {
 
     $cfg = Get-Calibration
     if ($null -eq $cfg) {
-        Write-Step ("未找到有效列表坐标，请在 config.json 的 listCalibration 中配置，或运行 run-calibrate.cmd。")
+        Write-Step ("未找到有效列表坐标，请在 config.json 的 listCalibration 中配置，或运行 cmd\run-calibrate.cmd。")
         throw 'Calibration required.'
     }
 
@@ -2978,7 +2978,7 @@ function Invoke-LoginToHome {
     Write-CaptureState -Stage 'Login' -Message '准备登录'
     $loginCfg = Get-LoginCalibration
     if ($null -eq $loginCfg) {
-        Write-Step ("未找到有效登录坐标，请在 config.json 的 loginCalibration 中配置，或运行 run-calibrate.cmd。")
+        Write-Step ("未找到有效登录坐标，请在 config.json 的 loginCalibration 中配置，或运行 cmd\run-calibrate.cmd。")
         throw 'Login calibration required.'
     }
     if ([string]::IsNullOrWhiteSpace($LoginUser)) {
@@ -3048,7 +3048,7 @@ function Invoke-EnterListFromHome {
 
     $loginCfg = Get-LoginCalibration
     if ($null -eq $loginCfg) {
-        Write-Step ("未找到有效登录坐标，请在 config.json 的 loginCalibration 中配置，或运行 run-calibrate.cmd。")
+        Write-Step ("未找到有效登录坐标，请在 config.json 的 loginCalibration 中配置，或运行 cmd\run-calibrate.cmd。")
         throw 'Login calibration required.'
     }
 
@@ -3075,7 +3075,7 @@ function Invoke-EnterListFromHome {
         $entryX = [int](Get-ConfigProperty -Config $loginCfg -Names @('MultiInstitutionX'))
         $entryY = [int](Get-ConfigProperty -Config $loginCfg -Names @('MultiInstitutionY'))
         if ($entryX -le 0 -and $entryY -le 0) {
-            throw '未找到【外院在本院多执业医师】入口坐标。请先运行 run-calibrate.cmd 完成第6步坐标校准。'
+            throw '未找到【外院在本院多执业医师】入口坐标。请先运行 cmd\run-calibrate.cmd 完成第6步坐标校准。'
         }
         Write-CaptureState -Stage 'OpenList' -Message '点击外院在本院多执业医师入口'
         Write-Step '点击“外院在本院多执业医师”。'
@@ -4403,7 +4403,7 @@ function Invoke-MainExportFlow {
 
         $exportCfg = Get-ExportCalibration
         if ($null -eq $exportCfg) {
-            throw '未找到有效导出坐标。请先运行 run-export-calibrate.cmd 完成校准。'
+            throw '未找到有效导出坐标。请先运行 cmd\run-export-calibrate.cmd 完成校准。'
         }
 
         $outDir = Get-ExportOutputDir
@@ -4448,7 +4448,7 @@ function Invoke-MainExportFlow {
         Bring-ToFront $main
 
         if (-not (Wait-UntilListReadyForExport -MainWindow $main -ExportCfg $exportCfg)) {
-            throw '验证码仍未关闭或列表未就绪，无法导出。请重新运行 run-export.cmd。'
+            throw '验证码仍未关闭或列表未就绪，无法导出。请重新运行 cmd\run-export.cmd。'
         }
 
         Write-Step '点击【导出】。'
@@ -4461,7 +4461,7 @@ function Invoke-MainExportFlow {
             $state = Get-ExportFlowState -MainWindow $main -ExportCfg $exportCfg -DeepCheck
             Write-ExportFlowState $state
             if ($state.State -eq 'CaptchaDialog') {
-                throw '验证码输入错误，导出未开始。请重新运行 run-export.cmd。'
+                throw '验证码输入错误，导出未开始。请重新运行 cmd\run-export.cmd。'
             }
             throw '保存导出文件失败，请检查另存为对话框或导出目录权限。'
         }
@@ -4483,7 +4483,7 @@ function Invoke-MultiExportFlow {
 
     $exportCfg = Get-ExportCalibration -RequireMulti
     if ($null -eq $exportCfg) {
-        throw '未找到多执业导出坐标（MultiExportX/Y）。请运行 run-export-calibrate.cmd 完成第 8 步校准。'
+        throw '未找到多执业导出坐标（MultiExportX/Y）。请运行 cmd\run-export-calibrate.cmd 完成第 8 步校准。'
     }
 
     $outDir = Get-ExportOutputDir
