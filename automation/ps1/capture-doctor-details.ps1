@@ -983,6 +983,144 @@ function Find-PersonByOcrIdCard {
     return $null
 }
 
+$script:DoctorAppExeName = '医师电子化注册信息系统（机构版）.exe'
+
+function Expand-AppPathCandidate {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    if ($Path -match '\.lnk$') {
+        try {
+            $shell = New-Object -ComObject WScript.Shell
+            $target = [string]$shell.CreateShortcut($Path).TargetPath
+            if (-not [string]::IsNullOrWhiteSpace($target) -and (Test-Path -LiteralPath $target)) {
+                return $target
+            }
+        }
+        catch { }
+        return $null
+    }
+    return $Path
+}
+
+function Get-DoctorAppPathFromRunningProcess {
+    foreach ($proc in Get-Process -ErrorAction SilentlyContinue) {
+        try {
+            $title = [string]$proc.MainWindowTitle
+            if ([string]::IsNullOrWhiteSpace($title)) { continue }
+            if ($title -notmatch $MainWindowTitleRegex -and $title -notmatch $LoginWindowTitleRegex) { continue }
+
+            $path = Expand-AppPathCandidate -Path ([string]$proc.Path)
+            if (-not [string]::IsNullOrWhiteSpace($path)) { return $path }
+
+            $cim = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $proc.Id) -ErrorAction SilentlyContinue
+            $path = Expand-AppPathCandidate -Path ([string]$cim.ExecutablePath)
+            if (-not [string]::IsNullOrWhiteSpace($path)) { return $path }
+        }
+        catch { }
+    }
+
+    $procName = [IO.Path]::GetFileNameWithoutExtension($script:DoctorAppExeName)
+    foreach ($proc in (Get-Process -Name $procName -ErrorAction SilentlyContinue)) {
+        try {
+            $path = Expand-AppPathCandidate -Path ([string]$proc.Path)
+            if (-not [string]::IsNullOrWhiteSpace($path)) { return $path }
+
+            $cim = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $proc.Id) -ErrorAction SilentlyContinue
+            $path = Expand-AppPathCandidate -Path ([string]$cim.ExecutablePath)
+            if (-not [string]::IsNullOrWhiteSpace($path)) { return $path }
+        }
+        catch { }
+    }
+    return $null
+}
+
+function Find-DoctorAppPathFromShortcuts {
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcutRoots = @(
+        [Environment]::GetFolderPath('Programs'),
+        [Environment]::GetFolderPath('CommonPrograms'),
+        [Environment]::GetFolderPath('Desktop'),
+        [Environment]::GetFolderPath('CommonDesktopDirectory')
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+
+    foreach ($root in $shortcutRoots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $links = Get-ChildItem -LiteralPath $root -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "*$($script:DoctorAppExeName)*" -or $_.Name -like '*医师电子化注册*' }
+        foreach ($link in $links) {
+            try {
+                $target = [string]$shell.CreateShortcut($link.FullName).TargetPath
+                $path = Expand-AppPathCandidate -Path $target
+                if (-not [string]::IsNullOrWhiteSpace($path)) { return $path }
+            }
+            catch { }
+        }
+    }
+    return $null
+}
+
+function Find-DoctorAppPathOnDrives {
+    $relativePaths = @(
+        "医师电子化注册信息系统（机构版）\$($script:DoctorAppExeName)",
+        "北京民科医疗科技有限公司\医师电子化注册信息系统（机构版）\$($script:DoctorAppExeName)"
+    )
+    $drives = [IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and $_.DriveType -eq 'Fixed' }
+    foreach ($drive in $drives) {
+        $root = $drive.RootDirectory.FullName
+        foreach ($rel in $relativePaths) {
+            $candidate = Join-Path $root $rel
+            $path = Expand-AppPathCandidate -Path $candidate
+            if (-not [string]::IsNullOrWhiteSpace($path)) { return $path }
+        }
+
+        try {
+            $dirs = Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like '*医师电子化注册*' }
+            foreach ($dir in $dirs) {
+                $candidate = Join-Path $dir.FullName $script:DoctorAppExeName
+                $path = Expand-AppPathCandidate -Path $candidate
+                if (-not [string]::IsNullOrWhiteSpace($path)) { return $path }
+
+                $nested = Join-Path $dir.FullName "医师电子化注册信息系统（机构版）\$($script:DoctorAppExeName)"
+                $path = Expand-AppPathCandidate -Path $nested
+                if (-not [string]::IsNullOrWhiteSpace($path)) { return $path }
+            }
+        }
+        catch { }
+    }
+    return $null
+}
+
+function Resolve-DoctorAppPath {
+    if (-not [string]::IsNullOrWhiteSpace($script:AppPath)) {
+        $existing = Expand-AppPathCandidate -Path $script:AppPath
+        if (-not [string]::IsNullOrWhiteSpace($existing)) {
+            if ($existing -ne $script:AppPath) {
+                Write-Step ("解析 appPath 快捷方式：{0}" -f $existing)
+            }
+            $script:AppPath = $existing
+            return $existing
+        }
+        Write-Step ("配置的 appPath 不存在，将自动查找：{0}" -f $script:AppPath)
+    }
+
+    $finders = @(
+        @{ Name = '运行中的进程'; Action = { Get-DoctorAppPathFromRunningProcess } },
+        @{ Name = '开始菜单/桌面快捷方式'; Action = { Find-DoctorAppPathFromShortcuts } },
+        @{ Name = '常见安装目录'; Action = { Find-DoctorAppPathOnDrives } }
+    )
+    foreach ($finder in $finders) {
+        $found = & $finder.Action
+        if (-not [string]::IsNullOrWhiteSpace($found)) {
+            Write-Step ("自动找到应用（{0}）：{1}" -f $finder.Name, $found)
+            $script:AppPath = $found
+            return $found
+        }
+    }
+    return $null
+}
+
 function Apply-AppConfig {
     $cfg = Get-AppConfig
     if ($null -eq $cfg) { return }
@@ -991,6 +1129,7 @@ function Apply-AppConfig {
     if ([string]::IsNullOrWhiteSpace($script:AppPath) -and -not [string]::IsNullOrWhiteSpace([string]$cfgAppPath)) {
         $script:AppPath = [string]$cfgAppPath
     }
+    Resolve-DoctorAppPath | Out-Null
 
     $cfgLoginUser = Get-ConfigProperty -Config $cfg -Names @('loginUser', 'LoginUser')
     if ([string]::IsNullOrWhiteSpace($script:LoginUser) -and -not [string]::IsNullOrWhiteSpace([string]$cfgLoginUser)) {
@@ -2336,8 +2475,9 @@ function Stop-DoctorApplication {
 }
 
 function Restart-DoctorAndEnterList {
+    Resolve-DoctorAppPath | Out-Null
     if ([string]::IsNullOrWhiteSpace($AppPath)) {
-        throw '未配置 appPath，无法自动重启应用。请在 config.json 设置 appPath。'
+        throw '未找到医师系统应用路径，无法自动重启。请先手动打开应用，或在 config.json 设置 appPath。'
     }
     Stop-DoctorApplication
     Start-Sleep -Seconds $RestartWaitSeconds
@@ -2886,11 +3026,12 @@ function Wait-WindowByAnyTitle {
 }
 
 function Start-DoctorApplication {
+    Resolve-DoctorAppPath | Out-Null
     if ([string]::IsNullOrWhiteSpace($AppPath)) {
-        Write-Step '未提供 -AppPath，将使用当前已打开的医师系统窗口。'
+        Write-Step '未找到 appPath，将使用当前已打开的医师系统窗口。'
         return
     }
-    if (-not (Test-Path $AppPath)) {
+    if (-not (Test-Path -LiteralPath $AppPath)) {
         throw "AppPath not found: $AppPath"
     }
     Write-Step ("启动应用：{0}" -f $AppPath)
