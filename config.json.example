@@ -44,5 +44,16 @@
     "requestTimeoutSeconds": 60,
     "retryCount": 3,
     "retryDelaySeconds": 2
+  },
+  "minkeRegApi": {
+    "loginServiceUrl": "https://jgd.wsb002.cn/LoginUnitService/LoginService.asmx",
+    "docUnitServiceUrl": "https://jgd.wsb002.cn/Unit.DoctorReg.WSL/MKDocUnitService.asmx",
+    "productId": "8fad1b8d-2020-48d1-824b-5b3b261ee089",
+    "outputDir": "exports/reg-api",
+    "requestTimeoutSeconds": 120,
+    "mainSearchType": 1,
+    "multiSearchType": 9,
+    "useDoctorUnitGetListForOther": false,
+    "forceRefreshMd5": ""
   }
 }
