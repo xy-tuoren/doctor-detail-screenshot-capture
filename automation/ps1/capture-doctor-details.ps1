@@ -123,8 +123,44 @@ public static class NativeWin32 {
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("imm32.dll")] public static extern IntPtr ImmGetDefaultIMEWnd(IntPtr hWnd);
     public const int VK_SPACE = 0x20;
     public const int VK_CONTROL = 0x11;
+    public const uint WM_IME_CONTROL = 0x0283;
+    public const int IMC_SETOPENSTATUS = 0x0006;
+}
+"@
+
+# 用 Win32 EnumWindows 枚举可见顶层窗口（含“被拥有窗口/owned window”）。
+# 验证码弹窗“请输入验证码”是主窗口的被拥有窗口，UI Automation 的 RootElement 子节点枚举会漏掉它，
+# 但 EnumWindows 能枚举到，用于可靠检测验证码弹窗是否打开。
+Add-Type @"
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class WinEnum {
+    delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet=CharSet.Auto)] static extern int GetWindowText(IntPtr hWnd, StringBuilder s, int n);
+    [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr hWnd);
+    public static string[] GetTopLevelTitles() {
+        var list = new List<string>();
+        EnumWindows((h, l) => {
+            if (!IsWindowVisible(h)) return true;
+            int len = GetWindowTextLength(h);
+            if (len <= 0) return true;
+            var sb = new StringBuilder(len + 2);
+            GetWindowText(h, sb, sb.Capacity);
+            string t = sb.ToString();
+            if (!string.IsNullOrEmpty(t)) list.Add(t);
+            return true;
+        }, IntPtr.Zero);
+        return list.ToArray();
+    }
 }
 "@
 
@@ -647,6 +683,29 @@ function Invoke-ElementAction {
 
     $rect = $Element.Current.BoundingRectangle
     Invoke-ScreenClick -X (Safe-Int ($rect.Left + ($rect.Width / 2))) -Y (Safe-Int ($rect.Top + ($rect.Height / 2))) -FocusWindow $FocusWindow
+}
+
+function Set-ImeEnglishForForeground {
+    <#
+        把当前前台窗口的输入法切到英文（关闭 IME 开启状态）。
+        中文输入法激活时，SendKeys 合成的 ^a / {DEL} / ^v 会被 IME 拦截而无法送进输入框。
+        通过向目标线程的默认 IME 窗口发送 WM_IME_CONTROL(IMC_SETOPENSTATUS, 0) 关闭输入法，
+        该方式可跨进程生效。失败仅告警，不中断流程。
+    #>
+    try {
+        $hwnd = [NativeWin32]::GetForegroundWindow()
+        if ($hwnd -eq [IntPtr]::Zero) { return }
+        $ime = [NativeWin32]::ImmGetDefaultIMEWnd($hwnd)
+        if ($ime -eq [IntPtr]::Zero) { return }
+        [NativeWin32]::SendMessage(
+            $ime,
+            [NativeWin32]::WM_IME_CONTROL,
+            [IntPtr][NativeWin32]::IMC_SETOPENSTATUS,
+            [IntPtr]0) | Out-Null
+    }
+    catch {
+        Write-Step ("Warning: 切换输入法到英文失败：{0}" -f $_.Exception.Message)
+    }
 }
 
 function Invoke-ScreenClick {
@@ -2343,6 +2402,9 @@ function Invoke-NameSearchInput {
     Bring-ToFront $MainWindow
     Invoke-ScreenClick -X ([int]$Calibration.SearchBoxX) -Y ([int]$Calibration.SearchBoxY) -FocusWindow $MainWindow
     Start-Sleep -Milliseconds 150
+    Write-FocusDiagnostics -Tag '姓名框点击后'
+    Set-ImeEnglishForForeground
+    Start-Sleep -Milliseconds 60
     [System.Windows.Forms.SendKeys]::SendWait('^a')
     Start-Sleep -Milliseconds 60
     [System.Windows.Forms.SendKeys]::SendWait('{DEL}')
@@ -2351,6 +2413,17 @@ function Invoke-NameSearchInput {
     Start-Sleep -Milliseconds 60
     [System.Windows.Forms.SendKeys]::SendWait('^v')
     Start-Sleep -Milliseconds 150
+
+    # 写入后回读校验：能读到值且为空 => 写入失败，按要求立即停止
+    $entered = Get-FocusedElementValue
+    if ($null -ne $entered) {
+        Write-Step ("  [诊断] 姓名框回读值='{0}'" -f $entered)
+        if ([string]::IsNullOrEmpty($entered)) {
+            Write-FocusDiagnostics -Tag '姓名写入失败'
+            throw ("姓名搜索框未能写入内容（回读为空），已立即停止以便排查。姓名='{0}'。请把以上 [诊断:...] 日志发我。" -f $Name)
+        }
+    }
+
     [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
 }
 
@@ -3058,27 +3131,105 @@ function Clear-ClipboardSafe {
     }
 }
 
+function Get-FocusedElementValue {
+    <#
+        读取当前焦点元素的文本值（仅当其支持 ValuePattern 时）。
+        返回 $null 表示无法判定（控件不支持或读取失败），调用方应跳过校验而非当作失败。
+    #>
+    try {
+        $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+        if ($null -eq $focused) { return $null }
+        $pattern = $null
+        $ok = $focused.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)
+        if ($ok -and $null -ne $pattern) {
+            return $pattern.Current.Value
+        }
+    }
+    catch { }
+    return $null
+}
+
+function Write-FocusDiagnostics {
+    <#
+        打印当前前台窗口句柄与焦点元素信息（类型/类名/是否有键盘焦点/当前值），
+        用于定位“点了输入框但没输入内容”的真因。
+    #>
+    param([string]$Tag)
+    try {
+        $fg = [NativeWin32]::GetForegroundWindow()
+        $f = [System.Windows.Automation.AutomationElement]::FocusedElement
+        if ($null -ne $f) {
+            $vp = $null
+            $val = '<不支持ValuePattern>'
+            if ($f.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
+                $val = ("'{0}'" -f $vp.Current.Value)
+            }
+            Write-Step ("  [诊断:{0}] 前台hwnd={1} 焦点元素 Type={2} Class='{3}' hasFocus={4} 当前值={5}" -f `
+                $Tag, $fg, $f.Current.ControlType.ProgrammaticName, $f.Current.ClassName, $f.Current.HasKeyboardFocus, $val)
+        }
+        else {
+            Write-Step ("  [诊断:{0}] 前台hwnd={1} 焦点元素=<null>" -f $Tag, $fg)
+        }
+    }
+    catch { Write-Step ("  [诊断:{0}] 读取诊断信息失败：{1}" -f $Tag, $_.Exception.Message) }
+}
+
 function Invoke-ClickAndPasteText {
+    <#
+        点击坐标并粘贴文本。返回值：
+          $true  —— 写入成功（回读非空），或控件不支持回读（无法判定，按成功处理）。
+          $false —— 控件支持回读但回读为空（确认写入失败）。
+        -LogSteps 打印每一步与焦点诊断。
+    #>
     param(
         [int]$X,
         [int]$Y,
         [string]$Text,
         [System.Windows.Automation.AutomationElement]$FocusWindow = $null,
-        [switch]$ClearClipboardAfterPaste
+        [switch]$ClearClipboardAfterPaste,
+        [switch]$LogSteps
     )
     Invoke-ScreenClick -X $X -Y $Y -FocusWindow $FocusWindow
     Start-Sleep -Milliseconds 150
-    [System.Windows.Forms.SendKeys]::SendWait('^a')
-    Start-Sleep -Milliseconds 80
-    [System.Windows.Forms.SendKeys]::SendWait('{DEL}')
-    Start-Sleep -Milliseconds 80
-    Set-Clipboard -Value $Text
-    Start-Sleep -Milliseconds 80
-    [System.Windows.Forms.SendKeys]::SendWait('^v')
-    Start-Sleep -Milliseconds 120
+    if ($LogSteps) { Write-FocusDiagnostics -Tag '点击输入框后' }
+
+    $result = $true
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        if ($LogSteps) { Write-Step ("  第{0}次尝试：关IME -> ^a -> DEL -> Set-Clipboard -> ^v" -f $attempt) }
+        Set-ImeEnglishForForeground
+        Start-Sleep -Milliseconds 60
+        [System.Windows.Forms.SendKeys]::SendWait('^a')
+        Start-Sleep -Milliseconds 80
+        [System.Windows.Forms.SendKeys]::SendWait('{DEL}')
+        Start-Sleep -Milliseconds 80
+        Set-Clipboard -Value $Text
+        if ($LogSteps) {
+            try { Write-Step ("    剪贴板回读='{0}'" -f (Get-Clipboard -Raw)) } catch { }
+        }
+        Start-Sleep -Milliseconds 80
+        [System.Windows.Forms.SendKeys]::SendWait('^v')
+        Start-Sleep -Milliseconds 120
+
+        # 仅当焦点控件支持 ValuePattern 时才校验；为空且还能重试则再来一次。
+        $current = Get-FocusedElementValue
+        if ($LogSteps) {
+            $shown = if ($null -eq $current) { '<无法回读>' } else { ("'{0}'" -f $current) }
+            Write-Step ("    粘贴后回读输入框值={0}" -f $shown)
+        }
+        if ($null -eq $current) { $result = $true; break }
+        if (-not [string]::IsNullOrEmpty($current)) { $result = $true; break }
+        $result = $false
+        if ($attempt -lt 2) {
+            Write-Step '  Warning: 粘贴后输入框仍为空，重试一次。'
+            Invoke-ScreenClick -X $X -Y $Y -FocusWindow $FocusWindow
+            Start-Sleep -Milliseconds 150
+        }
+    }
+
     if ($ClearClipboardAfterPaste) {
         Clear-ClipboardSafe
     }
+    return $result
 }
 
 function Wait-RectStable {
@@ -3156,11 +3307,11 @@ function Invoke-LoginToHome {
     Wait-RectStable -Rect $loginWin.Current.BoundingRectangle -TimeoutSeconds 4 -StableChecks 1 | Out-Null
 
     Write-Step '输入账号。'
-    Invoke-ClickAndPasteText -X ([int]$loginCfg.UserX) -Y ([int]$loginCfg.UserY) -Text $LoginUserValue -FocusWindow $loginWin
+    Invoke-ClickAndPasteText -X ([int]$loginCfg.UserX) -Y ([int]$loginCfg.UserY) -Text $LoginUserValue -FocusWindow $loginWin | Out-Null
 
     Write-Step '输入密码。'
     try {
-        Invoke-ClickAndPasteText -X ([int]$loginCfg.PasswordX) -Y ([int]$loginCfg.PasswordY) -Text $plainPassword -FocusWindow $loginWin -ClearClipboardAfterPaste
+        Invoke-ClickAndPasteText -X ([int]$loginCfg.PasswordX) -Y ([int]$loginCfg.PasswordY) -Text $plainPassword -FocusWindow $loginWin -ClearClipboardAfterPaste | Out-Null
     }
     finally {
         $plainPassword = $null
@@ -3634,8 +3785,25 @@ function Test-CaptchaDialogByRegionOcr {
     }
 }
 
+function Test-NativeWindowTitleMatch {
+    <#
+        用 Win32 EnumWindows 判断是否存在标题匹配的可见顶层窗口（含被拥有窗口）。
+        用于检测 UI Automation 漏掉的“请输入验证码”等被拥有弹窗。
+    #>
+    param([string]$TitleRegex)
+    try {
+        foreach ($t in [WinEnum]::GetTopLevelTitles()) {
+            if (-not [string]::IsNullOrWhiteSpace($t) -and $t -match $TitleRegex) { return $true }
+        }
+    }
+    catch { }
+    return $false
+}
+
 function Test-CaptchaPresentFast {
+    # 先用 UI Automation 找；找不到再用 Win32 EnumWindows 兜底（验证码弹窗是被拥有窗口，UIA 常枚举不到）。
     if ($null -ne (Find-WindowByAnyTitle -TitleRegex '请输入验证码')) { return $true }
+    if (Test-NativeWindowTitleMatch -TitleRegex '请输入验证码') { return $true }
     return $false
 }
 
@@ -3938,9 +4106,10 @@ function Test-IsCaptchaDialogVisible {
         [switch]$FastOnly
     )
 
-    # 少数情况下验证码会是独立顶层窗口
+    # 验证码弹窗（被拥有窗口）：UIA 常枚举不到，用 Win32 EnumWindows 兜底
     $win = Find-WindowByAnyTitle -TitleRegex '验证码|请输入验证码'
     if ($null -ne $win) { return $true }
+    if (Test-NativeWindowTitleMatch -TitleRegex '验证码|请输入验证码') { return $true }
 
     if ($null -ne $ExportCfg) {
         if (Test-CaptchaRegionAppeared -ExportCfg $ExportCfg -BaselineHash $BaselineHash) { return $true }
@@ -4078,7 +4247,8 @@ function Get-ExportFlowState {
         $MainWindow = Find-MainApplicationWindow $MainWindowTitleRegex
     }
 
-    if ($null -ne (Find-WindowByAnyTitle -TitleRegex '导出数据至Excel|另存为|Save As')) {
+    if ($null -ne (Find-WindowByAnyTitle -TitleRegex '导出数据至Excel|另存为|Save As') -or `
+            (Test-NativeWindowTitleMatch -TitleRegex '导出数据至Excel|另存为|Save As')) {
         return [pscustomobject]@{
             State  = 'ExportSaveDialog'
             Detail = '检测到另存为/导出对话框'
@@ -4296,6 +4466,8 @@ function Save-ExportDialog {
 
     Write-Step '  正在保存导出文件，向当前焦点粘贴路径...'
     Start-SleepWithPause -Milliseconds $InitialWaitMilliseconds
+    Set-ImeEnglishForForeground
+    Start-SleepWithPause -Milliseconds 60
     Set-Clipboard -Value $FullPath
     Start-SleepWithPause -Milliseconds 60
     [System.Windows.Forms.SendKeys]::SendWait('^a')
@@ -4507,9 +4679,17 @@ function Resolve-CaptchaForExport {
 
         Write-Step ("  {0}：识别为 {1}，填入并确定。" -f $attemptLabel, $code)
 
-        # 清空输入框后粘贴，避免上一次残留
-        Invoke-ClickAndPasteText -X ([int]$ExportCfg.CaptchaInputX) -Y ([int]$ExportCfg.CaptchaInputY) `
-            -Text $code -FocusWindow $MainWindow
+        # 清空输入框后粘贴，避免上一次残留；带每步日志与写入后回读校验
+        Write-FocusDiagnostics -Tag '验证码填入前'
+        $inputOk = Invoke-ClickAndPasteText -X ([int]$ExportCfg.CaptchaInputX) -Y ([int]$ExportCfg.CaptchaInputY) `
+            -Text $code -FocusWindow $MainWindow -LogSteps
+        Write-FocusDiagnostics -Tag '验证码填入后'
+
+        # 按要求：若确认写入失败（回读为空），立即停止，避免无限刷新空转。
+        if (-not $inputOk) {
+            throw ("验证码输入框未能写入内容（回读为空），已立即停止以便排查。识别码='{0}'。请把以上 [诊断:...] 日志发我。" -f $code)
+        }
+
         Start-SleepWithPause -Milliseconds 150
 
         Invoke-ScreenClick -X ([int]$ExportCfg.ConfirmX) -Y ([int]$ExportCfg.ConfirmY) -FocusWindow $MainWindow
