@@ -6,7 +6,7 @@
     [ValidateSet('Main','Multi')]
     [string]$ListEntry = 'Main',
 
-    [string]$MainWindowTitleRegex = '8\.9\.4|医师电子化注册信息系统',
+    [string]$MainWindowTitleRegex = '医师电子化注册信息系统|机构版',
     [string]$DetailWindowTitleRegex = '信息展示|执业信息|详细信息',
     [string]$ViewDetailButtonRegex = '查看详',
 
@@ -71,7 +71,10 @@
     [switch]$DisableStateResume,
     [switch]$Resume,
     [switch]$NoScroll,
-    [switch]$KeepDetailWindowOpen
+    [switch]$KeepDetailWindowOpen,
+
+    # 机构端窗口离开前台时自动暂停，回到前台自动继续（可用 -DisableForegroundPause 关闭）
+    [switch]$DisableForegroundPause
 )
 
 Set-StrictMode -Version 2.0
@@ -124,6 +127,10 @@ public static class NativeWin32 {
     [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+    public const uint GW_OWNER = 4;
     [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
     [DllImport("imm32.dll")] public static extern IntPtr ImmGetDefaultIMEWnd(IntPtr hWnd);
     public const int VK_SPACE = 0x20;
@@ -399,10 +406,19 @@ function Get-MainWindowTitlePatterns {
         [char]0x533B, [char]0x5E08, [char]0x7535, [char]0x5B50, [char]0x5316,
         [char]0x6CE8, [char]0x518C, [char]0x4FE1, [char]0x606F, [char]0x7CFB, [char]0x7EDF
     )
-    foreach ($extra in @('8\.9\.4', $builtin, '注册信息', '电子化注册')) {
+    foreach ($extra in @($builtin, '电子化注册', '机构版')) {
         if (-not $patterns.Contains($extra)) { $patterns.Add($extra) }
     }
     return $patterns
+}
+
+function Test-MatchesMainWindowTitle {
+    param([string]$Title)
+    if ([string]::IsNullOrWhiteSpace($Title)) { return $false }
+    foreach ($pattern in (Get-MainWindowTitlePatterns -UserPattern $MainWindowTitleRegex)) {
+        if ($Title -match $pattern) { return $true }
+    }
+    return $false
 }
 
 function Find-MainApplicationWindow {
@@ -1067,7 +1083,7 @@ function Get-DoctorAppPathFromRunningProcess {
         try {
             $title = [string]$proc.MainWindowTitle
             if ([string]::IsNullOrWhiteSpace($title)) { continue }
-            if ($title -notmatch $MainWindowTitleRegex -and $title -notmatch $LoginWindowTitleRegex) { continue }
+            if ($title -notmatch $LoginWindowTitleRegex -and -not (Test-MatchesMainWindowTitle $title)) { continue }
 
             $path = Expand-AppPathCandidate -Path ([string]$proc.Path)
             if (-not [string]::IsNullOrWhiteSpace($path)) { return $path }
@@ -2445,6 +2461,9 @@ $script:LastErrorPopupTime = $null
 $script:CapturedSinceLastPopup = 0
 $script:ErrorPopupStatsReady = $false
 $script:IsCapturePaused = $false
+$script:IsForegroundPaused = $false
+$script:ForegroundPauseAnnounced = $false
+$script:PauseWhenAppNotForeground = $true
 $script:LastCtrlSpaceDown = $false
 $script:GlobalPauseHotkeyStarted = $false
 $script:ExportDebugTiming = (-not [string]::IsNullOrWhiteSpace($env:EXPORT_DEBUG_TIMING))
@@ -2528,7 +2547,7 @@ function Stop-DoctorApplication {
     foreach ($proc in Get-Process -ErrorAction SilentlyContinue) {
         try {
             $t = $proc.MainWindowTitle
-            if (-not [string]::IsNullOrWhiteSpace($t) -and ($t -match $MainWindowTitleRegex -or $t -match $LoginWindowTitleRegex)) {
+            if (-not [string]::IsNullOrWhiteSpace($t) -and ((Test-MatchesMainWindowTitle $t) -or $t -match $LoginWindowTitleRegex)) {
                 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
                 $killed++
             }
@@ -2643,21 +2662,126 @@ function Test-PauseToggleRequested {
     return $false
 }
 
+function Get-DoctorAppProcessIds {
+    $ids = @{}
+    $procName = [IO.Path]::GetFileNameWithoutExtension($script:DoctorAppExeName)
+    foreach ($proc in (Get-Process -Name $procName -ErrorAction SilentlyContinue)) {
+        $ids[[int]$proc.Id] = $true
+    }
+    foreach ($proc in (Get-Process -ErrorAction SilentlyContinue)) {
+        try {
+            $title = [string]$proc.MainWindowTitle
+            if ([string]::IsNullOrWhiteSpace($title)) { continue }
+            if (-not (Test-MatchesMainWindowTitle $title) -and $title -notmatch $LoginWindowTitleRegex -and $title -notmatch $DetailWindowTitleRegex) { continue }
+            $ids[[int]$proc.Id] = $true
+        }
+        catch { }
+    }
+    return $ids
+}
+
+function Get-WindowProcessId {
+    param([IntPtr]$Hwnd)
+    if ($Hwnd -eq [IntPtr]::Zero) { return 0 }
+    $procId = [uint32]0
+    [void][NativeWin32]::GetWindowThreadProcessId($Hwnd, [ref]$procId)
+    return [int]$procId
+}
+
+function Get-WindowTitleText {
+    param([IntPtr]$Hwnd)
+    if ($Hwnd -eq [IntPtr]::Zero) { return '' }
+    $sb = New-Object System.Text.StringBuilder 512
+    [void][NativeWin32]::GetWindowText($Hwnd, $sb, $sb.Capacity)
+    return [string]$sb
+}
+
+function Test-DoctorAppWindowTitle {
+    param([string]$Title)
+    if ([string]::IsNullOrWhiteSpace($Title)) { return $false }
+    if (Test-MatchesMainWindowTitle $Title) { return $true }
+    if ($Title -match $LoginWindowTitleRegex) { return $true }
+    if ($Title -match $DetailWindowTitleRegex) { return $true }
+    if ($Title -match '验证码|另存为|保存|导出') { return $true }
+    return $false
+}
+
+function Test-WindowBelongsToDoctorApp {
+    param([IntPtr]$Hwnd)
+    if ($Hwnd -eq [IntPtr]::Zero) { return $false }
+
+    $appPids = Get-DoctorAppProcessIds
+    $visited = @{}
+    $current = $Hwnd
+    while ($current -ne [IntPtr]::Zero -and -not $visited.ContainsKey($current.ToInt64())) {
+        $visited[$current.ToInt64()] = $true
+        $procId = Get-WindowProcessId -Hwnd $current
+        if ($procId -gt 0 -and $appPids.ContainsKey($procId)) { return $true }
+        $title = Get-WindowTitleText -Hwnd $current
+        if (Test-DoctorAppWindowTitle -Title $title) { return $true }
+        $current = [NativeWin32]::GetWindow($current, [NativeWin32]::GW_OWNER)
+    }
+    return $false
+}
+
+function Test-DoctorAppInForeground {
+    $fg = [NativeWin32]::GetForegroundWindow()
+    return Test-WindowBelongsToDoctorApp -Hwnd $fg
+}
+
+function Update-ForegroundPauseState {
+    if (-not $script:PauseWhenAppNotForeground) { return }
+
+    if (Test-DoctorAppInForeground) {
+        if ($script:IsForegroundPaused) {
+            $script:IsForegroundPaused = $false
+            $script:ForegroundPauseAnnounced = $false
+            Write-Step '机构端已回到前台，自动恢复运行。'
+        }
+        return
+    }
+
+    if (-not $script:IsForegroundPaused) {
+        $script:IsForegroundPaused = $true
+        if (-not $script:ForegroundPauseAnnounced) {
+            Write-Step '机构端不在前台，已自动暂停（切回机构端窗口后将自动继续）。'
+            $script:ForegroundPauseAnnounced = $true
+        }
+    }
+}
+
 function Wait-IfPauseRequested {
     try {
         if (Test-PauseToggleRequested) {
             $script:IsCapturePaused = -not $script:IsCapturePaused
-        }
-        if (-not $script:IsCapturePaused) { return }
-
-        Write-Step '已暂停（按【Ctrl+空格】继续，无需切换回控制台）...'
-        while ($script:IsCapturePaused) {
-            Start-Sleep -Milliseconds 150
-            if (Test-PauseToggleRequested) {
-                $script:IsCapturePaused = $false
+            if (-not $script:IsCapturePaused) {
+                $script:ForegroundPauseAnnounced = $false
             }
         }
-        Write-Step '已恢复运行。'
+
+        Update-ForegroundPauseState
+
+        if (-not $script:IsCapturePaused -and -not $script:IsForegroundPaused) { return }
+
+        if ($script:IsCapturePaused -and -not $script:IsForegroundPaused) {
+            Write-Step '已暂停（按【Ctrl+空格】继续，无需切换回控制台）...'
+        }
+
+        $wasManualPause = [bool]$script:IsCapturePaused
+        while ($script:IsCapturePaused -or $script:IsForegroundPaused) {
+            Start-Sleep -Milliseconds 150
+            if (Test-PauseToggleRequested) {
+                $script:IsCapturePaused = -not $script:IsCapturePaused
+                if (-not $script:IsCapturePaused) {
+                    $script:ForegroundPauseAnnounced = $false
+                }
+            }
+            Update-ForegroundPauseState
+        }
+
+        if ($wasManualPause -and -not $script:IsCapturePaused) {
+            Write-Step '已恢复运行。'
+        }
     }
     catch {
         # 控制台不可交互（如输入被重定向）时忽略暂停功能。
@@ -2685,6 +2809,9 @@ function Initialize-PauseHotkey {
     param([switch]$DeferGlobalHotkey)
 
     $script:IsCapturePaused = $false
+    $script:IsForegroundPaused = $false
+    $script:ForegroundPauseAnnounced = $false
+    $script:PauseWhenAppNotForeground = -not $DisableForegroundPause.IsPresent
     try {
         $ctrlDown = ([NativeWin32]::GetAsyncKeyState([NativeWin32]::VK_CONTROL) -band 0x8000) -ne 0
         $spaceDown = ([NativeWin32]::GetAsyncKeyState([NativeWin32]::VK_SPACE) -band 0x8000) -ne 0
@@ -2700,6 +2827,9 @@ function Initialize-PauseHotkey {
     }
     else {
         Write-Step '提示：运行中随时按【Ctrl+空格】暂停/恢复（按键轮询，焦点在医师系统时最稳）。'
+    }
+    if ($script:PauseWhenAppNotForeground) {
+        Write-Step '提示：机构端窗口不在前台时将自动暂停，切回机构端后自动继续。'
     }
 }
 
@@ -4124,7 +4254,7 @@ function Find-CaptchaErrorPopup {
         }
 
         # 跳过主程序窗口与大窗口：它们子树庞大，深扫会卡死，且错误弹窗一定是独立小窗
-        if (-not [string]::IsNullOrWhiteSpace($title) -and $title -match $MainWindowTitleRegex) { continue }
+        if (-not [string]::IsNullOrWhiteSpace($title) -and (Test-MatchesMainWindowTitle $title)) { continue }
         $rect = $win.Current.BoundingRectangle
         if ($rect.Width -gt 900 -or $rect.Height -gt 700) { continue }
 

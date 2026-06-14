@@ -20,7 +20,7 @@ param(
     [string]$Label = '',
     [switch]$Captcha,
     [string]$TestText = 'CESHI123',
-    [string]$MainWindowTitleRegex = '8\.9\.4|医师电子化注册信息系统'
+    [string]$MainWindowTitleRegex = '医师电子化注册信息系统|机构版'
 )
 
 $ErrorActionPreference = 'Stop'
