@@ -47,6 +47,7 @@ from src.minke_reg import (
 )
 
 from src.cli.automation import AUTOMATION_TASKS, describe_task, run_task
+from src.cli.pipeline_cmds import add_pipeline_commands
 
 
 
@@ -320,7 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_auto.set_defaults(func=cmd_run_automation)
 
-
+    add_pipeline_commands(subparsers)
 
     return parser
 

@@ -1,1 +1,1 @@
-"""Reserved for future API + automation orchestration workflows."""
+"""Pipeline workflow entry points live in src.cli.pipeline_cmds."""

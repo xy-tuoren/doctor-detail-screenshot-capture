@@ -1,0 +1,9 @@
+# 卫健委采集（src/capture/nhc）可选依赖
+# 安装后还需执行：playwright install chromium
+playwright>=1.40.0
+playwright-stealth>=2.0.0
+ddddocr>=1.4.0
+Pillow>=10.0.0
+
+# 可选：opencv 预处理增强（CLAHE / Otsu 二值化），缺失时自动回退 Pillow
+# opencv-python-headless>=4.8.0
