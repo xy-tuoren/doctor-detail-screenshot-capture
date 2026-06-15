@@ -2729,6 +2729,53 @@ function Test-DoctorAppInForeground {
     return Test-WindowBelongsToDoctorApp -Hwnd $fg
 }
 
+function Ensure-DoctorAppForeground {
+    if (Test-DoctorAppInForeground) { return $true }
+
+    Write-Step '尝试将医师系统窗口带到前台...'
+
+    $target = Find-MainApplicationWindow $MainWindowTitleRegex
+    if ($null -eq $target) {
+        $target = Find-WindowByAnyTitle -TitleRegex $LoginWindowTitleRegex
+    }
+
+    if ($null -eq $target) {
+        Write-Step '未检测到医师系统窗口，尝试启动应用...'
+        Start-DoctorApplication
+        $deadline = (Get-Date).AddSeconds($LoginWaitSeconds)
+        do {
+            $target = Find-MainApplicationWindow $MainWindowTitleRegex
+            if ($null -eq $target) {
+                $target = Find-WindowByAnyTitle -TitleRegex $LoginWindowTitleRegex
+            }
+            if ($null -ne $target) { break }
+            Start-Sleep -Milliseconds 500
+        } while ((Get-Date) -lt $deadline)
+    }
+
+    if ($null -ne $target) {
+        Bring-ToFront $target
+        $main = Find-MainApplicationWindow $MainWindowTitleRegex
+        if ($null -ne $main) {
+            Maximize-Window $main
+            Bring-ToFront $main
+        }
+        else {
+            Bring-ToFront $target
+        }
+        Start-Sleep -Milliseconds 300
+    }
+
+    if (Test-DoctorAppInForeground) {
+        $script:IsForegroundPaused = $false
+        $script:ForegroundPauseAnnounced = $false
+        Write-Step '医师系统窗口已激活。'
+        return $true
+    }
+
+    return $false
+}
+
 function Update-ForegroundPauseState {
     if (-not $script:PauseWhenAppNotForeground) { return }
 
@@ -5224,6 +5271,7 @@ function Invoke-ExportWithLogin {
     # 暂停/恢复改由 Wait-IfPauseRequested 中的按键轮询（GetAsyncKeyState）实现，全局有效。
     Initialize-PauseHotkey -DeferGlobalHotkey
     try {
+        Ensure-DoctorAppForeground | Out-Null
         if ($ListEntry -eq 'Multi') {
             Invoke-MultiExportFlow | Out-Null
         }
