@@ -53,11 +53,11 @@ def has_writable_fields(payload: dict[str, Any], *, include_images: bool = False
 
 
 def needs_institution_capture(payload: dict[str, Any]) -> bool:
-    return "InstitutionUrl" in payload and not payload.get("InstitutionUrl")
+    return "institutionBase" in payload and not payload.get("institutionBase")
 
 
 def needs_nhc_capture(payload: dict[str, Any]) -> bool:
-    return "HealthCommissionUrl" in payload and not payload.get("HealthCommissionUrl")
+    return "healthCommissionBase" in payload and not payload.get("healthCommissionBase")
 
 
 def iter_institution_capture_targets(data: list[dict[str, Any]] | dict[str, Any]) -> list[dict[str, Any]]:

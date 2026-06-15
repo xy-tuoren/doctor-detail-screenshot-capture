@@ -2,7 +2,7 @@
 
 补全莲藕 `recordDate`（备案日期）时的字段来源因执业分类而不同：
 
-- **多执业**：`recordDate`←导出"开始日期"；`recordExpireDate`、`healthCommissionExpireDate`、`institutionExpireDate` 三个到期日期都←导出"结束日期"。
-- **主执业**：机构端"主执业导出"没有开始/结束日期，因此 `recordDate`←导出"审核日期"；上述三个到期日期主执业不补。
+- **多执业**：`recordDate`←导出"开始日期"；`recordExpireDate`（备案到期日期）←导出"结束日期"。
+- **主执业**：机构端"主执业导出"没有开始/结束日期，因此 `recordDate`←导出"审核日期"；`recordExpireDate` 主执业不补。
 
 "审核日期当备案日期"很反直觉，未了解机构端导出结构的人会以为是 bug。记录于此，避免被"修正"。本规则依赖主执业导出含"审核日期"列、多执业导出含"开始日期/结束日期"列；列名变动需同步更新映射。

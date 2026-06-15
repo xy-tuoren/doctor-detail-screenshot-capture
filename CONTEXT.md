@@ -29,7 +29,7 @@ _Avoid_: 公示平台、国网
 ### 核对与名单（Reconciliation & Rosters）
 
 **核对（对比）**：
-以莲藕系统名单为基准，用莲藕的 `doctorName` + `idCard` 与机构端导出的「姓名」+「身份证号」**双字段同时匹配**。莲藕 API 无 `idCard` 时，按姓名在机构端导出中查找（仅唯一命中时采用）以补全身份证，再参与匹配或写入缺失名单。禁止仅用姓名 fallback 进入待补 JSON（补全后仍须身份证+姓名与导出一致）。机构端导出有而莲藕没有（不处理）。
+以莲藕系统名单为基准，用莲藕的 `doctorName` + `idCard` 与机构端导出的「姓名」+「身份证号」**双字段同时匹配**。莲藕无 `idCard`、导出无该身份证、或姓名与导出不一致 → **缺失名单**。双匹配成功且 `updateField` 非空 → **to_supplement.json**。禁止仅用姓名推断身份证或进入待补 JSON。机构端导出有而莲藕没有（不处理）。
 _Avoid_: 比对、匹配
 
 **待补 JSON（to_supplement.json）**：
@@ -46,9 +46,9 @@ _Avoid_: updateField（仅指接口字段实现时使用）
 ### 采集产物（Capture Artifacts）
 
 **机构端图片**：
-从机构端客户端详情窗采集的执业信息截图。对应莲藕系统的 `institutionUrl`（机构端图片）字段。
+从机构端客户端详情窗采集的执业信息截图。对应莲藕系统的 `institutionBase`（机构端图片 base64）字段。
 _Avoid_: captures、详情截图
 
 **卫健委图片**：
-从卫健委公示平台采集的医师信息截图，与机构端图片同存于 `captures/` 下（`captures/卫健委/`）。对应莲藕系统的 `healthCommissionUrl`（卫健委图片）字段。
+从卫健委公示平台采集的医师信息截图，与机构端图片同存于 `captures/` 下（`captures/卫健委/`）。对应莲藕系统的 `healthCommissionBase`（卫健委图片 base64）字段。
 _Avoid_: screenshots、batch-doctor-query

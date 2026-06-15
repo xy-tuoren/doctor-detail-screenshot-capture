@@ -14,7 +14,7 @@ from src.api import (
 
     default_output_path,
 
-    fetch_all_records,
+    fetch_doctors_with_cache,
 
     load_api_config,
 
@@ -25,6 +25,8 @@ from src.api import (
     save_xlsx,
 
 )
+
+from src.pipeline.paths import ensure_workspace
 
 from src.minke_reg import (
 
@@ -65,7 +67,12 @@ def cmd_fetch_doctors(args: argparse.Namespace) -> int:
 
 
 
-        records = fetch_all_records(api_cfg, max_pages=args.max_pages)
+        records = fetch_doctors_with_cache(
+            api_cfg,
+            ensure_workspace(),
+            refresh=bool(getattr(args, "refresh_cache", False)),
+            max_pages=args.max_pages,
+        )
 
         output_path = args.output or default_output_path(api_cfg)
 
@@ -220,6 +227,12 @@ def build_parser() -> argparse.ArgumentParser:
     fetch.add_argument("--page-size", type=int, default=None, help="Override doctorApi.pageSize")
 
     fetch.add_argument("--max-pages", type=int, default=None, help="Fetch only first N pages")
+
+    fetch.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Ignore doctors API cache and fetch fresh data (default: reuse 24h cache)",
+    )
 
     fetch.set_defaults(func=cmd_fetch_doctors)
 

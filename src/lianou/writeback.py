@@ -11,12 +11,10 @@ from typing import Any
 UPDATE_PATH = "/api/doctorExt/UpdateDoctorMedical"
 
 PASCAL_FIELD_MAP = {
-    "recordDate": "RecordDate",
-    "recordExpireDate": "RecordExpireDate",
-    "healthCommissionExpireDate": "HealthCommissionExpireDate",
-    "healthCommissionUrl": "HealthCommissionUrl",
-    "institutionExpireDate": "InstitutionExpireDate",
-    "institutionUrl": "InstitutionUrl",
+    "recordDate": "recordDate",
+    "recordExpireDate": "recordExpireDate",
+    "healthCommissionBase": "healthCommissionBase",
+    "institutionBase": "institutionBase",
 }
 
 IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
@@ -41,7 +39,7 @@ def build_update_url(api_cfg: dict[str, Any]) -> str:
     return f"{base}{UPDATE_PATH}?{query}"
 
 
-def encode_image_base64(image_path: Path, *, data_uri: bool = True) -> str:
+def encode_image_base64(image_path: Path, *, data_uri: bool = False) -> str:
     raw = image_path.read_bytes()
     encoded = base64.b64encode(raw).decode("ascii")
     if data_uri:
@@ -56,7 +54,7 @@ class LianouWritebackClient:
     def __init__(self, api_cfg: dict[str, Any]):
         self.api_cfg = api_cfg
         self.timeout = int(api_cfg.get("requestTimeoutSeconds", 60))
-        self.image_data_uri = bool(api_cfg.get("imageDataUri", True))
+        self.image_data_uri = bool(api_cfg.get("imageDataUri", False))
 
     def update_from_payload(self, payload: dict[str, Any]) -> WritebackResult:
         from src.reconcile.to_supplement import postable_body

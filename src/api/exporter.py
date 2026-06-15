@@ -24,10 +24,8 @@ COLUMN_DEFS: list[tuple[str, str, str]] = [
     ("departmentName", "科室名称", "departmentName"),
     ("recordDate", "备案日期", "recordDate"),
     ("recordExpireDate", "备案到期日期", "recordExpireDate"),
-    ("healthCommissionExpireDate", "卫健委到期日期", "healthCommissionExpireDate"),
-    ("healthCommissionUrl", "卫健委图片", "healthCommissionUrl"),
-    ("institutionExpireDate", "机构端到期日期", "institutionExpireDate"),
-    ("institutionUrl", "机构端图片", "institutionUrl"),
+    ("healthCommissionBase", "卫健委图片", "healthCommissionBase"),
+    ("institutionBase", "机构端图片", "institutionBase"),
     ("updateField", "缺失字段", "updateField"),
 ]
 

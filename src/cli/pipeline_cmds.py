@@ -6,7 +6,7 @@ from pathlib import Path
 
 from src.api import (
     default_output_path,
-    fetch_all_records,
+    fetch_doctors_with_cache,
     load_api_config,
     merge_api_config,
     project_root,
@@ -54,7 +54,12 @@ def _load_doctors(args: argparse.Namespace, workspace: Path) -> list:
     api_cfg = merge_api_config(load_api_config(args.config))
     if args.page_size is not None:
         api_cfg["pageSize"] = args.page_size
-    return fetch_all_records(api_cfg, max_pages=args.max_pages)
+    return fetch_doctors_with_cache(
+        api_cfg,
+        workspace,
+        refresh=bool(getattr(args, "refresh_cache", False)),
+        max_pages=args.max_pages,
+    )
 
 
 def _load_export_index(args: argparse.Namespace) -> dict:
@@ -71,7 +76,12 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         if args.page_size is not None:
             api_cfg["pageSize"] = args.page_size
 
-        records = fetch_all_records(api_cfg, max_pages=args.max_pages)
+        records = fetch_doctors_with_cache(
+            api_cfg,
+            workspace,
+            refresh=bool(getattr(args, "refresh_cache", False)),
+            max_pages=args.max_pages,
+        )
 
         if args.output_json or args.save_json or args.debug:
             out_json = args.output_json or doctors_json(workspace)
@@ -153,7 +163,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             f"matchedRecords={summary.get('matchedRecords', 0)} "
             f"missing={summary.get('missing', 0)} "
             f"missingNoIdCard={summary.get('missingNoIdCard', 0)} "
-            f"idCardFromExport={summary.get('idCardFromExport', 0)} "
+            f"missingNotInExport={summary.get('missingNotInExport', 0)} "
             f"nameMismatch={summary.get('nameMismatch', 0)}"
         )
         print(f"saved to_supplement.json to {supplement_path}")
@@ -287,27 +297,27 @@ def cmd_upload_images(args: argparse.Namespace) -> int:
             if needs_institution_capture(payload):
                 image = find_institution_image(captures_root, name, id_card)
                 if image:
-                    payload["InstitutionUrl"] = encode_image_base64(
+                    payload["institutionBase"] = encode_image_base64(
                         image, data_uri=client.image_data_uri
                     )
                     touched = True
                     filled += 1
-                    print(f"[FILL] {name} InstitutionUrl <- {image.name}")
+                    print(f"[FILL] {name} institutionBase <- {image.name}")
                 else:
-                    print(f"[SKIP] {name} InstitutionUrl: image not found")
+                    print(f"[SKIP] {name} institutionBase: image not found")
                     skipped += 1
 
             if needs_nhc_capture(payload):
                 image = find_nhc_image(nhc_root, name, cert_code)
                 if image:
-                    payload["HealthCommissionUrl"] = encode_image_base64(
+                    payload["healthCommissionBase"] = encode_image_base64(
                         image, data_uri=client.image_data_uri
                     )
                     touched = True
                     filled += 1
-                    print(f"[FILL] {name} HealthCommissionUrl <- {image.name}")
+                    print(f"[FILL] {name} healthCommissionBase <- {image.name}")
                 else:
-                    print(f"[SKIP] {name} HealthCommissionUrl: image not found")
+                    print(f"[SKIP] {name} healthCommissionBase: image not found")
                     skipped += 1
 
             if touched and not dry_run:
@@ -377,6 +387,11 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Save intermediate debug artifacts (doctors.json, export_index.json, etc.)",
     )
+    common.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Ignore doctors API cache and fetch fresh data (default: reuse 24h cache)",
+    )
 
     fetch = subparsers.add_parser("fetch", parents=[common], help="Fetch Lianou doctors")
     fetch.add_argument("--output-json", type=Path, default=None, help="Output doctors.json path")
@@ -429,7 +444,7 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
     supplement.add_argument(
         "--include-images",
         action="store_true",
-        help="Also submit HealthCommissionUrl/InstitutionUrl when present in JSON",
+        help="Also submit healthCommissionBase/institutionBase when present in JSON",
     )
     supplement.add_argument(
         "--commit", action="store_true", help="Actually call the update API (default: dry-run)"
@@ -439,7 +454,7 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
     capture_institution = subparsers.add_parser(
         "capture-institution",
         parents=[common],
-        help="Capture institution-side screenshots for missing institutionUrl",
+        help="Capture institution-side screenshots for missing institutionBase",
     )
     capture_institution.add_argument(
         "--plan",
@@ -453,7 +468,7 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
     capture_nhc = subparsers.add_parser(
         "capture-nhc",
         parents=[common],
-        help="Capture NHC screenshots for missing healthCommissionUrl",
+        help="Capture NHC screenshots for missing healthCommissionBase",
     )
     capture_nhc.add_argument(
         "--plan",

@@ -6,16 +6,15 @@ from .field_mapping import map_export_values
 
 # updateField 可点名的字段 → UpdateDoctorMedical 请求体属性名
 CAMEL_TO_API: dict[str, str] = {
-    "recordDate": "RecordDate",
-    "recordExpireDate": "RecordExpireDate",
-    "healthCommissionExpireDate": "HealthCommissionExpireDate",
-    "healthCommissionUrl": "HealthCommissionUrl",
-    "institutionExpireDate": "InstitutionExpireDate",
-    "institutionUrl": "InstitutionUrl",
+    "recordDate": "recordDate",
+    "recordExpireDate": "recordExpireDate",
+    "healthCommissionBase": "healthCommissionBase",
+    "institutionBase": "institutionBase",
 }
 
 REQUIRED_API_KEYS = frozenset({"AId", "DoctorFileId", "doctorName"})
-IMAGE_API_FIELDS = frozenset({"HealthCommissionUrl", "InstitutionUrl"})
+IMAGE_API_FIELDS = frozenset({"healthCommissionBase", "institutionBase"})
+IMAGE_CANONICAL_FIELDS = frozenset({"healthCommissionBase", "institutionBase"})
 
 
 def _str(value: Any) -> str:
@@ -46,7 +45,7 @@ def build_update_payload(
         api_key = CAMEL_TO_API.get(field)
         if not api_key:
             continue
-        if field.endswith("Url"):
+        if field in IMAGE_CANONICAL_FIELDS:
             # 占位，供后续截图脚本填入 base64
             payload[api_key] = ""
             continue
