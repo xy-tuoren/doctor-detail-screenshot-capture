@@ -213,13 +213,15 @@ def cmd_capture_institution(args: argparse.Namespace) -> int:
 
         to_supplement = load_json(plan_path)
         targets = iter_institution_capture_targets(to_supplement)
+        captures_root = getattr(args, "captures_dir", None) or (project_root() / "captures")
         code = run_institution_capture(
             targets,
             config_path=args.config,
             workspace=workspace,
+            captures_root=captures_root,
             dry_run=args.dry_run,
         )
-        print(f"institution capture targets: {len(targets)}")
+        print(f"institution capture targets from plan: {len(targets)}")
         return code
     except Exception as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
@@ -461,6 +463,12 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
         type=Path,
         default=None,
         help="Path to to_supplement.json (default: workspace/to_supplement.json)",
+    )
+    capture_institution.add_argument(
+        "--captures-dir",
+        type=Path,
+        default=None,
+        help="Existing screenshot root (default: ./captures)",
     )
     capture_institution.add_argument("--dry-run", action="store_true")
     capture_institution.set_defaults(func=cmd_capture_institution)

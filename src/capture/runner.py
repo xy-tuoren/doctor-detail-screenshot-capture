@@ -10,6 +10,47 @@ from src.capture.paths import default_nhc_captures_dir
 from src.cli.automation import PS1, run_task, AutomationTask
 
 
+def institution_list_folder(list_entry: str) -> str:
+    return "多执业" if list_entry == "Multi" else "主执业"
+
+
+def institution_capture_exists(
+    captures_root: Path,
+    name: str,
+    id_card: str,
+    list_entry: str,
+) -> bool:
+    """Match PS1 Test-PersonAlreadyCaptured: requires id_card; checks list-specific folder."""
+    if not id_card.strip():
+        return False
+    folder = captures_root / institution_list_folder(list_entry)
+    if not folder.exists():
+        return False
+    exact = folder / f"{name}_{id_card}.png"
+    if exact.exists():
+        return True
+    prefix = f"{name}_"
+    for path in folder.glob(f"{name}_*.png"):
+        if path.name.startswith(prefix):
+            return True
+    return False
+
+
+def filter_institution_capture_targets(
+    targets: list[dict[str, Any]],
+    captures_root: Path,
+) -> tuple[list[dict[str, Any]], int]:
+    pending: list[dict[str, Any]] = []
+    for item in targets:
+        name = str(item.get("name") or "")
+        id_card = str(item.get("idCard") or "")
+        list_entry = str(item.get("listEntry") or "Main")
+        if institution_capture_exists(captures_root, name, id_card, list_entry):
+            continue
+        pending.append(item)
+    return pending, len(targets) - len(pending)
+
+
 def build_capture_config(
     base_config: Path,
     persons: list[dict[str, str]],
@@ -31,14 +72,27 @@ def run_institution_capture(
     *,
     config_path: Path,
     workspace: Path,
+    captures_root: Path | None = None,
     dry_run: bool = False,
 ) -> int:
     if not targets:
         print("no institution capture targets")
         return 0
 
+    root = project_root()
+    captures = captures_root or (root / "captures")
+    pending_targets, skipped = filter_institution_capture_targets(targets, captures)
+    if skipped:
+        print(
+            f"institution capture: skipped {skipped}/{len(targets)} "
+            f"with existing screenshots under {captures}"
+        )
+    if not pending_targets:
+        print("no institution capture targets (all have existing screenshots)")
+        return 0
+
     grouped: dict[str, list[dict[str, str]]] = {"Main": [], "Multi": []}
-    for item in targets:
+    for item in pending_targets:
         entry = item.get("listEntry") or "Main"
         grouped.setdefault(entry, []).append(
             {
@@ -47,7 +101,6 @@ def run_institution_capture(
             }
         )
 
-    root = project_root()
     exit_code = 0
     for list_entry, persons in grouped.items():
         if not persons:
