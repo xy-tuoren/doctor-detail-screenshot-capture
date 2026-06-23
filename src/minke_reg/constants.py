@@ -48,11 +48,17 @@ DEFAULT_MINKE_REG_CONFIG = {
 
     "mainSearchType": 1,
 
-    "multiSearchType": 9,
+    "multiSearchType": 8,
 
     "forceRefreshMd5": "",
 
     "useDoctorUnitGetListForOther": False,
+
+    "detailFetchWorkers": 48,
+
+    "detailFetchRetries": 2,
+
+    "detailReuseConnection": True,
 
 }
 

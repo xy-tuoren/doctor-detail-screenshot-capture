@@ -6,7 +6,7 @@ echo ========================================
 echo   Export main doctors via SOAP API
 echo   (no UI / no coordinates)
 echo   Output: exports\reg-api\主执业导出-^<timestamp^>.xlsx
-echo   (single sheet, same as UI list export / searchType 1)
+echo   (15 UI columns, no electronic license; certs via GetRegDetailForUnit)
 echo ========================================
 echo.
 echo Coordinate-based export remains at cmd\automation\export.cmd

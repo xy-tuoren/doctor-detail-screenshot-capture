@@ -29,11 +29,14 @@ _Avoid_: 公示平台、国网
 ### 核对与名单（Reconciliation & Rosters）
 
 **核对（对比）**：
-以莲藕系统名单为基准，用莲藕的 `doctorName` + `idCard` 与机构端导出的「姓名」+「身份证号」**双字段同时匹配**。莲藕无 `idCard`、导出无该身份证、或姓名与导出不一致 → **缺失名单**。双匹配成功且 `updateField` 非空 → **to_supplement.json**。禁止仅用姓名推断身份证或进入待补 JSON。机构端导出有而莲藕没有（不处理）。
+以莲藕系统名单为基准，用莲藕的 `doctorName` + `idCard` 与机构端导出的「姓名」+「身份证号」**双字段同时匹配**。莲藕无 `idCard`、导出无该身份证、或姓名与导出不一致 → **缺失名单**。双匹配成功且 `updateField` 非空 → **to_supplement.json**。机构端导出有而莲藕没有 → **to_create.json**（供后续新增接口）。禁止仅用姓名推断身份证或进入待补 JSON。
 _Avoid_: 比对、匹配
 
 **待补 JSON（to_supplement.json）**：
 核对后「双匹配成功」且 `updateField` 非空的记录，保存为 **UpdateDoctorMedical 请求体数组**。每项仅含接口必填三项（`AId`、`DoctorFileId`、`doctorName`）以及 **updateField 点名的待补字段**；日期等由机构端导出解析后填入，图片字段以空字符串占位供后续脚本写入 base64。不含无需修改的字段。
+
+**待新增 JSON（to_create.json）**：
+机构端导出中有、莲藕系统中无对应身份证的记录，保存为 **新增接口请求体数组**（尚无 `AId` / `DoctorFileId`）。含 `doctorName`、`iDCard`、执业类型、可映射的日期/科室，图片字段空占位，并附 `_capture`（截图用）与 `_export`（原始导出行）。
 
 **缺失名单**：
 核对后生成的、「莲藕系统有但无法完成姓名+身份证双匹配」的医生名单（xlsx），**仅两列：姓名、身份证**，按 `(姓名, 身份证)` 去重。莲藕无身份证时身份证列为空。

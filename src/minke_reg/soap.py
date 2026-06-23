@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import http.client
+import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any
@@ -19,10 +22,23 @@ def _find_text(parent: ET.Element, local: str) -> str:
 
 
 class SoapClient:
-    def __init__(self, service_url: str, namespace: str, timeout: int = 120) -> None:
+    def __init__(
+        self,
+        service_url: str,
+        namespace: str,
+        timeout: int = 120,
+        *,
+        reuse_connection: bool = False,
+    ) -> None:
         self.service_url = service_url
         self.namespace = namespace.rstrip("/") + "/"
         self.timeout = timeout
+        self.reuse_connection = reuse_connection
+        if reuse_connection:
+            parsed = urllib.parse.urlparse(service_url)
+            self._host = parsed.hostname or ""
+            self._path = parsed.path or "/"
+            self._conn_local = threading.local()
 
     def call(
         self,
@@ -30,6 +46,11 @@ class SoapClient:
         body_xml: str,
         header_xml: str = "",
     ) -> str:
+        if self.reuse_connection:
+            return self._call_reuse(action, body_xml, header_xml)
+        return self._call_urlopen(action, body_xml, header_xml)
+
+    def _build_envelope(self, body_xml: str, header_xml: str) -> bytes:
         header_block = header_xml or ""
         envelope = (
             '<?xml version="1.0" encoding="utf-8"?>'
@@ -40,7 +61,9 @@ class SoapClient:
             f"<soap:Body>{body_xml}</soap:Body>"
             "</soap:Envelope>"
         )
-        payload = envelope.encode("utf-8")
+        return envelope.encode("utf-8")
+
+    def _soap_headers(self, action: str, *, keep_alive: bool = False) -> dict[str, str]:
         headers = {
             "Content-Type": "text/xml; charset=utf-8",
             "SOAPAction": f'"{action}"',
@@ -48,10 +71,16 @@ class SoapClient:
                 "Mozilla/4.0 (compatible; MSIE 6.0; MS Web Services Client Protocol 4.0.30319.42000)"
             ),
         }
+        if keep_alive:
+            headers["Connection"] = "keep-alive"
+        return headers
+
+    def _call_urlopen(self, action: str, body_xml: str, header_xml: str) -> str:
+        payload = self._build_envelope(body_xml, header_xml)
         req = urllib.request.Request(
             self.service_url,
             data=payload,
-            headers=headers,
+            headers=self._soap_headers(action),
             method="POST",
         )
         try:
@@ -60,6 +89,28 @@ class SoapClient:
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"SOAP HTTP {exc.code}: {body[:500]}") from exc
+
+    def _call_reuse(self, action: str, body_xml: str, header_xml: str) -> str:
+        payload = self._build_envelope(body_xml, header_xml)
+        conn = getattr(self._conn_local, "conn", None)
+        if conn is None:
+            conn = http.client.HTTPSConnection(self._host, timeout=self.timeout)
+            self._conn_local.conn = conn
+        try:
+            conn.request(
+                "POST",
+                self._path,
+                body=payload,
+                headers=self._soap_headers(action, keep_alive=True),
+            )
+            resp = conn.getresponse()
+            data = resp.read().decode("utf-8", errors="replace")
+            if resp.status >= 400:
+                raise RuntimeError(f"SOAP HTTP {resp.status}: {data[:500]}")
+            return data
+        except (http.client.HTTPException, OSError, RuntimeError):
+            self._conn_local.conn = None
+            raise
 
     def call_operation(
         self,

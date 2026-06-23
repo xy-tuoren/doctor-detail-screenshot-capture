@@ -52,8 +52,11 @@
     "outputDir": "exports/reg-api",
     "requestTimeoutSeconds": 120,
     "mainSearchType": 1,
-    "multiSearchType": 9,
+    "multiSearchType": 8,
     "useDoctorUnitGetListForOther": false,
-    "forceRefreshMd5": ""
+    "forceRefreshMd5": "",
+    "detailFetchWorkers": 48,
+    "detailFetchRetries": 2,
+    "detailReuseConnection": true
   }
 }

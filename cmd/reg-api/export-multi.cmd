@@ -6,6 +6,7 @@ echo ========================================
 echo   Export multi doctors via SOAP API
 echo   (no UI / no coordinates)
 echo   Output: exports\reg-api\多执业导出-^<timestamp^>.xlsx
+echo   (searchType 8, same roster as UI 多执业 tab / export)
 echo ========================================
 echo.
 echo Coordinate-based export remains at cmd\automation\export-multi.cmd

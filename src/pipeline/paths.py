@@ -20,6 +20,10 @@ def to_supplement_json(workspace: Path) -> Path:
     return workspace / "to_supplement.json"
 
 
+def to_create_json(workspace: Path) -> Path:
+    return workspace / "to_create.json"
+
+
 def doctors_json(workspace: Path) -> Path:
     return workspace / "doctors.json"
 

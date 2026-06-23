@@ -1,5 +1,5 @@
 ﻿param(
-    [ValidateSet('Probe','Prototype','Batch','Search','SearchNames','Calibrate','LoginCalibrate','CalibrateAll','LoginToHome','OpenListAndSearchNames','LoginAndSearchNames','Review','Export','ExportCalibrate','CaptchaRecoveryProbe')]
+    [ValidateSet('Probe','Prototype','Batch','Search','SearchNames','Calibrate','LoginCalibrate','CalibrateAll','LoginToHome','OpenListAndSearchNames','LoginAndSearchNames','Review','Export','ExportCalibrate','CaptchaRecoveryProbe','CaptureGetLatest')]
     [string]$Mode = 'Probe',
 
     # 列表入口：Main=主执业机构在本院医师；Multi=外院在本院多执业医师
@@ -5236,6 +5236,80 @@ function Invoke-CaptchaRecoveryProbe {
     Write-Step ("[探针] 完成。截图与日志目录：{0}" -f $probeDir)
 }
 
+function Invoke-CaptureGetLatestFlow {
+    param([int]$WaitSeconds = 8)
+
+    try {
+        Initialize-CaptchaOcrWarmup
+
+        $exportCfg = Get-ExportCalibration
+        if ($null -eq $exportCfg) {
+            throw '未找到 exportCalibration，请先运行 cmd\automation\export-calibrate.cmd。'
+        }
+
+        $main = Enter-ExportListPage -EntryLabel '主执业'
+
+        Write-Step '检测列表页状态...'
+        $state = Get-ExportFlowState -MainWindow $main -ExportCfg $exportCfg -QuickCheck
+        Write-ExportFlowState $state
+
+        $captchaAlreadyOpen = ($state.State -eq 'CaptchaDialog')
+        if ($state.State -eq 'CaptchaError') {
+            Write-Step '检测到未完成的验证码错误状态，先恢复后再继续。'
+            Recover-CaptchaForRetry -ExportCfg $exportCfg -MainWindow $main
+            $captchaAlreadyOpen = $true
+        }
+        elseif ($state.State -ne 'ListReady' -and -not $captchaAlreadyOpen) {
+            throw ("进入列表页后状态异常：{0} — {1}。请确认页面是否正确。" -f $state.State, $state.Detail)
+        }
+
+        $baselineHash = Get-CaptchaRegionHash -ExportCfg $exportCfg
+        if ($captchaAlreadyOpen) {
+            Write-Step '验证码弹窗已打开，直接识别提交。'
+            $captchaWait = 'Captcha'
+        }
+        else {
+            Write-Step '点击【获取最新】...'
+            Invoke-ScreenClick -X ([int]$exportCfg.GetLatestX) -Y ([int]$exportCfg.GetLatestY) -FocusWindow $main
+            Move-CursorAway -MainWindow $main
+            $main = Find-MainApplicationWindow $MainWindowTitleRegex
+            if ($null -ne $main) { Bring-ToFront $main }
+            $captchaWait = Wait-ForCaptchaDialog -MainWindow $main -ExportCfg $exportCfg -BaselineHash $baselineHash
+        }
+
+        if ($captchaWait -eq 'Captcha') {
+            Write-Step '识别并提交验证码...'
+            if (-not (Resolve-CaptchaForExport -ExportCfg $exportCfg -MainWindow $main -ListBaselineHash $baselineHash)) {
+                $state = Get-ExportFlowState -MainWindow $main -ExportCfg $exportCfg -DeepCheck
+                Write-ExportFlowState $state
+                throw '验证码识别失败（已用尽重试次数）。可查看 logs\captcha-last.png 核对截图区域。'
+            }
+        }
+        elseif ($captchaWait -eq 'NoCaptcha') {
+            Write-Step '获取最新无需验证码，列表已就绪。'
+        }
+        else {
+            $state = Get-ExportFlowState -MainWindow $main -ExportCfg $exportCfg -DeepCheck
+            Write-ExportFlowState $state
+            throw ("等待验证码弹窗超时，当前状态：{0} — {1}" -f $state.State, $state.Detail)
+        }
+
+        $main = Find-MainApplicationWindow $MainWindowTitleRegex
+        if ($null -eq $main) { throw '验证码通过后主窗口丢失。' }
+        Bring-ToFront $main
+
+        if (-not (Wait-UntilListReadyForExport -MainWindow $main -ExportCfg $exportCfg)) {
+            throw '验证码通过后列表未就绪，请重试。'
+        }
+
+        Write-Step ("【获取最新】完成，等待 {0}s..." -f $WaitSeconds)
+        Start-Sleep -Seconds $WaitSeconds
+    }
+    finally {
+        Stop-CaptchaOcrServer
+    }
+}
+
 function Complete-ExportSaveDialog {
     param(
         [string]$Entry,
@@ -5439,5 +5513,6 @@ switch ($Mode) {
     'Review' { Review-Output }
     'ExportCalibrate' { Invoke-ExportCalibration }
     'CaptchaRecoveryProbe' { Invoke-CaptchaRecoveryProbe }
+    'CaptureGetLatest' { Invoke-CaptureGetLatestFlow }
     'Export' { Invoke-ExportWithLogin }
 }

@@ -5,6 +5,7 @@ from typing import Any
 
 from .field_mapping import MAIN_PRACTICE, MULTI_PRACTICE, map_export_values
 from .api_payload import build_update_payload
+from .to_create import build_create_payload
 from .update_field import parse_update_fields
 
 
@@ -89,6 +90,38 @@ def _dedupe_missing(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     return out
 
 
+def _collect_lianou_id_cards(doctors: list[dict[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for doctor in doctors:
+        id_card = extract_id_card(doctor)
+        if id_card:
+            ids.add(id_card)
+    return ids
+
+
+def _collect_export_only(
+    lianou_id_cards: set[str],
+    main_index: dict[str, dict[str, Any]],
+    multi_index: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    export_ids = set(main_index.keys()) | set(multi_index.keys())
+    payloads: list[dict[str, Any]] = []
+    for id_card in sorted(export_ids - lianou_id_cards):
+        export_row, practice_source = _resolve_export_row(id_card, main_index, multi_index)
+        if export_row is None or practice_source is None:
+            continue
+        if not normalize_name(export_row.get("姓名")):
+            continue
+        payloads.append(
+            build_create_payload(
+                export_row=export_row,
+                practice_source=practice_source,
+                id_card=id_card,
+            )
+        )
+    return payloads
+
+
 def reconcile_doctors(
     doctors: list[dict[str, Any]],
     export_index: dict[str, Any],
@@ -145,6 +178,9 @@ def reconcile_doctors(
         )
         to_supplement.append(payload)
 
+    lianou_id_cards = _collect_lianou_id_cards(doctors)
+    to_create = _collect_export_only(lianou_id_cards, main_index, multi_index)
+
     missing = _dedupe_missing(missing_rows)
     matched_keys = len({capture_key(p) for p in to_supplement})
     record_count = len(to_supplement)
@@ -158,8 +194,10 @@ def reconcile_doctors(
             "missingNoIdCard": missing_no_id_card,
             "missingNotInExport": missing_not_in_export,
             "nameMismatch": name_mismatch,
+            "exportOnly": len(to_create),
         },
         "payloads": to_supplement,
+        "toCreate": to_create,
         "missing": missing,
     }
 

@@ -10,6 +10,8 @@ from .constants import MAIN_ROW_TAGS, MULTI_ROW_TAGS, NS_DOCTOR_UNIT
 
 from .dataset import parse_dataset_rows
 
+from .doctor_detail import enrich_main_rows, format_main_row_ui
+
 from .session import MinkeSession
 
 from .soap import SoapClient, extract_error_message
@@ -126,6 +128,10 @@ def export_main_records(cfg: dict[str, Any], session: MinkeSession) -> dict[str,
 
     rows = fetch_doctor_unit_list(cfg, session, search_type, md5_str)
 
+    rows = enrich_main_rows(cfg, session, rows)
+
+    rows = [format_main_row_ui(row) for row in rows]
+
     return {"主执业": rows}
 
 
@@ -136,7 +142,7 @@ def export_multi_records(cfg: dict[str, Any], session: MinkeSession) -> list[dic
 
     md5_str = str(cfg.get("forceRefreshMd5", ""))
 
-    search_type = int(cfg.get("multiSearchType", 9))
+    search_type = int(cfg.get("multiSearchType", 8))
 
     if cfg.get("useDoctorUnitGetListForOther", False):
 

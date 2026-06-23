@@ -106,13 +106,13 @@ def cmd_export_reg_main(args: argparse.Namespace) -> int:
 
         print(f"登录成功：{session.organ_name or session.login_id}")
 
-        print("正在拉取主执业列表...")
+        print("正在拉取主执业列表并补全证号...")
 
         sheets = export_main_records(cfg, session)
 
         for sheet_name, records in sheets.items():
 
-            print(f"  {sheet_name}: {len(records)} 条")
+            print(f"  {sheet_name}: {len(records)} 条（含身份证/资格证/执业证编码）")
 
         output_path = args.output or reg_default_output_path(cfg, "主执业")
 

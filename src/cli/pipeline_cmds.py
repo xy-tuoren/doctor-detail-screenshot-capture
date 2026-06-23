@@ -30,6 +30,7 @@ from src.pipeline.paths import (
     missing_roster_xlsx,
     reconcile_result_json,
     supplement_plan_json,
+    to_create_json,
     to_supplement_json,
 )
 from src.reconcile import (
@@ -135,8 +136,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         result = reconcile_doctors(doctors, export_index)
 
         payloads = result.get("payloads") or []
+        to_create = result.get("toCreate") or []
         supplement_path = args.output or to_supplement_json(workspace)
         save_json(supplement_path, payloads)
+
+        create_path = args.create_output or to_create_json(workspace)
+        save_json(create_path, to_create)
 
         exports_dir = args.exports_dir or (project_root() / "exports")
         missing_path = args.missing_output or missing_roster_xlsx(exports_dir)
@@ -164,9 +169,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             f"missing={summary.get('missing', 0)} "
             f"missingNoIdCard={summary.get('missingNoIdCard', 0)} "
             f"missingNotInExport={summary.get('missingNotInExport', 0)} "
-            f"nameMismatch={summary.get('nameMismatch', 0)}"
+            f"nameMismatch={summary.get('nameMismatch', 0)} "
+            f"exportOnly={summary.get('exportOnly', 0)}"
         )
         print(f"saved to_supplement.json to {supplement_path}")
+        print(f"saved to_create.json to {create_path}")
         print(f"saved missing roster to {missing_path}")
         return 0
     except Exception as exc:
@@ -429,6 +436,12 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
         help="Output to_supplement.json path (default: workspace/to_supplement.json)",
     )
     reconcile.add_argument("--missing-output", type=Path, default=None)
+    reconcile.add_argument(
+        "--create-output",
+        type=Path,
+        default=None,
+        help="Output to_create.json path (default: workspace/to_create.json)",
+    )
     reconcile.add_argument("--exports-dir", type=Path, default=None)
     reconcile.add_argument("--page-size", type=int, default=None)
     reconcile.add_argument("--max-pages", type=int, default=None)
