@@ -29,18 +29,39 @@ _Avoid_: 公示平台、国网
 ### 核对与名单（Reconciliation & Rosters）
 
 **核对（对比）**：
-以莲藕系统名单为基准，用莲藕的 `doctorName` + `idCard` 与机构端导出的「姓名」+「身份证号」**双字段同时匹配**。莲藕无 `idCard`、导出无该身份证、或姓名与导出不一致 → **缺失名单**。双匹配成功且 `updateField` 非空 → **to_supplement.json**。机构端导出有而莲藕没有 → **to_create.json**（供后续新增接口）。禁止仅用姓名推断身份证或进入待补 JSON。
+以莲藕系统名单为基准，用莲藕的 `doctorName` + `practicingCertCode`（执业证书编号）与机构端导出的「姓名」+「执业证书编码」**双字段同时匹配**。莲藕无 `practicingCertCode`、导出无该证书号、或姓名与导出不一致 → **莲藕有机构端无**核对名单。双匹配成功 → 按 `docMedicalList` 逐医院生成 **to_submit.json** 操作体。机构端导出有而莲藕没有对应证书号 → **机构端有莲藕无**核对名单（仅统计，不新增整名医生）。禁止仅用姓名匹配，证书号为空一律进莲藕有机构端无名单。
 _Avoid_: 比对、匹配
 
-**待补 JSON（to_supplement.json）**：
-核对后「双匹配成功」且 `updateField` 非空的记录，保存为 **UpdateDoctorMedical 请求体数组**。每项仅含接口必填三项（`AId`、`DoctorFileId`、`doctorName`）以及 **updateField 点名的待补字段**；日期等由机构端导出解析后填入，图片字段以空字符串占位供后续脚本写入 base64。不含无需修改的字段。
+**中间数据（to_submit.json）**：
+核对后对每个「双匹配成功」的医生，遍历其 `docMedicalList` 生成 **UpdateDoctorMedical 请求体数组**，每项带 `operationType`：
+- docMedicalList 中**缺「莲藕健康医院」** → 一条 **新增**（`operationType=0`），携带新增接口需要的全部字段（必填 5 项 + 机构类型/医院/科室/日期 + 图片空占位）。
+- docMedicalList 中**每个已存在医院**（含莲藕健康医院）若 `updateField` 非空 → 一条 **更新**（`operationType=1`，带 `aId`），只含必填 5 项 + `updateField` 点名且我方可提供的字段；图片字段空占位供后续脚本写入 base64。
 
-**待新增 JSON（to_create.json）**：
-机构端导出中有、莲藕系统中无对应身份证的记录，保存为 **新增接口请求体数组**（尚无 `AId` / `DoctorFileId`）。含 `doctorName`、`iDCard`、执业类型、可映射的日期/科室，图片字段空占位，并附 `_capture`（截图用）与 `_export`（原始导出行）。
+**莲藕健康医院**：
+本院在 `docMedicalList` 中的医院名（固定字符串 `莲藕健康医院`）。每位我方管理的医生都应有一条本院记录，缺则新增、有则按其 `updateField` 更新。
 
-**缺失名单**：
-核对后生成的、「莲藕系统有但无法完成姓名+身份证双匹配」的医生名单（xlsx），**仅两列：姓名、身份证**，按 `(姓名, 身份证)` 去重。莲藕无身份证时身份证列为空。
-_Avoid_: 异常名单、差异名单
+**未匹配名单**（合并为单文件 `workspace/reconcile_report.xlsx`，每次核对覆盖）：
+一个 xlsx、两个 sheet，**三列：姓名、执业证书编号、身份证**（身份证**展示**优先莲藕 API `idCard`，为空时用机构端导出「身份证号」补充，不参与匹配）：
+- sheet `莲藕有机构端无`：莲藕 API 有该医生，但机构端导出无法按「执业证书编号+姓名」双字段匹配（含证书号为空、导出无此证号、姓名不一致）。
+- sheet `机构端有莲藕无`：机构端导出有该医生，但莲藕 API 无对应执业证书编号。
+
+**管线中间产物（`workspace/`）**：
+每次 `reconcile` 默认只落 **3 个主文件**（固定名、覆盖写）：
+| 文件 | 说明 |
+|------|------|
+| `to_submit.json` | 提交操作体（新增/修改），后续采图、回填、提交均读此文件 |
+| `reconcile_report.xlsx` | 核对名单（上表两个 sheet） |
+| `reconcile_summary.json` | 核对摘要（条数统计、导出来源路径） |
+
+子目录（不 clutter 根目录）：
+| 路径 | 说明 |
+|------|------|
+| `cache/doctors_api_cache.json` | 莲藕 API 全量缓存（24h 复用） |
+| `tmp/capture-config-*.json` | 机构端采图临时配置 |
+| `tmp/nhc-failures.log` | 卫健委采图失败日志 |
+| `debug/` | 仅 `--debug`：`doctors.json`、`export_index.json`、`reconcile_result.json` |
+
+机构端 SOAP 原始导出（输入）在 `exports/reg-api/`；截图在 `captures/`。
 
 **缺失字段**：
 莲藕系统接口为每位医生返回的、标记其缺少哪些数据的字段（接口字段 `updateField`）。指示该医生需要补全什么。

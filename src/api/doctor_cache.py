@@ -10,7 +10,15 @@ DEFAULT_CACHE_TTL = timedelta(days=1)
 
 
 def doctors_cache_path(workspace: Path) -> Path:
-    return workspace / "doctors_api_cache.json"
+    from src.pipeline.paths import doctors_api_cache_json
+
+    new_path = doctors_api_cache_json(workspace)
+    legacy = workspace / "doctors_api_cache.json"
+    if new_path.exists():
+        return new_path
+    if legacy.exists():
+        return legacy
+    return new_path
 
 
 def cache_fingerprint(api_cfg: dict[str, Any]) -> str:
@@ -84,6 +92,7 @@ def fetch_doctors_with_cache(
     ttl: timedelta = DEFAULT_CACHE_TTL,
 ) -> list[dict[str, Any]]:
     from .doctor_medical import fetch_all_records
+    from src.pipeline.paths import doctors_api_cache_json
 
     if max_pages is not None:
         return fetch_all_records(api_cfg, max_pages=max_pages)
@@ -108,6 +117,7 @@ def fetch_doctors_with_cache(
             return cached
 
     records = fetch_all_records(api_cfg, max_pages=None)
-    write_doctors_cache(cache_path, records, fingerprint=fingerprint)
-    print(f"cached {len(records)} doctors to {cache_path}")
+    out = doctors_api_cache_json(workspace)
+    write_doctors_cache(out, records, fingerprint=fingerprint)
+    print(f"cached {len(records)} doctors to {out}")
     return records

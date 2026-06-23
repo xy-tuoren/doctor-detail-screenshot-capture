@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
-from .field_mapping import MULTI_PRACTICE, map_export_values
+from .field_mapping import MULTI_PRACTICE, map_department_name, map_export_values
 
 IMAGE_PLACEHOLDER_FIELDS = frozenset({"healthCommissionBase", "institutionBase"})
 
-_DEPARTMENT_KEYS = ("科室名称", "所在科室", "科室", "departmentName")
 _CERT_KEYS = ("执业证书编码", "资格证书编码")
 
 
@@ -25,11 +24,7 @@ def _extract_cert_code(export_row: dict[str, Any]) -> str | None:
 
 
 def _export_department(row: dict[str, Any]) -> str:
-    for key in _DEPARTMENT_KEYS:
-        value = row.get(key)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    return ""
+    return map_department_name(row)
 
 
 def build_create_payload(

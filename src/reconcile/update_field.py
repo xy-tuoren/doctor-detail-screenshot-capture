@@ -4,8 +4,24 @@ import re
 
 from .field_mapping import FIELD_LABELS
 
+# docMedicalList[].updateField 可能出现的全部规范字段名（接口字段）
+CANONICAL_FIELDS = frozenset(
+    {
+        "medicalInstitutionType",
+        "practiceProvince",
+        "practiceCity",
+        "hospital",
+        "hospitalLevel",
+        "departmentName",
+        "recordDate",
+        "recordExpireDate",
+        "healthCommissionBase",
+        "institutionBase",
+    }
+)
+
 _LABEL_TO_FIELD = {label: field for field, label in FIELD_LABELS.items()}
-_FIELD_NAMES = set(FIELD_LABELS)
+_FIELD_NAMES = set(FIELD_LABELS) | set(CANONICAL_FIELDS)
 
 # 兼容旧 updateField 命名；身份证仅用于本地对账匹配，不参与写回
 FIELD_ALIASES: dict[str, str] = {

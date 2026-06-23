@@ -8,6 +8,7 @@ from typing import Any
 from src.api.config import project_root
 from src.capture.paths import default_nhc_captures_dir
 from src.cli.automation import PS1, run_task, AutomationTask
+from src.pipeline.paths import capture_config_json, nhc_failures_log
 
 
 def institution_list_folder(list_entry: str) -> str:
@@ -105,7 +106,7 @@ def run_institution_capture(
     for list_entry, persons in grouped.items():
         if not persons:
             continue
-        temp_config = workspace / f"capture-config-{list_entry.lower()}.json"
+        temp_config = capture_config_json(workspace, list_entry)
         build_capture_config(config_path, persons, list_entry, temp_config)
         task = AutomationTask(ps1_mode="LoginAndSearchNames", list_entry=list_entry)
         extra = ["-ConfigPath", str(temp_config)]
@@ -137,7 +138,7 @@ def run_nhc_capture(
 
     root = project_root()
     out_dir = output_dir or default_nhc_captures_dir(root)
-    failure_log = workspace / "nhc-failures.log"
+    failure_log = nhc_failures_log(workspace)
 
     try:
         summary = _run(

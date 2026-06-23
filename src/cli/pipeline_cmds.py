@@ -5,12 +5,10 @@ import sys
 from pathlib import Path
 
 from src.api import (
-    default_output_path,
     fetch_doctors_with_cache,
     load_api_config,
     merge_api_config,
     project_root,
-    save_xlsx,
 )
 from src.capture.runner import (
     find_institution_image,
@@ -23,51 +21,93 @@ from src.institution_export import build_export_index
 from src.lianou.writeback import LianouWritebackClient, apply_supplement_plan
 from src.pipeline.io import load_json, save_json
 from src.pipeline.paths import (
-    capture_targets_json,
     doctors_json,
     ensure_workspace,
     export_index_json,
-    missing_roster_xlsx,
+    reconcile_report_xlsx,
     reconcile_result_json,
-    supplement_plan_json,
-    to_create_json,
-    to_supplement_json,
+    reconcile_summary_json,
+    to_submit_json,
 )
 from src.reconcile import (
     iter_institution_capture_targets,
     iter_nhc_capture_targets,
-    iter_payloads,
     reconcile_doctors,
-    save_missing_roster,
 )
+from src.reconcile.missing_roster import save_reconcile_report
 
 
 def _workspace(args: argparse.Namespace) -> Path:
-    if args.workspace is not None:
+    if getattr(args, "workspace", None) is not None:
         args.workspace.mkdir(parents=True, exist_ok=True)
         return args.workspace
     return ensure_workspace()
 
 
+def _plan_path(args: argparse.Namespace, workspace: Path) -> Path:
+    return getattr(args, "plan", None) or to_submit_json(workspace)
+
+
 def _load_doctors(args: argparse.Namespace, workspace: Path) -> list:
-    if args.doctors:
-        return load_json(args.doctors)
+    if getattr(args, "doctors", None):
+        data = load_json(args.doctors)
+        if isinstance(data, dict) and isinstance(data.get("records"), list):
+            return data["records"]
+        return data
     api_cfg = merge_api_config(load_api_config(args.config))
-    if args.page_size is not None:
+    if getattr(args, "page_size", None) is not None:
         api_cfg["pageSize"] = args.page_size
     return fetch_doctors_with_cache(
         api_cfg,
         workspace,
         refresh=bool(getattr(args, "refresh_cache", False)),
-        max_pages=args.max_pages,
+        max_pages=getattr(args, "max_pages", None),
     )
 
 
 def _load_export_index(args: argparse.Namespace) -> dict:
-    if args.export_index:
+    if getattr(args, "export_index", None):
         return load_json(args.export_index)
-    exports_dir = args.exports_dir or (project_root() / "exports")
+    exports_dir = getattr(args, "exports_dir", None) or (project_root() / "exports")
     return build_export_index(exports_dir)
+
+
+def cmd_export_reg(args: argparse.Namespace) -> int:
+    """调用机构端 SOAP 接口导出最新主执业/多执业 xlsx 到 exports/reg-api。"""
+    try:
+        from src.minke_reg import (
+            default_output_path as reg_default_output_path,
+            export_main_records,
+            export_multi_records,
+            load_minke_reg_config,
+            login_minke_reg,
+            save_reg_workbook,
+            save_reg_xlsx,
+        )
+
+        cfg = load_minke_reg_config(args.config)
+        print("正在登录医师注册系统...")
+        session = login_minke_reg(cfg)
+        print(f"登录成功：{session.organ_name or session.login_id}")
+
+        if not args.skip_main:
+            print("正在拉取主执业列表并补全证号...")
+            sheets = export_main_records(cfg, session)
+            main_out = reg_default_output_path(cfg, "主执业")
+            total = save_reg_workbook(sheets, main_out)
+            print(f"主执业已保存 {total} 条到 {main_out}")
+
+        if not args.skip_multi:
+            print("正在拉取多执业医师列表...")
+            multi_records = export_multi_records(cfg, session)
+            multi_out = reg_default_output_path(cfg, "多执业")
+            save_reg_xlsx(multi_records, multi_out)
+            print(f"多执业已保存 {len(multi_records)} 条到 {multi_out}")
+
+        return 0
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
 
 
 def cmd_fetch(args: argparse.Namespace) -> int:
@@ -90,13 +130,6 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             print(f"saved {len(records)} doctors to {out_json}")
         else:
             print(f"fetched {len(records)} doctors (not saved; use --save-json or --output-json)")
-
-        if args.output_xlsx:
-            save_xlsx(records, args.output_xlsx)
-        elif args.save_xlsx:
-            xlsx_path = default_output_path(api_cfg)
-            save_xlsx(records, xlsx_path)
-            print(f"saved xlsx: {xlsx_path}")
 
         return 0
     except Exception as exc:
@@ -135,58 +168,64 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         export_index = _load_export_index(args)
         result = reconcile_doctors(doctors, export_index)
 
-        payloads = result.get("payloads") or []
-        to_create = result.get("toCreate") or []
-        supplement_path = args.output or to_supplement_json(workspace)
-        save_json(supplement_path, payloads)
+        to_submit = result.get("toSubmit") or []
+        submit_path = args.output or to_submit_json(workspace)
+        save_json(submit_path, to_submit)
 
-        create_path = args.create_output or to_create_json(workspace)
-        save_json(create_path, to_create)
+        report_path = args.report_output or reconcile_report_xlsx(workspace)
+        save_reconcile_report(
+            lianou_only=result.get("lianouOnly", []),
+            export_only=result.get("exportOnly", []),
+            output_path=report_path,
+        )
 
-        exports_dir = args.exports_dir or (project_root() / "exports")
-        missing_path = args.missing_output or missing_roster_xlsx(exports_dir)
-        save_missing_roster(result.get("missing", []), missing_path)
+        summary = result.get("summary", {})
+        export_sources = (export_index.get("sources") or {}) if isinstance(export_index, dict) else {}
+        save_json(
+            reconcile_summary_json(workspace),
+            {
+                "summary": summary,
+                "exportSources": export_sources,
+                "artifacts": {
+                    "toSubmit": str(submit_path),
+                    "reconcileReport": str(report_path),
+                },
+            },
+        )
 
         if args.debug:
             save_json(doctors_json(workspace), doctors)
             save_json(export_index_json(workspace), export_index)
             save_json(reconcile_result_json(workspace), result)
-            save_json(
-                capture_targets_json(workspace),
-                {
-                    "institution": iter_institution_capture_targets(payloads),
-                    "nhc": iter_nhc_capture_targets(payloads),
-                },
-            )
-            print("[debug] saved doctors.json, export_index.json, reconcile_result.json")
-
-        summary = result.get("summary", {})
+            print("[debug] saved debug/doctors.json, debug/export_index.json, debug/reconcile_result.json")
         print(
             "reconcile: "
             f"doctors={summary.get('doctors', 0)} "
-            f"matchedKeys={summary.get('matchedKeys', 0)} "
-            f"matchedRecords={summary.get('matchedRecords', 0)} "
-            f"missing={summary.get('missing', 0)} "
-            f"missingNoIdCard={summary.get('missingNoIdCard', 0)} "
-            f"missingNotInExport={summary.get('missingNotInExport', 0)} "
-            f"nameMismatch={summary.get('nameMismatch', 0)} "
+            f"matchedDoctors={summary.get('matchedDoctors', 0)} "
+            f"createOps={summary.get('createOps', 0)} "
+            f"updateOps={summary.get('updateOps', 0)} "
+            f"submitOps={summary.get('submitOps', 0)} "
+            f"lianouOnly={summary.get('lianouOnly', 0)} "
+            f"(noCert={summary.get('missingNoCert', 0)} "
+            f"notInExport={summary.get('missingNotInExport', 0)} "
+            f"nameMismatch={summary.get('nameMismatch', 0)}) "
             f"exportOnly={summary.get('exportOnly', 0)}"
         )
-        print(f"saved to_supplement.json to {supplement_path}")
-        print(f"saved to_create.json to {create_path}")
-        print(f"saved missing roster to {missing_path}")
+        print(f"saved to_submit.json -> {submit_path}")
+        print(f"saved reconcile_report.xlsx -> {report_path}")
+        print(f"saved reconcile_summary.json -> {reconcile_summary_json(workspace)}")
         return 0
     except Exception as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
 
 
-def cmd_supplement(args: argparse.Namespace) -> int:
+def cmd_submit(args: argparse.Namespace) -> int:
     try:
         workspace = _workspace(args)
-        plan_path = args.plan or to_supplement_json(workspace)
+        plan_path = _plan_path(args, workspace)
         if not plan_path.exists():
-            raise FileNotFoundError(f"to_supplement.json not found: {plan_path}")
+            raise FileNotFoundError(f"to_submit.json not found: {plan_path}")
 
         plan = load_json(plan_path)
         api_cfg = merge_api_config(load_api_config(args.config))
@@ -202,7 +241,7 @@ def cmd_supplement(args: argparse.Namespace) -> int:
             print(f"[{status}] aId={item.a_id} {item.doctor_name}: {item.message}")
 
         mode = "dry-run" if dry_run else "commit"
-        print(f"supplement ({mode}): total={len(results)} ok={ok} failed={failed}")
+        print(f"submit ({mode}): total={len(results)} ok={ok} failed={failed}")
         if failed and not dry_run:
             return 1
         return 0
@@ -214,12 +253,12 @@ def cmd_supplement(args: argparse.Namespace) -> int:
 def cmd_capture_institution(args: argparse.Namespace) -> int:
     try:
         workspace = _workspace(args)
-        plan_path = args.plan or to_supplement_json(workspace)
+        plan_path = _plan_path(args, workspace)
         if not plan_path.exists():
-            raise FileNotFoundError(f"to_supplement.json not found: {plan_path}")
+            raise FileNotFoundError(f"to_submit.json not found: {plan_path}")
 
-        to_supplement = load_json(plan_path)
-        targets = iter_institution_capture_targets(to_supplement)
+        to_submit = load_json(plan_path)
+        targets = iter_institution_capture_targets(to_submit)
         captures_root = getattr(args, "captures_dir", None) or (project_root() / "captures")
         code = run_institution_capture(
             targets,
@@ -238,12 +277,12 @@ def cmd_capture_institution(args: argparse.Namespace) -> int:
 def cmd_capture_nhc(args: argparse.Namespace) -> int:
     try:
         workspace = _workspace(args)
-        plan_path = args.plan or to_supplement_json(workspace)
+        plan_path = _plan_path(args, workspace)
         if not plan_path.exists():
-            raise FileNotFoundError(f"to_supplement.json not found: {plan_path}")
+            raise FileNotFoundError(f"to_submit.json not found: {plan_path}")
 
-        to_supplement = load_json(plan_path)
-        targets = iter_nhc_capture_targets(to_supplement)
+        to_submit = load_json(plan_path)
+        targets = iter_nhc_capture_targets(to_submit)
 
         nhc_cfg = {}
         try:
@@ -270,7 +309,7 @@ def cmd_capture_nhc(args: argparse.Namespace) -> int:
         return 1
 
 
-def cmd_upload_images(args: argparse.Namespace) -> int:
+def cmd_fill_images(args: argparse.Namespace) -> int:
     try:
         from src.lianou.writeback import encode_image_base64
         from src.reconcile.to_supplement import (
@@ -278,12 +317,13 @@ def cmd_upload_images(args: argparse.Namespace) -> int:
             needs_institution_capture,
             needs_nhc_capture,
             normalize_payloads,
+            set_supplement_field,
         )
 
         workspace = _workspace(args)
-        plan_path = args.plan or to_supplement_json(workspace)
+        plan_path = _plan_path(args, workspace)
         if not plan_path.exists():
-            raise FileNotFoundError(f"to_supplement.json not found: {plan_path}")
+            raise FileNotFoundError(f"to_submit.json not found: {plan_path}")
 
         payloads = normalize_payloads(load_json(plan_path))
         api_cfg = merge_api_config(load_api_config(args.config))
@@ -306,8 +346,10 @@ def cmd_upload_images(args: argparse.Namespace) -> int:
             if needs_institution_capture(payload):
                 image = find_institution_image(captures_root, name, id_card)
                 if image:
-                    payload["institutionBase"] = encode_image_base64(
-                        image, data_uri=client.image_data_uri
+                    set_supplement_field(
+                        payload,
+                        "institutionBase",
+                        encode_image_base64(image, data_uri=client.image_data_uri),
                     )
                     touched = True
                     filled += 1
@@ -319,8 +361,10 @@ def cmd_upload_images(args: argparse.Namespace) -> int:
             if needs_nhc_capture(payload):
                 image = find_nhc_image(nhc_root, name, cert_code)
                 if image:
-                    payload["healthCommissionBase"] = encode_image_base64(
-                        image, data_uri=client.image_data_uri
+                    set_supplement_field(
+                        payload,
+                        "healthCommissionBase",
+                        encode_image_base64(image, data_uri=client.image_data_uri),
                     )
                     touched = True
                     filled += 1
@@ -332,19 +376,19 @@ def cmd_upload_images(args: argparse.Namespace) -> int:
             if touched and not dry_run:
                 result = client.update_from_payload(payload)
                 status = "OK" if result.ok else "FAIL"
-                print(f"[{status}] AId={payload.get('AId')} {name}: {result.message}")
+                print(f"[{status}] aId={result.a_id} {name}: {result.message}")
                 if result.ok:
                     ok += 1
                 else:
                     failed += 1
                     exit_code = 1
             elif touched and dry_run:
-                print(f"[DRY] AId={payload.get('AId')} {name}: would upload after fill")
+                print(f"[DRY] {name}: would upload after fill")
 
         save_json(plan_path, payloads)
 
         mode = "dry-run" if dry_run else "commit"
-        print(f"upload-images ({mode}): filled={filled} ok={ok} skipped={skipped} failed={failed}")
+        print(f"fill-images ({mode}): filled={filled} ok={ok} skipped={skipped} failed={failed}")
         print(f"saved {plan_path}")
         return exit_code
     except Exception as exc:
@@ -353,19 +397,20 @@ def cmd_upload_images(args: argparse.Namespace) -> int:
 
 
 def cmd_run_all(args: argparse.Namespace) -> int:
-    steps = [
-        ("reconcile", cmd_reconcile),
-    ]
-    if not args.skip_supplement:
-        steps.append(("supplement", cmd_supplement))
+    steps = []
+    if getattr(args, "with_export", False):
+        steps.append(("export-reg", cmd_export_reg))
+    steps.append(("reconcile", cmd_reconcile))
     if not args.skip_capture:
         steps.extend(
             [
                 ("capture-institution", cmd_capture_institution),
                 ("capture-nhc", cmd_capture_nhc),
-                ("upload-images", cmd_upload_images),
+                ("fill-images", cmd_fill_images),
             ]
         )
+    if not args.skip_submit:
+        steps.append(("submit", cmd_submit))
 
     for name, handler in steps:
         print(f"\n=== {name} ===")
@@ -402,17 +447,22 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
         help="Ignore doctors API cache and fetch fresh data (default: reuse 24h cache)",
     )
 
+    export_reg = subparsers.add_parser(
+        "export-reg", parents=[common], help="Export institution xlsx via Minke SOAP API"
+    )
+    export_reg.add_argument("--skip-main", action="store_true", help="跳过主执业导出")
+    export_reg.add_argument("--skip-multi", action="store_true", help="跳过多执业导出")
+    export_reg.set_defaults(func=cmd_export_reg)
+
     fetch = subparsers.add_parser("fetch", parents=[common], help="Fetch Lianou doctors")
     fetch.add_argument("--output-json", type=Path, default=None, help="Output doctors.json path")
     fetch.add_argument("--save-json", action="store_true", help="Save doctors.json to workspace")
-    fetch.add_argument("--output-xlsx", type=Path, default=None, help="Optional xlsx output path")
-    fetch.add_argument("--save-xlsx", action="store_true", help="Also save default exports xlsx")
     fetch.add_argument("--page-size", type=int, default=None)
     fetch.add_argument("--max-pages", type=int, default=None)
     fetch.set_defaults(func=cmd_fetch)
 
     parse_exports = subparsers.add_parser(
-        "parse-exports", parents=[common], help="Parse latest institution UI exports"
+        "parse-exports", parents=[common], help="Parse latest institution exports"
     )
     parse_exports.add_argument(
         "--exports-dir",
@@ -425,7 +475,7 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
     parse_exports.set_defaults(func=cmd_parse_exports)
 
     reconcile = subparsers.add_parser(
-        "reconcile", parents=[common], help="Reconcile doctors and build to_supplement.json"
+        "reconcile", parents=[common], help="Reconcile doctors and build to_submit.json"
     )
     reconcile.add_argument("--doctors", type=Path, default=None, help="Use existing doctors.json")
     reconcile.add_argument("--export-index", type=Path, default=None, help="Use existing export index")
@@ -433,38 +483,40 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
         "--output",
         type=Path,
         default=None,
-        help="Output to_supplement.json path (default: workspace/to_supplement.json)",
+        help="Output to_submit.json path (default: workspace/to_submit.json)",
     )
-    reconcile.add_argument("--missing-output", type=Path, default=None)
     reconcile.add_argument(
-        "--create-output",
+        "--report-output",
         type=Path,
         default=None,
-        help="Output to_create.json path (default: workspace/to_create.json)",
+        help="核对报告 xlsx（默认 workspace/reconcile_report.xlsx，含两个 sheet）",
     )
     reconcile.add_argument("--exports-dir", type=Path, default=None)
     reconcile.add_argument("--page-size", type=int, default=None)
     reconcile.add_argument("--max-pages", type=int, default=None)
     reconcile.set_defaults(func=cmd_reconcile)
 
-    supplement = subparsers.add_parser(
-        "supplement", parents=[common], help="Write mapped fields back to Lianou"
+    submit = subparsers.add_parser(
+        "submit",
+        parents=[common],
+        aliases=["supplement"],
+        help="Submit operations to Lianou (UpdateDoctorMedical, operationType 0/1)",
     )
-    supplement.add_argument(
+    submit.add_argument(
         "--plan",
         type=Path,
         default=None,
-        help="Path to to_supplement.json (default: workspace/to_supplement.json)",
+        help="Path to to_submit.json (default: workspace/to_submit.json)",
     )
-    supplement.add_argument(
+    submit.add_argument(
         "--include-images",
         action="store_true",
         help="Also submit healthCommissionBase/institutionBase when present in JSON",
     )
-    supplement.add_argument(
+    submit.add_argument(
         "--commit", action="store_true", help="Actually call the update API (default: dry-run)"
     )
-    supplement.set_defaults(func=cmd_supplement)
+    submit.set_defaults(func=cmd_submit)
 
     capture_institution = subparsers.add_parser(
         "capture-institution",
@@ -475,7 +527,7 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
         "--plan",
         type=Path,
         default=None,
-        help="Path to to_supplement.json (default: workspace/to_supplement.json)",
+        help="Path to to_submit.json (default: workspace/to_submit.json)",
     )
     capture_institution.add_argument(
         "--captures-dir",
@@ -495,7 +547,7 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
         "--plan",
         type=Path,
         default=None,
-        help="Path to to_supplement.json (default: workspace/to_supplement.json)",
+        help="Path to to_submit.json (default: workspace/to_submit.json)",
     )
     capture_nhc.add_argument("--output-dir", type=Path, default=None)
     capture_nhc.add_argument("--province", default=None, help="所在省份（默认读 config 或广东省）")
@@ -505,30 +557,34 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
     capture_nhc.add_argument("--dry-run", action="store_true")
     capture_nhc.set_defaults(func=cmd_capture_nhc)
 
-    upload_images = subparsers.add_parser(
-        "upload-images",
+    fill_images = subparsers.add_parser(
+        "fill-images",
         parents=[common],
-        help="Upload captured images to Lianou (base64 via UpdateDoctorMedical)",
+        aliases=["upload-images"],
+        help="Fill captured images (base64) into to_submit.json and optionally upload",
     )
-    upload_images.add_argument(
+    fill_images.add_argument(
         "--plan",
         type=Path,
         default=None,
-        help="Path to to_supplement.json (default: workspace/to_supplement.json)",
+        help="Path to to_submit.json (default: workspace/to_submit.json)",
     )
-    upload_images.add_argument("--captures-dir", type=Path, default=None)
-    upload_images.add_argument("--nhc-dir", type=Path, default=None)
-    upload_images.add_argument(
+    fill_images.add_argument("--captures-dir", type=Path, default=None)
+    fill_images.add_argument("--nhc-dir", type=Path, default=None)
+    fill_images.add_argument(
         "--commit", action="store_true", help="Actually call the update API (default: dry-run)"
     )
-    upload_images.set_defaults(func=cmd_upload_images)
+    fill_images.set_defaults(func=cmd_fill_images)
 
     run_all = subparsers.add_parser("run-all", parents=[common], help="Run full pipeline")
+    run_all.add_argument("--with-export", action="store_true", help="先跑机构端 SOAP 导出")
+    run_all.add_argument("--skip-main", action="store_true")
+    run_all.add_argument("--skip-multi", action="store_true")
     run_all.add_argument("--exports-dir", type=Path, default=None)
     run_all.add_argument("--doctors", type=Path, default=None)
     run_all.add_argument("--export-index", type=Path, default=None)
     run_all.add_argument("--output", type=Path, default=None)
-    run_all.add_argument("--missing-output", type=Path, default=None)
+    run_all.add_argument("--report-output", type=Path, default=None)
     run_all.add_argument("--plan", type=Path, default=None)
     run_all.add_argument("--captures-dir", type=Path, default=None)
     run_all.add_argument("--nhc-dir", type=Path, default=None)
@@ -541,9 +597,9 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
     run_all.add_argument("--show-browser", action="store_true")
     run_all.add_argument("--dry-run", action="store_true", help="Dry-run captures")
     run_all.add_argument(
-        "--commit", action="store_true", help="Actually write back to Lianou (supplement/upload)"
+        "--commit", action="store_true", help="Actually write back to Lianou (submit/fill-images)"
     )
     run_all.add_argument("--include-images", action="store_true")
-    run_all.add_argument("--skip-supplement", action="store_true")
+    run_all.add_argument("--skip-submit", action="store_true")
     run_all.add_argument("--skip-capture", action="store_true")
     run_all.set_defaults(func=cmd_run_all)

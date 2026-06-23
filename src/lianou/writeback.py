@@ -57,18 +57,28 @@ class LianouWritebackClient:
         self.image_data_uri = bool(api_cfg.get("imageDataUri", False))
 
     def update_from_payload(self, payload: dict[str, Any]) -> WritebackResult:
-        from src.reconcile.to_supplement import postable_body
+        from src.reconcile.to_supplement import META_KEYS, postable_body
 
         body = postable_body(payload)
-        a_id = body.get("AId")
+        operation_type = int(body.get("operationType", 0))
+        a_id = body.get("aId", body.get("AId"))
+        doctor_file_id = body.get("doctorFileId") or body.get("DoctorFileId")
         doctor_name = str(body.get("doctorName") or "")
 
-        if a_id is None or not body.get("DoctorFileId") or not doctor_name:
+        if not doctor_file_id or not doctor_name:
             return WritebackResult(
                 a_id=a_id,
                 doctor_name=doctor_name,
                 ok=False,
-                message="missing required AId/DoctorFileId/doctorName",
+                message="missing required doctorFileId/doctorName",
+                fields={},
+            )
+        if operation_type == 1 and a_id is None:
+            return WritebackResult(
+                a_id=a_id,
+                doctor_name=doctor_name,
+                ok=False,
+                message="missing required aId for update (operationType=1)",
                 fields={},
             )
 
@@ -85,7 +95,7 @@ class LianouWritebackClient:
             doctor_name=doctor_name,
             ok=ok,
             message=str(response.get("msg") or response.get("data") or ""),
-            fields={k: str(v) for k, v in body.items() if k not in ("AId", "DoctorFileId", "doctorName")},
+            fields={k: str(v) for k, v in body.items() if k not in META_KEYS},
         )
 
     def update(
@@ -181,7 +191,7 @@ def apply_supplement_plan(
     dry_run: bool = True,
     include_images: bool = False,
 ) -> list[WritebackResult]:
-    from src.reconcile.to_supplement import iter_payloads, postable_body
+    from src.reconcile.to_supplement import has_writable_fields, iter_payloads, postable_body
 
     client = LianouWritebackClient(api_cfg)
     results: list[WritebackResult] = []
@@ -192,18 +202,19 @@ def apply_supplement_plan(
             continue
 
         doctor_name = str(body.get("doctorName") or "")
-        a_id = body.get("AId")
+        a_id = body.get("aId", body.get("AId"))
 
         if dry_run:
-            from src.reconcile.api_payload import REQUIRED_API_KEYS
+            from src.reconcile.to_supplement import META_KEYS
 
-            fields = {k: str(v) for k, v in body.items() if k not in REQUIRED_API_KEYS}
+            fields = {k: str(v) for k, v in body.items() if k not in META_KEYS}
+            op = "create" if int(body.get("operationType", 0)) == 0 else "update"
             results.append(
                 WritebackResult(
                     a_id=a_id,
                     doctor_name=doctor_name,
                     ok=True,
-                    message="dry-run",
+                    message=f"dry-run ({op})",
                     fields=fields,
                 )
             )

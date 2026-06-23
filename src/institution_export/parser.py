@@ -1,4 +1,11 @@
-"""Parse institution UI export .xls files (OOXML disguised as .xls)."""
+"""Parse institution UI/SOAP export files.
+
+支持两种来源：
+- 旧版 UI 导出：``exports/*.xls``（OOXML 伪装成 .xls，用内置 zip/xml 读取）
+- 新版 SOAP 导出：``exports/reg-api/*.xlsx``（openpyxl 标准 xlsx）
+
+核对匹配键由身份证号改为「执业证书编码」+ 姓名，故索引按执业证书编码建立。
+"""
 
 from __future__ import annotations
 
@@ -12,6 +19,8 @@ from typing import Any
 MAIN_HEADERS = frozenset({"审核日期"})
 MULTI_HEADERS = frozenset({"开始日期", "结束日期"})
 
+CERT_KEYS = ("执业证书编码", "执业证书编号")
+
 
 @dataclass(frozen=True)
 class ExportFiles:
@@ -19,18 +28,71 @@ class ExportFiles:
     multi: Path | None
 
 
+def _export_dirs(exports_dir: Path) -> list[Path]:
+    """主目录及 reg-api 子目录都纳入查找。"""
+    dirs = [exports_dir]
+    reg_api = exports_dir / "reg-api"
+    if reg_api != exports_dir:
+        dirs.append(reg_api)
+    return [d for d in dirs if d.exists()]
+
+
+def _latest_export(exports_dir: Path, prefix: str) -> Path | None:
+    candidates: list[Path] = []
+    for directory in _export_dirs(exports_dir):
+        for pattern in (f"{prefix}-*.xlsx", f"{prefix}-*.xls"):
+            candidates.extend(directory.glob(pattern))
+    candidates = [p for p in candidates if p.stat().st_size > 0]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
 def find_latest_exports(exports_dir: Path) -> ExportFiles:
-    main_files = sorted(exports_dir.glob("主执业导出-*.xls"), key=lambda p: p.stat().st_mtime)
-    multi_files = sorted(exports_dir.glob("多执业导出-*.xls"), key=lambda p: p.stat().st_mtime)
-    main = main_files[-1] if main_files and main_files[-1].stat().st_size > 0 else None
-    multi = multi_files[-1] if multi_files and multi_files[-1].stat().st_size > 0 else None
-    return ExportFiles(main=main, multi=multi)
+    return ExportFiles(
+        main=_latest_export(exports_dir, "主执业导出"),
+        multi=_latest_export(exports_dir, "多执业导出"),
+    )
 
 
 def parse_export_file(path: Path) -> list[dict[str, Any]]:
     if not path.exists() or path.stat().st_size == 0:
         return []
+    if path.suffix.lower() == ".xlsx":
+        return _parse_xlsx(path)
+    return _parse_legacy_xls(path)
 
+
+def _parse_xlsx(path: Path) -> list[dict[str, Any]]:
+    from openpyxl import load_workbook
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws = wb.active
+        row_iter = ws.iter_rows(values_only=True)
+        try:
+            header_row = next(row_iter)
+        except StopIteration:
+            return []
+        headers = [str(cell).strip() if cell is not None else "" for cell in header_row]
+        records: list[dict[str, Any]] = []
+        for row in row_iter:
+            record: dict[str, Any] = {}
+            for idx, header in enumerate(headers):
+                if not header:
+                    continue
+                value = row[idx] if idx < len(row) else None
+                if value is None:
+                    continue
+                record[header] = value
+            if record:
+                records.append(record)
+        return records
+    finally:
+        wb.close()
+
+
+def _parse_legacy_xls(path: Path) -> list[dict[str, Any]]:
     with zipfile.ZipFile(path) as zf:
         shared_strings = _read_shared_strings(zf)
         rows = _read_sheet_rows(zf, shared_strings)
@@ -63,23 +125,41 @@ def classify_export(headers: list[str]) -> str:
     raise ValueError(f"无法识别导出类型，表头: {headers}")
 
 
+def normalize_cert_code(value: Any) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", "", str(value).strip())
+
+
+def extract_cert_code(row: dict[str, Any]) -> str:
+    for key in CERT_KEYS:
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return normalize_cert_code(value)
+    return ""
+
+
 def build_export_index(exports_dir: Path) -> dict[str, Any]:
+    """按执业证书编码建立索引（main: dict、multi: list）。
+
+    身份证/姓名仍随行保留：姓名用于双字段校验，身份证供后续图片采集。
+    """
     files = find_latest_exports(exports_dir)
     main_records = parse_export_file(files.main) if files.main else []
     multi_records = parse_export_file(files.multi) if files.multi else []
 
     main_index: dict[str, dict[str, Any]] = {}
     for row in main_records:
-        id_card = _normalize_id(row.get("身份证号"))
-        if id_card:
-            main_index[id_card] = row
+        cert = extract_cert_code(row)
+        if cert:
+            main_index[cert] = row
 
     multi_index: dict[str, list[dict[str, Any]]] = {}
     for row in multi_records:
-        id_card = _normalize_id(row.get("身份证号"))
-        if not id_card:
+        cert = extract_cert_code(row)
+        if not cert:
             continue
-        multi_index.setdefault(id_card, []).append(row)
+        multi_index.setdefault(cert, []).append(row)
 
     return {
         "sources": {
