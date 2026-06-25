@@ -10,11 +10,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.institution_export.dates import normalize_api_date
+
 from .field_mapping import (
     DEFAULT_HOSPITAL_LEVEL,
     DEFAULT_PRACTICE_CITY,
     DEFAULT_PRACTICE_PROVINCE,
     MAIN_PRACTICE,
+    MAIN_PRACTICE_EXCLUDED_FIELDS,
     MULTI_PRACTICE,
     map_department_name,
     map_export_values,
@@ -86,6 +89,8 @@ def _map_missing_to_values(
     values: dict[str, Any] = {}
 
     for field in sorted(missing_fields):
+        if practice_source == MAIN_PRACTICE and field in MAIN_PRACTICE_EXCLUDED_FIELDS:
+            continue
         if field == "medicalInstitutionType":
             values["medicalInstitutionType"] = _practice_type(practice_source)
         elif field == "departmentName":
@@ -100,12 +105,30 @@ def _map_missing_to_values(
         elif field in ("recordDate", "recordExpireDate"):
             value = export_mapped.get(field)
             if value:
-                values[field] = value
+                values[field] = normalize_api_date(value)
         elif field in IMAGE_FIELDS:
             values[field] = ""
         # hospital：导出无数据，忽略
 
     return values
+
+
+map_missing_update_values = _map_missing_to_values
+
+
+def _apply_export_dates(
+    target: dict[str, Any],
+    export_mapped: dict[str, str],
+    practice_source: str,
+) -> None:
+    """仅当机构端导出有对应日期时才写入 updateField。"""
+    record_date = normalize_api_date(export_mapped.get("recordDate", ""))
+    if record_date:
+        target["recordDate"] = record_date
+    if practice_source == MULTI_PRACTICE:
+        expire = normalize_api_date(export_mapped.get("recordExpireDate", ""))
+        if expire:
+            target["recordExpireDate"] = expire
 
 
 def build_create_op(
@@ -121,20 +144,21 @@ def build_create_op(
     export_mapped = map_export_values(practice_source, export_row)
     department = _export_department(export_row)
 
-    payload: dict[str, Any] = {"operationType": OPERATION_ADD}
-    payload.update(_required_identity(doctor, cert_code, id_card))
-    payload["updateField"] = {
+    update_field: dict[str, Any] = {
         "medicalInstitutionType": _practice_type(practice_source),
         "practiceProvince": DEFAULT_PRACTICE_PROVINCE,
         "practiceCity": DEFAULT_PRACTICE_CITY,
         "hospitalLevel": DEFAULT_HOSPITAL_LEVEL,
         "hospital": lianou_hospital,
         "departmentName": department,
-        "recordDate": export_mapped.get("recordDate", ""),
-        "recordExpireDate": export_mapped.get("recordExpireDate", ""),
         "healthCommissionBase": "",
         "institutionBase": "",
     }
+    _apply_export_dates(update_field, export_mapped, practice_source)
+
+    payload: dict[str, Any] = {"operationType": OPERATION_ADD}
+    payload.update(_required_identity(doctor, cert_code, id_card))
+    payload["updateField"] = update_field
     payload["_capture"] = _capture_meta(id_card, cert_code, practice_source, lianou_hospital)
     payload["_op"] = "create"
     return payload

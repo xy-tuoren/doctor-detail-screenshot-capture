@@ -176,6 +176,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         save_reconcile_report(
             lianou_only=result.get("lianouOnly", []),
             export_only=result.get("exportOnly", []),
+            to_submit=to_submit,
             output_path=report_path,
         )
 
@@ -309,6 +310,117 @@ def cmd_capture_nhc(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_rename_captures(args: argparse.Namespace) -> int:
+    try:
+        from src.capture.rename_by_export import rename_captures_by_ui_export, salvage_unmatched_by_ocr
+
+        root = project_root()
+        captures_root = args.captures_dir or (root / "captures")
+        exports_root = args.exports_dir or (root / "exports")
+        dry_run = not args.commit
+
+        result = rename_captures_by_ui_export(
+            captures_root=captures_root,
+            exports_root=exports_root,
+            dry_run=dry_run,
+        )
+        if getattr(args, "ocr_unmatched", False):
+            ocr_result = salvage_unmatched_by_ocr(
+                captures_root=captures_root,
+                exports_root=exports_root,
+                dry_run=dry_run,
+            )
+            result.renamed += ocr_result.renamed
+            result.skipped_already += ocr_result.skipped_already
+            result.conflicts += ocr_result.conflicts
+            result.deleted += ocr_result.deleted
+            result.ocr_failed += ocr_result.ocr_failed
+            result.errors.extend(ocr_result.errors or [])
+
+        mode = "dry-run" if dry_run else "commit"
+        print(
+            f"rename-captures ({mode}): renamed={result.renamed} "
+            f"already={result.skipped_already} no_match={result.skipped_no_match} "
+            f"name_mismatch={result.skipped_name_mismatch} conflicts={result.conflicts} "
+            f"deleted={result.deleted} ocr_failed={result.ocr_failed}"
+        )
+        if result.errors:
+            print(f"issues ({len(result.errors)}):")
+            for line in result.errors[:30]:
+                print(f"  {line}")
+            if len(result.errors) > 30:
+                print(f"  ... and {len(result.errors) - 30} more")
+        if result.conflicts and not dry_run:
+            return 1
+        return 0
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_rename_nhc(args: argparse.Namespace) -> int:
+    try:
+        from src.capture.paths import default_nhc_captures_dir
+        from src.capture.rename_nhc import rename_nhc_screenshots
+
+        root = project_root()
+        source = args.source_dir or (root / "captures" / "screenshots")
+        target = args.target_dir or default_nhc_captures_dir(root)
+        dry_run = not args.commit
+
+        result = rename_nhc_screenshots(
+            source_dir=source,
+            target_dir=target,
+            exports_root=root / "exports",
+            dry_run=dry_run,
+            delete_source=not bool(getattr(args, "keep_source", False)),
+        )
+        mode = "dry-run" if dry_run else "commit"
+        print(
+            f"rename-nhc ({mode}): renamed={result.renamed} "
+            f"already={result.skipped_already} unparsed={result.skipped_unparsed} "
+            f"conflicts={result.conflicts}"
+        )
+        if result.errors:
+            print(f"issues ({len(result.errors)}):")
+            for line in result.errors[:20]:
+                print(f"  {line}")
+            if len(result.errors) > 20:
+                print(f"  ... and {len(result.errors) - 20} more")
+        if result.conflicts and not dry_run:
+            return 1
+        return 0
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_verify_nhc_captures(args: argparse.Namespace) -> int:
+    try:
+        from src.capture.verify_nhc import verify_nhc_captures
+        from src.capture.paths import default_nhc_captures_dir
+
+        root = project_root()
+        nhc_dir = args.nhc_dir or default_nhc_captures_dir(root)
+        report = args.report or (root / "logs" / "verify-nhc-report.csv")
+        summary = verify_nhc_captures(
+            captures_dir=nhc_dir,
+            report_path=report,
+            limit=int(args.limit or 0),
+            force=bool(args.force),
+        )
+        problems = (
+            summary.cert_mismatch
+            + summary.name_mismatch
+            + summary.both_mismatch
+            + summary.bad_filename
+        )
+        return 1 if problems else 0
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+
 def cmd_fill_images(args: argparse.Namespace) -> int:
     try:
         from src.lianou.writeback import encode_image_base64
@@ -339,12 +451,11 @@ def cmd_fill_images(args: argparse.Namespace) -> int:
         for payload in payloads:
             meta = capture_meta(payload)
             name = str(payload.get("doctorName") or "")
-            id_card = str(meta.get("idCard") or "")
-            cert_code = meta.get("certCode")
+            cert_code = str(meta.get("certCode") or "")
 
             touched = False
             if needs_institution_capture(payload):
-                image = find_institution_image(captures_root, name, id_card)
+                image = find_institution_image(captures_root, name, cert_code)
                 if image:
                     set_supplement_field(
                         payload,
@@ -489,7 +600,7 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
         "--report-output",
         type=Path,
         default=None,
-        help="核对报告 xlsx（默认 workspace/reconcile_report.xlsx，含两个 sheet）",
+        help="核对报告 xlsx（默认 workspace/reconcile_report.xlsx，含三个 sheet）",
     )
     reconcile.add_argument("--exports-dir", type=Path, default=None)
     reconcile.add_argument("--page-size", type=int, default=None)
@@ -556,6 +667,85 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
     capture_nhc.add_argument("--show-browser", action="store_true", help="显示浏览器（默认无头）")
     capture_nhc.add_argument("--dry-run", action="store_true")
     capture_nhc.set_defaults(func=cmd_capture_nhc)
+
+    rename_captures = subparsers.add_parser(
+        "rename-captures",
+        parents=[common],
+        help="Rename capture PNGs via exports/ui 身份证号→执业证书编码",
+    )
+    rename_captures.add_argument("--captures-dir", type=Path, default=None)
+    rename_captures.add_argument(
+        "--exports-dir",
+        type=Path,
+        default=None,
+        help="Root exports directory (reads exports/ui/*.xls|xlsx)",
+    )
+    rename_captures.add_argument(
+        "--ocr-unmatched",
+        action="store_true",
+        help="对仍未匹配的图片 OCR 执业证书编码：在导出表中有则重命名，否则删除",
+    )
+    rename_captures.add_argument(
+        "--commit", action="store_true", help="Actually rename files (default: dry-run)"
+    )
+    rename_captures.set_defaults(func=cmd_rename_captures)
+
+    rename_nhc = subparsers.add_parser(
+        "rename-nhc",
+        parents=[common],
+        help="Normalize 卫健委 screenshots to 姓名_执业证书编号.png under captures/卫健委",
+    )
+    rename_nhc.add_argument(
+        "--source-dir",
+        type=Path,
+        default=None,
+        help="Source NHC screenshots (default: captures/screenshots)",
+    )
+    rename_nhc.add_argument(
+        "--target-dir",
+        type=Path,
+        default=None,
+        help="Output directory (default: captures/卫健委)",
+    )
+    rename_nhc.add_argument(
+        "--keep-source",
+        action="store_true",
+        help="Copy/rename in place; do not remove duplicates from source after move",
+    )
+    rename_nhc.add_argument(
+        "--commit", action="store_true", help="Actually rename/move files (default: dry-run)"
+    )
+    rename_nhc.set_defaults(func=cmd_rename_nhc)
+
+    verify_nhc = subparsers.add_parser(
+        "verify-nhc-captures",
+        parents=[common],
+        help="OCR verify 卫健委 screenshots: filename 姓名/证号 vs screenshot content",
+    )
+    verify_nhc.add_argument(
+        "--nhc-dir",
+        type=Path,
+        default=None,
+        help="NHC captures directory (default: captures/卫健委)",
+    )
+    verify_nhc.add_argument(
+        "--report",
+        type=Path,
+        default=None,
+        help="CSV report path (default: logs/verify-nhc-report.csv)",
+    )
+    verify_nhc.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Only verify the first N files (0 = all pending)",
+    )
+    verify_nhc.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-verify all files, ignoring previously passed records in the report",
+    )
+    verify_nhc.set_defaults(func=cmd_verify_nhc_captures)
 
     fill_images = subparsers.add_parser(
         "fill-images",

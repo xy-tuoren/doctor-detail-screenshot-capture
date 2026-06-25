@@ -41,7 +41,7 @@ def to_submit_json(workspace: Path) -> Path:
 
 
 def reconcile_report_xlsx(workspace: Path) -> Path:
-    """核对名单：单文件双 sheet（莲藕有机构端无 / 机构端有莲藕无）。"""
+    """核对名单：单文件三 sheet（莲藕有机构端无 / 机构端有莲藕无 / 需补充名单）。"""
     return workspace / "reconcile_report.xlsx"
 
 

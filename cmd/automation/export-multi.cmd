@@ -14,7 +14,7 @@ if not exist "%ROOT%\config.json" (
 )
 echo Multi-institution export has no captcha; it clicks Export directly.
 echo If multi export button is not calibrated, run cmd\automation\export-calibrate.cmd (step 8) first.
-echo Exported file: 多执业导出-<timestamp>.xls in the exports folder.
+echo Exported file: 多执业导出-<timestamp>.xls in exports\ui.
 echo.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\automation\ps1\capture-doctor-details.ps1" -Mode Export -ListEntry Multi
 if errorlevel 1 (

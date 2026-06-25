@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify capture PNG filenames against OCR-extracted ID card numbers."""
+"""Verify capture PNG filenames against OCR-extracted practicing certificate codes."""
 
 from __future__ import annotations
 
@@ -18,37 +18,22 @@ from PIL import Image
 from rapidocr_onnxruntime import RapidOCR
 
 
-# 同时匹配 18 位（含 X 结尾）与 15 位老身份证号
-ID_CARD_PATTERN = re.compile(r"(?<![\dXx])(?:\d{17}[\dXx]|\d{15})(?![\dXx])")
-ID_LABEL_PATTERN = re.compile(
-    r"身份证(?:号码|号|證)?[:：]?\s*([0-9A-Za-z|!]{14,25})"
+CERT_LABEL_PATTERN = re.compile(
+    r"执业证书编码[:：]?\s*([0-9A-Za-z]{10,30})"
 )
-FILENAME_PATTERN = re.compile(r"^(.+)_(.{15,18})$")
-
-OCR_CHAR_MAP = {
-    "O": "0",
-    "Q": "0",
-    "D": "0",
-    "I": "1",
-    "L": "1",
-    "|": "1",
-    "!": "1",
-    "Z": "2",
-    "A": "4",
-    "S": "5",
-    "G": "6",
-    "T": "7",
-    "B": "8",
-    "X": "X",
-}
+CERT_FALLBACK_PATTERN = re.compile(
+    r"证书编码[:：]?\s*([0-9A-Za-z]{10,30})"
+)
+# 执业证书编号多为 15 位数字，文件名：姓名_证书编号.png
+FILENAME_PATTERN = re.compile(r"^(.+)_([0-9A-Za-z]{10,30})$")
 
 REPORT_COLUMNS = {
     "file": "文件路径",
     "subfolder": "子目录",
     "expected_name": "文件名姓名",
-    "expected_id_card": "文件名身份证",
-    "ocr_id_card": "OCR识别身份证",
-    "id_match": "身份证比对",
+    "expected_cert_code": "文件名执业证书编号",
+    "ocr_cert_code": "OCR识别执业证书编号",
+    "cert_match": "执业证书编号比对",
     "overall": "总体结论",
     "ocr_confidence": "OCR置信度",
     "notes": "备注",
@@ -63,7 +48,7 @@ MATCH_LABELS = {
 
 OVERALL_LABELS = {
     "OK": "通过",
-    "ID_MISMATCH": "身份证不匹配",
+    "CERT_MISMATCH": "执业证书编号不匹配",
     "BAD_FILENAME": "文件名格式错误",
 }
 
@@ -74,12 +59,12 @@ REVERSE_OVERALL_LABELS = {label: code for code, label in OVERALL_LABELS.items()}
 @dataclass
 class ExpectedInfo:
     name: str
-    id_card: str
+    cert_code: str
 
 
 @dataclass
 class OcrInfo:
-    id_card: str | None
+    cert_code: str | None
     text: str
     confidence: float
 
@@ -89,63 +74,36 @@ class VerifyResult:
     file: str
     subfolder: str
     expected_name: str
-    expected_id_card: str
-    ocr_id_card: str
-    id_match: str
+    expected_cert_code: str
+    ocr_cert_code: str
+    cert_match: str
     overall: str
     ocr_confidence: str
     notes: str
 
 
-def normalize_id_card(value: str | None) -> str:
+def normalize_cert_code(value: str | None) -> str:
     if not value:
         return ""
-    return value.strip().upper().replace(" ", "")
+    return re.sub(r"\s+", "", str(value).strip().upper())
 
 
-def convert_ocr_token_to_id_card(token: str | None) -> str | None:
-    if not token:
-        return None
-
-    cleaned_chars: list[str] = []
-    for ch in token.upper():
-        if ch.isdigit():
-            cleaned_chars.append(ch)
-        elif ch in OCR_CHAR_MAP:
-            cleaned_chars.append(OCR_CHAR_MAP[ch])
-
-    cleaned = "".join(cleaned_chars)
-    if len(cleaned) == 18 and re.fullmatch(r"\d{17}[\dX]", cleaned):
-        return cleaned
-    if len(cleaned) == 15 and re.fullmatch(r"\d{15}", cleaned):
-        return cleaned
-    if len(cleaned) > 18:
-        match = re.match(r"\d{17}[\dX]", cleaned)
-        if match:
-            return match.group(0)
-        match = re.match(r"\d{15}", cleaned)
-        if match:
-            return match.group(0)
-    return None
-
-
-def extract_id_from_text(text: str) -> str | None:
+def extract_cert_from_text(text: str) -> str | None:
     if not text:
         return None
 
     compact = re.sub(r"\s+", "", text)
-    label_match = ID_LABEL_PATTERN.search(compact)
-    if label_match:
-        normalized = convert_ocr_token_to_id_card(label_match.group(1))
-        if normalized:
-            return normalized
+    for pattern in (CERT_LABEL_PATTERN, CERT_FALLBACK_PATTERN):
+        match = pattern.search(compact)
+        if match:
+            return normalize_cert_code(match.group(1))
 
-    for source in (compact, text):
-        matches = ID_CARD_PATTERN.findall(source)
-        if matches:
-            eighteen = [m for m in matches if len(m) == 18]
-            chosen = eighteen[0] if eighteen else matches[0]
-            return normalize_id_card(chosen)
+    # 兜底：执业信息区常见 15 位执业证号（排除 18 位身份证、27 位资格证号）
+    for match in re.finditer(r"(?<![\d])(\d{15})(?![\d])", compact):
+        token = match.group(1)
+        if token.startswith(("19", "20")) and len(token) == 15:
+            continue
+        return token
     return None
 
 
@@ -153,7 +111,7 @@ def parse_filename(path: Path) -> ExpectedInfo | None:
     match = FILENAME_PATTERN.match(path.stem)
     if not match:
         return None
-    return ExpectedInfo(name=match.group(1), id_card=normalize_id_card(match.group(2)))
+    return ExpectedInfo(name=match.group(1), cert_code=normalize_cert_code(match.group(2)))
 
 
 def load_image(path: Path) -> np.ndarray:
@@ -173,16 +131,16 @@ def maybe_upscale(region: np.ndarray, min_size: int = 600) -> np.ndarray:
     )
 
 
+def crop_practice_info_region(image: np.ndarray) -> np.ndarray:
+    """执业信息区：执业证书编码通常在此。"""
+    height, width = image.shape[:2]
+    return image[int(height * 0.32) : int(height * 0.92), 0 : int(width * 0.95)]
+
+
 def crop_basic_info_region(image: np.ndarray) -> np.ndarray:
-    """基本信息整块：通常同时包含身份证号。"""
+    """基本信息区：兜底扫描。"""
     height, width = image.shape[:2]
     return image[int(height * 0.06) : int(height * 0.44), 0 : int(width * 0.78)]
-
-
-def crop_id_card_region(image: np.ndarray) -> np.ndarray:
-    """身份证补扫区（仅在整块未识别到身份证时使用）。"""
-    height, width = image.shape[:2]
-    return image[int(height * 0.26) : int(height * 0.42), 0 : int(width * 0.75)]
 
 
 def run_ocr(engine: RapidOCR, image: np.ndarray) -> tuple[str, float]:
@@ -207,35 +165,45 @@ def run_ocr(engine: RapidOCR, image: np.ndarray) -> tuple[str, float]:
 def ocr_image(engine: RapidOCR, path: Path) -> OcrInfo:
     image = load_image(path)
 
-    base_text, base_conf = run_ocr(engine, maybe_upscale(crop_basic_info_region(image)))
-    texts = [base_text] if base_text else []
-    confidences = [base_conf] if base_conf > 0 else []
+    practice_text, practice_conf = run_ocr(
+        engine, maybe_upscale(crop_practice_info_region(image))
+    )
+    texts = [practice_text] if practice_text else []
+    confidences = [practice_conf] if practice_conf > 0 else []
 
-    best_id = extract_id_from_text(base_text)
+    best_cert = extract_cert_from_text(practice_text)
 
-    if not best_id:
-        id_text, id_conf = run_ocr(engine, maybe_upscale(crop_id_card_region(image)))
-        if id_text:
-            texts.append(id_text)
-            if id_conf > 0:
-                confidences.append(id_conf)
-            best_id = extract_id_from_text(id_text)
+    if not best_cert:
+        base_text, base_conf = run_ocr(engine, maybe_upscale(crop_basic_info_region(image)))
+        if base_text:
+            texts.append(base_text)
+            if base_conf > 0:
+                confidences.append(base_conf)
+            best_cert = extract_cert_from_text(base_text)
+
+    if not best_cert:
+        full_text, full_conf = run_ocr(engine, maybe_upscale(image))
+        if full_text:
+            texts.append(full_text)
+            if full_conf > 0:
+                confidences.append(full_conf)
+            best_cert = extract_cert_from_text(full_text)
 
     avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
     full_text = "\n".join(texts)
 
     return OcrInfo(
-        id_card=best_id,
+        cert_code=best_cert,
         text=full_text,
         confidence=avg_conf,
     )
 
 
-def compare_id(expected: str, actual: str | None) -> tuple[str, str]:
-    expected_norm = normalize_id_card(expected)
-    actual_norm = normalize_id_card(actual)
+def compare_cert(expected: str, actual: str | None) -> tuple[str, str]:
+    expected_norm = normalize_cert_code(expected)
+    actual_norm = normalize_cert_code(actual)
     if not actual_norm:
-        return "MISSING", "OCR 未识别到身份证号"
+        return "MISSING", "OCR 未识别到执业证书编号"
     if expected_norm == actual_norm:
         return "OK", ""
     return "MISMATCH", f"文件名={expected_norm}，OCR={actual_norm}"
@@ -249,10 +217,10 @@ def label_overall(value: str) -> str:
     return OVERALL_LABELS.get(value, value)
 
 
-def overall_status(id_match: str) -> str:
-    if id_match == "OK":
+def overall_status(cert_match: str) -> str:
+    if cert_match == "OK":
         return "OK"
-    return "ID_MISMATCH"
+    return "CERT_MISMATCH"
 
 
 def iter_capture_files(captures_dir: Path) -> list[Path]:
@@ -264,15 +232,15 @@ def make_rel_file(captures_dir: Path, file_path: Path) -> str:
 
 
 def row_dict_to_result(row: dict[str, str]) -> VerifyResult:
-    id_match = REVERSE_MATCH_LABELS.get(row.get(REPORT_COLUMNS["id_match"], ""), "N/A")
-    overall = REVERSE_OVERALL_LABELS.get(row.get(REPORT_COLUMNS["overall"], ""), "ID_MISMATCH")
+    cert_match = REVERSE_MATCH_LABELS.get(row.get(REPORT_COLUMNS["cert_match"], ""), "N/A")
+    overall = REVERSE_OVERALL_LABELS.get(row.get(REPORT_COLUMNS["overall"], ""), "CERT_MISMATCH")
     return VerifyResult(
         file=row.get(REPORT_COLUMNS["file"], "").replace("\\", "/"),
         subfolder=row.get(REPORT_COLUMNS["subfolder"], ""),
         expected_name=row.get(REPORT_COLUMNS["expected_name"], ""),
-        expected_id_card=row.get(REPORT_COLUMNS["expected_id_card"], ""),
-        ocr_id_card=row.get(REPORT_COLUMNS["ocr_id_card"], ""),
-        id_match=id_match,
+        expected_cert_code=row.get(REPORT_COLUMNS["expected_cert_code"], ""),
+        ocr_cert_code=row.get(REPORT_COLUMNS["ocr_cert_code"], ""),
+        cert_match=cert_match,
         overall=overall,
         ocr_confidence=row.get(REPORT_COLUMNS["ocr_confidence"], ""),
         notes=row.get(REPORT_COLUMNS["notes"], ""),
@@ -330,27 +298,27 @@ def verify_file(engine: RapidOCR, captures_dir: Path, file_path: Path) -> Verify
             file=rel_file,
             subfolder=subfolder,
             expected_name="",
-            expected_id_card="",
-            ocr_id_card="",
-            id_match="N/A",
+            expected_cert_code="",
+            ocr_cert_code="",
+            cert_match="N/A",
             overall="BAD_FILENAME",
             ocr_confidence="",
-            notes="文件名格式应为：姓名_身份证号.png",
+            notes="文件名格式应为：姓名_执业证书编号.png",
         )
 
     ocr_info = ocr_image(engine, file_path)
-    id_match, id_note = compare_id(expected.id_card, ocr_info.id_card)
+    cert_match, cert_note = compare_cert(expected.cert_code, ocr_info.cert_code)
 
     return VerifyResult(
         file=rel_file,
         subfolder=subfolder,
         expected_name=expected.name,
-        expected_id_card=expected.id_card,
-        ocr_id_card=ocr_info.id_card or "",
-        id_match=id_match,
-        overall=overall_status(id_match),
+        expected_cert_code=expected.cert_code,
+        ocr_cert_code=ocr_info.cert_code or "",
+        cert_match=cert_match,
+        overall=overall_status(cert_match),
         ocr_confidence=f"{ocr_info.confidence:.3f}",
-        notes=id_note,
+        notes=cert_note,
     )
 
 
@@ -359,9 +327,9 @@ def result_to_report_row(row: VerifyResult) -> dict[str, str]:
         REPORT_COLUMNS["file"]: row.file,
         REPORT_COLUMNS["subfolder"]: row.subfolder,
         REPORT_COLUMNS["expected_name"]: row.expected_name,
-        REPORT_COLUMNS["expected_id_card"]: row.expected_id_card,
-        REPORT_COLUMNS["ocr_id_card"]: row.ocr_id_card,
-        REPORT_COLUMNS["id_match"]: label_match(row.id_match),
+        REPORT_COLUMNS["expected_cert_code"]: row.expected_cert_code,
+        REPORT_COLUMNS["ocr_cert_code"]: row.ocr_cert_code,
+        REPORT_COLUMNS["cert_match"]: label_match(row.cert_match),
         REPORT_COLUMNS["overall"]: label_overall(row.overall),
         REPORT_COLUMNS["ocr_confidence"]: row.ocr_confidence,
         REPORT_COLUMNS["notes"]: row.notes,
@@ -387,7 +355,6 @@ class IncrementalReportWriter:
         if result.overall == "OK":
             self._ok_rows.append(result)
         else:
-            # 每发现一条异常，立即插到报告最上方（表头之下）。
             self._problem_rows.insert(0, result)
         self._rewrite()
 
@@ -415,9 +382,11 @@ def format_console_failure(result: VerifyResult) -> str:
         return " | ".join(parts)
 
     parts.append(
-        f"文件名身份证={result.expected_id_card or '无'}，OCR身份证={result.ocr_id_card or '未识别'}"
+        "文件名执业证书编号="
+        f"{result.expected_cert_code or '无'}，"
+        f"OCR执业证书编号={result.ocr_cert_code or '未识别'}"
     )
-    parts.append(f"身份证比对={label_match(result.id_match)}")
+    parts.append(f"执业证书编号比对={label_match(result.cert_match)}")
     if result.notes:
         parts.append(f"备注={result.notes}")
     return " | ".join(parts)
@@ -434,14 +403,14 @@ def print_result_line(index: int, total: int, file_path: Path, result: VerifyRes
 def print_summary(rows: list[VerifyResult]) -> None:
     total = len(rows)
     ok = sum(1 for row in rows if row.overall == "OK")
-    bad_id = sum(1 for row in rows if row.overall == "ID_MISMATCH")
+    bad_cert = sum(1 for row in rows if row.overall == "CERT_MISMATCH")
     bad_filename = sum(1 for row in rows if row.overall == "BAD_FILENAME")
 
     print("")
     print("=== OCR 校验汇总 ===")
     print(f"总计: {total}")
     print(f"通过: {ok}")
-    print(f"身份证不匹配: {bad_id}")
+    print(f"执业证书编号不匹配: {bad_cert}")
     print(f"文件名格式错误: {bad_filename}")
 
     problems = [row for row in rows if row.overall != "OK"]
@@ -451,14 +420,14 @@ def print_summary(rows: list[VerifyResult]) -> None:
         for row in problems[:20]:
             print(
                 f"- {row.file}: {label_overall(row.overall)}，"
-                f"文件名身份证={row.expected_id_card}，"
-                f"OCR身份证={row.ocr_id_card or '未识别'}"
+                f"文件名执业证书编号={row.expected_cert_code}，"
+                f"OCR执业证书编号={row.ocr_cert_code or '未识别'}"
             )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Verify capture PNG filenames against OCR-extracted ID card numbers."
+        description="Verify capture PNG filenames against OCR-extracted practicing certificate codes."
     )
     parser.add_argument(
         "--captures-dir",
@@ -491,7 +460,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def make_engine(intra_threads: int) -> RapidOCR:
-    # 截图均为正向，无需方向分类（use_cls），可省一次推理
     kwargs: dict = {"use_cls": False}
     if intra_threads and intra_threads > 0:
         kwargs["intra_op_num_threads"] = intra_threads
@@ -515,8 +483,6 @@ def _worker_verify(file_str: str) -> VerifyResult:
 
 
 def resolve_worker_count(requested: int) -> int:
-    # 默认串行：onnxruntime 单次推理已占满 CPU，多进程通常无并行收益甚至更慢。
-    # 如需在其他机器尝试并发，可显式传 --workers N。
     if requested >= 1:
         return requested
     return 1

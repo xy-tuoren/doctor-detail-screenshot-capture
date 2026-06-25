@@ -50,6 +50,7 @@
     "docUnitServiceUrl": "https://jgd.wsb002.cn/Unit.DoctorReg.WSL/MKDocUnitService.asmx",
     "productId": "8fad1b8d-2020-48d1-824b-5b3b261ee089",
     "outputDir": "exports/reg-api",
+    "_outputDirNote": "SOAP 导出目录；客户端 UI 导出（cmd/automation/export*.cmd）默认保存到 exports/ui/",
     "requestTimeoutSeconds": 120,
     "mainSearchType": 1,
     "multiSearchType": 8,

@@ -7,6 +7,9 @@ from src.institution_export.dates import format_cell_value
 MAIN_PRACTICE = "main"
 MULTI_PRACTICE = "multi"
 
+# 主执业导出无结束日期，莲藕点名也不写入 to_submit
+MAIN_PRACTICE_EXCLUDED_FIELDS = frozenset({"recordExpireDate"})
+
 # 机构端导出无省/市/等级列时的业务默认值
 DEFAULT_PRACTICE_PROVINCE = "广东省"
 DEFAULT_PRACTICE_CITY = "广州市"

@@ -149,13 +149,13 @@ def iter_institution_capture_targets(data: list[dict[str, Any]] | dict[str, Any]
             continue
         meta = capture_meta(payload)
         name = str(payload.get("doctorName") or "")
-        id_card = str(meta.get("idCard") or "")
+        cert_code = str(meta.get("certCode") or "")
         list_entry = str(meta.get("listEntry") or "Main")
-        token = (name, id_card, list_entry)
+        token = (name, cert_code, list_entry)
         if token in seen:
             continue
         seen.add(token)
-        targets.append({"name": name, "idCard": id_card, "listEntry": list_entry})
+        targets.append({"name": name, "certCode": cert_code, "listEntry": list_entry})
     return targets
 
 

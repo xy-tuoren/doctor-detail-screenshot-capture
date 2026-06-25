@@ -4,6 +4,8 @@ DEFAULT_LOGIN_SERVICE_URL = (
 
 )
 
+from src.institution_export.paths import EXPORT_REG_API_DIR
+
 DEFAULT_DOC_UNIT_SERVICE_URL = (
 
     "https://jgd.wsb002.cn/Unit.DoctorReg.WSL/MKDocUnitService.asmx"
@@ -42,7 +44,7 @@ DEFAULT_MINKE_REG_CONFIG = {
 
     "productId": DEFAULT_PRODUCT_ID,
 
-    "outputDir": "exports/reg-api",
+    "outputDir": f"exports/{EXPORT_REG_API_DIR}",
 
     "requestTimeoutSeconds": 120,
 

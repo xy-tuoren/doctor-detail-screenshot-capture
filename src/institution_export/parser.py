@@ -1,10 +1,10 @@
 """Parse institution UI/SOAP export files.
 
-支持两种来源：
-- 旧版 UI 导出：``exports/*.xls``（OOXML 伪装成 .xls，用内置 zip/xml 读取）
-- 新版 SOAP 导出：``exports/reg-api/*.xlsx``（openpyxl 标准 xlsx）
+两种导出目录（均在 ``exports/`` 下）：
+- ``exports/ui/``：机构端客户端 UI 手动导出（多为 ``.xls``，OOXML 伪装）
+- ``exports/reg-api/``：SOAP 接口自动导出（标准 ``.xlsx``，openpyxl）
 
-核对匹配键由身份证号改为「执业证书编码」+ 姓名，故索引按执业证书编码建立。
+核对时在两目录中按文件名前缀各取修改时间最新的一份。
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .paths import EXPORT_SOURCE_DIRS
 
 MAIN_HEADERS = frozenset({"审核日期"})
 MULTI_HEADERS = frozenset({"开始日期", "结束日期"})
@@ -29,12 +31,15 @@ class ExportFiles:
 
 
 def _export_dirs(exports_dir: Path) -> list[Path]:
-    """主目录及 reg-api 子目录都纳入查找。"""
-    dirs = [exports_dir]
-    reg_api = exports_dir / "reg-api"
-    if reg_api != exports_dir:
-        dirs.append(reg_api)
-    return [d for d in dirs if d.exists()]
+    """在 exports/ui、exports/reg-api 子目录查找；兼容仍放在 exports 根目录的旧文件。"""
+    dirs: list[Path] = []
+    for name in EXPORT_SOURCE_DIRS:
+        sub = exports_dir / name
+        if sub.is_dir():
+            dirs.append(sub)
+    if exports_dir.is_dir():
+        dirs.append(exports_dir)
+    return dirs
 
 
 def _latest_export(exports_dir: Path, prefix: str) -> Path | None:

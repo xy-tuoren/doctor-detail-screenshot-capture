@@ -15,7 +15,7 @@ if not exist "%ROOT%\config.json" (
 )
 echo All settings will be read from config.json.
 echo If export coordinates are not calibrated, run cmd\automation\export-calibrate.cmd first.
-echo Exported files will be saved to the exports folder by default.
+echo Exported files will be saved to exports\ui by default.
 echo.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\automation\ps1\capture-doctor-details.ps1" -Mode Export -ListEntry Main
 if errorlevel 1 (

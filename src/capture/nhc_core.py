@@ -281,6 +281,60 @@ def human_wait(page, base_ms: int = 300):
     page.wait_for_timeout(_jitter_ms(base_ms))
 
 
+# ---------- 执业证书编码 ----------
+
+_CERT_CODE_LABEL_RE = re.compile(
+    r"执业证书编码[：:\s]*([A-Za-z0-9][A-Za-z0-9+\-_]*)",
+    re.IGNORECASE,
+)
+
+
+def normalize_cert_code(cert: str) -> str:
+    return re.sub(r"\s+", "", cert).upper()
+
+
+def extract_cert_code(drawer_text: str) -> str | None:
+    """从详情文本提取执业证书编码（支持纯数字、XC10+…、X1014… 等）。"""
+    if not drawer_text:
+        return None
+    m = _CERT_CODE_LABEL_RE.search(drawer_text)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def cert_code_in_text(cert: str, text: str) -> bool:
+    if not cert or not text:
+        return False
+    norm = normalize_cert_code(cert)
+    compact = re.sub(r"\s+", "", text).upper()
+    if norm in compact:
+        return True
+    if norm.replace("+", "") in compact.replace("+", ""):
+        return True
+    digits = re.sub(r"\D", "", norm)
+    if len(digits) >= 10 and digits in re.sub(r"\D", "", compact):
+        return True
+    return False
+
+
+def cert_codes_match(extracted: str | None, known: str | None) -> bool:
+    if not known:
+        return True
+    if not extracted or extracted.startswith("unknown_"):
+        return False
+    a, b = normalize_cert_code(extracted), normalize_cert_code(known)
+    if a == b:
+        return True
+    if a.replace("+", "") == b.replace("+", ""):
+        return True
+    digits_a = re.sub(r"\D", "", a)
+    digits_b = re.sub(r"\D", "", b)
+    if digits_a and digits_b and digits_a == digits_b:
+        return True
+    return False
+
+
 # ---------- 验证码识别器 ----------
 
 
@@ -1246,28 +1300,41 @@ def query_one(page, name: str, province: str, hospital: str, solver: CaptchaSolv
                 if panel is None:
                     raise PWTimeout("详情面板文本读取失败")
                 drawer_text = _read_locator_text(panel, timeout_ms=5000)
-            match = re.search(r"执业证书编码[：:]\s*(\d+)", drawer_text)
-            if match:
-                cert_code = match.group(1)
-            else:
+            cert_code = extract_cert_code(drawer_text)
+            if not cert_code:
                 cert_code = f"unknown_{i + 1}"
 
             # 如果已知证书编码，只截图匹配的那一个
-            if known_cert_code and cert_code != known_cert_code:
-                log(f"  ⏭ [{i + 1}/{total}] 跳过 {name}_{cert_code}（不匹配 {known_cert_code}）")
-                close_detail_panel(page)
-                continue
+            save_cert = cert_code
+            if known_cert_code:
+                if cert_codes_match(cert_code, known_cert_code):
+                    save_cert = known_cert_code
+                elif cert_code.startswith("unknown_"):
+                    if total == 1 or cert_code_in_text(known_cert_code, drawer_text):
+                        log(f"  ⚠ [{i + 1}/{total}] 证书编码未解析，"
+                            f"使用名单编码 {known_cert_code}")
+                        save_cert = known_cert_code
+                    else:
+                        log(f"  ⏭ [{i + 1}/{total}] 跳过 {name}_{cert_code}"
+                            f"（不匹配 {known_cert_code}）")
+                        close_detail_panel(page)
+                        continue
+                else:
+                    log(f"  ⏭ [{i + 1}/{total}] 跳过 {name}_{cert_code}"
+                        f"（不匹配 {known_cert_code}）")
+                    close_detail_panel(page)
+                    continue
 
             # 截图命名：姓名_证书编码.png（跳过已存在的）
-            filename = os.path.join(OUTPUT_DIR, f"{name}_{cert_code}.png")
+            filename = os.path.join(OUTPUT_DIR, f"{name}_{save_cert}.png")
             if os.path.exists(filename):
-                log(f"  ⏭ [{i + 1}/{total}] {name}_{cert_code}（已存在）")
+                log(f"  ⏭ [{i + 1}/{total}] {name}_{save_cert}（已存在）")
                 saved += 1  # 算作已处理
                 close_detail_panel(page)
                 continue
 
             panel.screenshot(path=filename)
-            log(f"  💾 [{i + 1}/{total}] {name}_{cert_code}")
+            log(f"  💾 [{i + 1}/{total}] {name}_{save_cert}")
             saved += 1
             close_detail_panel(page)
         except Exception as e:

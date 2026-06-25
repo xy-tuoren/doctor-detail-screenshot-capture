@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
-from .field_mapping import MULTI_PRACTICE, map_department_name, map_export_values
+from .field_mapping import MAIN_PRACTICE, MAIN_PRACTICE_EXCLUDED_FIELDS, MULTI_PRACTICE, map_department_name, map_export_values
 
 IMAGE_PLACEHOLDER_FIELDS = frozenset({"healthCommissionBase", "institutionBase"})
 
@@ -48,7 +48,10 @@ def build_create_payload(
     if department:
         payload["departmentName"] = department
 
-    for field in ("recordDate", "recordExpireDate"):
+    date_fields = ("recordDate",)
+    if practice_source == MULTI_PRACTICE:
+        date_fields = ("recordDate", "recordExpireDate")
+    for field in date_fields:
         value = export_mapped.get(field)
         if value:
             payload[field] = value

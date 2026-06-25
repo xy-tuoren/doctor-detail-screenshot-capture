@@ -18,16 +18,16 @@ def institution_list_folder(list_entry: str) -> str:
 def institution_capture_exists(
     captures_root: Path,
     name: str,
-    id_card: str,
+    cert_code: str,
     list_entry: str,
 ) -> bool:
-    """Match PS1 Test-PersonAlreadyCaptured: requires id_card; checks list-specific folder."""
-    if not id_card.strip():
+    """Match PS1 Test-PersonAlreadyCaptured: requires cert_code; checks list-specific folder."""
+    if not cert_code.strip():
         return False
     folder = captures_root / institution_list_folder(list_entry)
     if not folder.exists():
         return False
-    exact = folder / f"{name}_{id_card}.png"
+    exact = folder / f"{name}_{cert_code}.png"
     if exact.exists():
         return True
     prefix = f"{name}_"
@@ -44,9 +44,9 @@ def filter_institution_capture_targets(
     pending: list[dict[str, Any]] = []
     for item in targets:
         name = str(item.get("name") or "")
-        id_card = str(item.get("idCard") or "")
+        cert_code = str(item.get("certCode") or "")
         list_entry = str(item.get("listEntry") or "Main")
-        if institution_capture_exists(captures_root, name, id_card, list_entry):
+        if institution_capture_exists(captures_root, name, cert_code, list_entry):
             continue
         pending.append(item)
     return pending, len(targets) - len(pending)
@@ -62,7 +62,7 @@ def build_capture_config(
         cfg = json.load(f)
 
     key = "namesMulti" if list_entry == "Multi" else "namesMain"
-    cfg[key] = [{"name": p["name"], "idCard": p.get("idCard", "")} for p in persons]
+    cfg[key] = [{"name": p["name"], "certCode": p.get("certCode", "")} for p in persons]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -98,7 +98,7 @@ def run_institution_capture(
         grouped.setdefault(entry, []).append(
             {
                 "name": str(item.get("name") or ""),
-                "idCard": str(item.get("idCard") or ""),
+                "certCode": str(item.get("certCode") or ""),
             }
         )
 
@@ -159,12 +159,12 @@ def run_nhc_capture(
     return 0
 
 
-def find_institution_image(captures_root: Path, name: str, id_card: str) -> Path | None:
+def find_institution_image(captures_root: Path, name: str, cert_code: str) -> Path | None:
     for sub in ("主执业", "多执业"):
         folder = captures_root / sub
         if not folder.exists():
             continue
-        exact = folder / f"{name}_{id_card}.png"
+        exact = folder / f"{name}_{cert_code}.png"
         if exact.exists():
             return exact
         prefix = f"{name}_"

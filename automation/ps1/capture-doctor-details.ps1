@@ -931,16 +931,16 @@ function ConvertTo-PersonEntry {
     if ($Item -is [string]) {
         $text = $Item.Trim()
         if ($text.Length -eq 0) { return $null }
-        return [pscustomobject]@{ Name = $text; IdCard = '' }
+        return [pscustomobject]@{ Name = $text; CertCode = '' }
     }
 
     $name = Get-ConfigProperty -Config $Item -Names @('name', 'Name')
-    $idCard = Get-ConfigProperty -Config $Item -Names @('idCard', 'IdCard', 'idcard', '身份证')
+    $certCode = Get-ConfigProperty -Config $Item -Names @('certCode', 'CertCode', 'practicingCertCode', '执业证书编码')
     $nameText = [string]$name
     if ([string]::IsNullOrWhiteSpace($nameText)) { return $null }
     return [pscustomobject]@{
-        Name   = $nameText.Trim()
-        IdCard = if ($null -eq $idCard) { '' } else { [string]$idCard.Trim() }
+        Name     = $nameText.Trim()
+        CertCode = if ($null -eq $certCode) { '' } else { [string]$certCode.Trim() }
     }
 }
 
@@ -969,23 +969,29 @@ function Normalize-IdCard {
     return ($Value.Trim().ToUpperInvariant() -replace '\s', '')
 }
 
+function Normalize-CertCode {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    return ($Value.Trim().ToUpperInvariant() -replace '\s', '')
+}
+
 function Get-PersonOutputBaseName {
     param($Person)
     $safeName = Sanitize-FileName $Person.Name
-    if ([string]::IsNullOrWhiteSpace($Person.IdCard)) {
+    if ([string]::IsNullOrWhiteSpace($Person.CertCode)) {
         return $safeName
     }
-    return ('{0}_{1}' -f $safeName, (Sanitize-FileName $Person.IdCard))
+    return ('{0}_{1}' -f $safeName, (Sanitize-FileName $Person.CertCode))
 }
 
 function Get-PersonKey {
     param($Person)
-    return ('{0}|{1}' -f (Sanitize-FileName $Person.Name), (Normalize-IdCard $Person.IdCard))
+    return ('{0}|{1}' -f (Sanitize-FileName $Person.Name), (Normalize-CertCode $Person.CertCode))
 }
 
 function Test-PersonAlreadyCaptured {
     param($Person)
-    if ([string]::IsNullOrWhiteSpace($Person.IdCard)) { return $false }
+    if ([string]::IsNullOrWhiteSpace($Person.CertCode)) { return $false }
     $path = Join-Path $OutputDir ((Get-PersonOutputBaseName -Person $Person) + '.png')
     return (Test-Path $path)
 }
@@ -1042,15 +1048,15 @@ function Get-PendingPersons {
     }
 }
 
-function Find-PersonByOcrIdCard {
+function Find-PersonByOcrCertCode {
     param(
         [object[]]$Candidates,
-        [string]$OcrIdCard
+        [string]$OcrCertCode
     )
-    $norm = Normalize-IdCard $OcrIdCard
+    $norm = Normalize-CertCode $OcrCertCode
     if ($norm.Length -eq 0) { return $null }
     foreach ($person in $Candidates) {
-        $pNorm = Normalize-IdCard $person.IdCard
+        $pNorm = Normalize-CertCode $person.CertCode
         if ($pNorm.Length -eq 0) { continue }
         if ($pNorm -eq $norm) { return $person }
         if ($norm.Contains($pNorm) -or $pNorm.Contains($norm)) { return $person }
@@ -2066,13 +2072,25 @@ function Get-IdCardFromOcrText {
     return $null
 }
 
+function Get-CertCodeFromOcrText {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $compact = ($Text -replace '\s+', '')
+    if ($compact -match '执业证书编码[:：]?([0-9A-Za-z]+)') {
+        return Normalize-CertCode $Matches[1]
+    }
+    if ($compact -match '证书编码[:：]?([0-9A-Za-z]+)') {
+        return Normalize-CertCode $Matches[1]
+    }
+    return $null
+}
+
 function Get-DetailFieldsFromOcrText {
     param([string]$Text)
     $name = $null
     $code = $null
-    $idCard = $null
     if ([string]::IsNullOrWhiteSpace($Text)) {
-        return @{ Name = $null; CertCode = $null; IdCard = $null }
+        return @{ Name = $null; CertCode = $null }
     }
 
     $compact = ($Text -replace '\s+', '')
@@ -2083,16 +2101,8 @@ function Get-DetailFieldsFromOcrText {
         $name = $Matches[1]
     }
 
-    $idCard = Get-IdCardFromOcrText -Text $Text
-
-    $digits = @([regex]::Matches($Text, '\d+') | ForEach-Object { $_.Value })
-    if ($digits.Count -gt 0) {
-        $code = $digits | Where-Object { $_.Length -ge 20 } | Sort-Object Length -Descending | Select-Object -First 1
-        if ([string]::IsNullOrWhiteSpace($code)) {
-            $code = $digits | Where-Object { $_.Length -ne 18 } | Sort-Object Length -Descending | Select-Object -First 1
-        }
-    }
-    return @{ Name = $name; CertCode = $code; IdCard = $idCard }
+    $code = Get-CertCodeFromOcrText -Text $Text
+    return @{ Name = $name; CertCode = $code }
 }
 
 function Get-CertCodeFromBitmap {
@@ -2151,7 +2161,7 @@ function Wait-DetailContentReady {
         等待详情窗口内容渲染完成再返回，避免截到“正在查询，请稍后...”的加载层。
         策略：
           1) 画面哈希稳定（连续两帧一致）——加载动画播放时帧会变化，加载完成后趋于静止；
-          2) 启用 OCR 时再确认文本中不含加载提示，且已识别到身份证号。
+          2) 启用 OCR 时再确认文本中不含加载提示，且已识别到执业证书编号。
         返回： @{ Bitmap = <stable bitmap>; OcrText = <ocr text or $null> }
         调用方负责 Dispose 返回的 Bitmap。
     #>
@@ -2187,9 +2197,9 @@ function Wait-DetailContentReady {
 
             $lastOcrText = Get-OcrTextFromBitmap -Bitmap $lastBitmap
             if (-not (Test-LoadingText -Text $lastOcrText)) {
-                $id = Get-IdCardFromOcrText -Text $lastOcrText
-                if (-not [string]::IsNullOrWhiteSpace($id)) {
-                    # 内容已加载且能读到身份证号，视为渲染完成。
+                $cert = Get-CertCodeFromOcrText -Text $lastOcrText
+                if (-not [string]::IsNullOrWhiteSpace($cert)) {
+                    # 内容已加载且能读到执业证书编号，视为渲染完成。
                     return @{ Bitmap = $lastBitmap; OcrText = $lastOcrText }
                 }
             }
@@ -2890,13 +2900,13 @@ function Capture-NameSeries {
     try {
     $allPersons = @(Resolve-PersonList)
     if ($allPersons.Count -eq 0) {
-        throw ("请在 config.json 的 names 中配置人员（name + idCard），或使用 -Names / -NamesFile / -SearchName 指定。配置文件：{0}" -f $ConfigPath)
+        throw ("请在 config.json 的 names 中配置人员（name + certCode），或使用 -Names / -NamesFile / -SearchName 指定。配置文件：{0}" -f $ConfigPath)
     }
 
     $pendingResult = Get-PendingPersons -Persons $allPersons
     $personList = @($pendingResult.Pending)
     if ($pendingResult.Skipped -gt 0) {
-        Write-Step ("已跳过 {0} 个已有截图的人员（按 姓名+身份证 匹配 {1}）。" -f $pendingResult.Skipped, $OutputDir)
+        Write-Step ("已跳过 {0} 个已有截图的人员（按 姓名+执业证书编号 匹配 {1}）。" -f $pendingResult.Skipped, $OutputDir)
     }
     if ($personList.Count -eq 0) {
         Write-Step '所有配置人员均已有截图，无需继续抓取。'
@@ -2904,9 +2914,9 @@ function Capture-NameSeries {
         return
     }
 
-    $missingIdCard = @($personList | Where-Object { [string]::IsNullOrWhiteSpace($_.IdCard) })
-    if ($missingIdCard.Count -gt 0) {
-        Write-Step ("警告：有 {0} 个人员未配置 idCard，将无法按身份证命名和启动前去重。" -f $missingIdCard.Count)
+    $missingCertCode = @($personList | Where-Object { [string]::IsNullOrWhiteSpace($_.CertCode) })
+    if ($missingCertCode.Count -gt 0) {
+        Write-Step ("警告：有 {0} 个人员未配置 certCode，将无法按执业证书编号命名和启动前去重。" -f $missingCertCode.Count)
     }
 
     $cfg = Get-Calibration
@@ -2950,7 +2960,7 @@ function Capture-NameSeries {
 
         $rowSavedForName = 0
         $seenSignatures = @{}
-        $seenOcrIdCards = @{}
+        $seenOcrCertCodes = @{}
         $consecutiveRowFailures = 0
         $stopCurrentName = $false
         $previousDetailHash = ''
@@ -3002,44 +3012,44 @@ function Capture-NameSeries {
                     }
                     else {
                         $previousDetailHash = $detailHash
-                        $ocrIdCard = $null
+                        $ocrCertCode = $null
                         if (-not $NoOcr) {
                             Wait-IfPauseRequested
                             if ($null -ne $readyOcrText) { $ocrText = $readyOcrText }
                             else { $ocrText = Get-OcrTextFromBitmap -Bitmap $bitmap }
                             if (Test-LoadingText -Text $ocrText) {
                                 Write-Step ("  第 {0} 行仍处于加载中（正在查询/请稍后），跳过以避免截到加载弹窗。" -f ($row + 1))
-                                $ocrIdCard = $null
+                                $ocrCertCode = $null
                             }
                             else {
                                 Wait-IfPauseRequested
                                 $fields = Get-DetailFieldsFromOcrText -Text $ocrText
-                                $ocrIdCard = $fields.IdCard
+                                $ocrCertCode = $fields.CertCode
                             }
                         }
 
                         if (-not $NoOcr) {
-                            if ([string]::IsNullOrWhiteSpace($ocrIdCard)) {
+                            if ([string]::IsNullOrWhiteSpace($ocrCertCode)) {
                                 $isUnmatched = $true
-                                Write-Step ("  第 {0} 行未识别到身份证号，跳过。" -f ($row + 1))
+                                Write-Step ("  第 {0} 行未识别到执业证书编号，跳过。" -f ($row + 1))
                             }
                             else {
-                                $normOcrId = Normalize-IdCard $ocrIdCard
-                                if ($seenOcrIdCards.ContainsKey($normOcrId)) {
+                                $normOcrCert = Normalize-CertCode $ocrCertCode
+                                if ($seenOcrCertCodes.ContainsKey($normOcrCert)) {
                                     $stopCurrentName = $true
-                                    Write-Step ("  第 {0} 行再次出现身份证 {1}，判定列表无更多新结果，结束该姓名。" -f ($row + 1), $normOcrId)
+                                    Write-Step ("  第 {0} 行再次出现执业证书编号 {1}，判定列表无更多新结果，结束该姓名。" -f ($row + 1), $normOcrCert)
                                 }
                                 else {
-                                    $seenOcrIdCards[$normOcrId] = $true
-                                    $targetPerson = Find-PersonByOcrIdCard -Candidates $remaining.ToArray() -OcrIdCard $ocrIdCard
+                                    $seenOcrCertCodes[$normOcrCert] = $true
+                                    $targetPerson = Find-PersonByOcrCertCode -Candidates $remaining.ToArray() -OcrCertCode $ocrCertCode
                                     if ($null -eq $targetPerson) {
                                         $isUnmatched = $true
-                                        Write-Step ("  第 {0} 行身份证 {1} 不在待抓取名单，跳过。" -f ($row + 1), $normOcrId)
-                                        $capturedProbe = [pscustomobject]@{ Name = $searchName; IdCard = $normOcrId }
+                                        Write-Step ("  第 {0} 行执业证书编号 {1} 不在待抓取名单，跳过。" -f ($row + 1), $normOcrCert)
+                                        $capturedProbe = [pscustomobject]@{ Name = $searchName; CertCode = $normOcrCert }
                                         if ($remaining.Count -eq 1 -and (Test-PersonAlreadyCaptured -Person $capturedProbe)) {
                                             $stopCurrentName = $true
-                                            $pendingId = Normalize-IdCard $remaining[0].IdCard
-                                            Write-Step ("  搜索结果为已截图人员；待抓取的 {0} 未出现在列表中，结束该姓名。" -f $pendingId)
+                                            $pendingCert = Normalize-CertCode $remaining[0].CertCode
+                                            Write-Step ("  搜索结果为已截图人员；待抓取的 {0} 未出现在列表中，结束该姓名。" -f $pendingCert)
                                         }
                                     }
                                 }
@@ -3055,11 +3065,11 @@ function Capture-NameSeries {
                         }
 
                         if ($null -ne $targetPerson) {
-                            if ([string]::IsNullOrWhiteSpace($targetPerson.IdCard)) {
-                                throw '该人员未配置 idCard，无法按 姓名+身份证 保存。'
+                            if ([string]::IsNullOrWhiteSpace($targetPerson.CertCode)) {
+                                throw '该人员未配置 certCode，无法按 姓名+执业证书编号 保存。'
                             }
 
-                            $signature = 'idcard:' + (Normalize-IdCard $targetPerson.IdCard)
+                            $signature = 'cert:' + (Normalize-CertCode $targetPerson.CertCode)
                             if ($seenSignatures.ContainsKey($signature)) {
                                 $isDuplicate = $true
                                 Write-Step ("  第 {0} 行与已截取的记录重复，停止该姓名。" -f ($row + 1))
@@ -3075,7 +3085,7 @@ function Capture-NameSeries {
                                 $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
                                 $fileName = [IO.Path]::GetFileName($path)
                                 [void]$remaining.Remove($targetPerson)
-                                Write-CaptureState -Stage 'SearchName' -CurrentName $searchName -CurrentRow ($row + 1) -CurrentIdCard $targetPerson.IdCard -Message '已保存当前人员，继续下一行'
+                                Write-CaptureState -Stage 'SearchName' -CurrentName $searchName -CurrentRow ($row + 1) -CurrentIdCard $targetPerson.CertCode -Message '已保存当前人员，继续下一行'
                             }
                         }
                     }
@@ -3093,8 +3103,8 @@ function Capture-NameSeries {
                         FileName    = $fileName
                         DetailTitle = $detail.Current.Name
                         Name        = $targetPerson.Name
-                        License     = $targetPerson.IdCard
-                        Signature   = ("search:{0}:idcard:{1}:row:{2}" -f $searchName, $targetPerson.IdCard, ($row + 1))
+                        License     = $targetPerson.CertCode
+                        Signature   = ("search:{0}:cert:{1}:row:{2}" -f $searchName, $targetPerson.CertCode, ($row + 1))
                         Message     = 'name-series capture'
                         RowText     = ''
                     })
@@ -5012,7 +5022,7 @@ function Invoke-ExportCalibration {
 function Get-ExportOutputDir {
     $outDir = $ExportDir
     if ([string]::IsNullOrWhiteSpace($outDir)) {
-        $outDir = Join-Path $ProjectRoot 'exports'
+        $outDir = Join-Path (Join-Path $ProjectRoot 'exports') 'ui'
     }
     if (-not (Test-Path $outDir)) {
         New-Item -ItemType Directory -Path $outDir -Force | Out-Null

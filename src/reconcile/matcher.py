@@ -6,8 +6,8 @@ from typing import Any
 from src.institution_export import extract_cert_code as export_cert_code
 from src.institution_export import normalize_cert_code
 
-from .field_mapping import MAIN_PRACTICE, MULTI_PRACTICE
-from .submit_payload import LIANOU_HOSPITAL, build_create_op, build_update_op
+from .field_mapping import MAIN_PRACTICE, MAIN_PRACTICE_EXCLUDED_FIELDS, MULTI_PRACTICE
+from .submit_payload import LIANOU_HOSPITAL, build_create_op, build_update_op, map_missing_update_values
 from .update_field import parse_update_fields
 
 
@@ -163,7 +163,16 @@ def _build_ops_for_doctor(
 
     for item in doc_list:
         missing = parse_update_fields(item.get("updateField"))
+        if practice_source == MAIN_PRACTICE:
+            missing -= MAIN_PRACTICE_EXCLUDED_FIELDS
         if not missing:
+            continue
+        mapped = map_missing_update_values(
+            missing_fields=missing,
+            export_row=export_row,
+            practice_source=practice_source,
+        )
+        if not mapped:
             continue
         ops.append(
             build_update_op(
@@ -260,11 +269,14 @@ def reconcile_doctors(
         matched_certs.add(cert)
         matched_doctors += 1
 
+        # export_row 已通过 姓名+执业证书编号 双字段匹配；API 无身份证时用该导出行补充
+        submit_id_card = _display_id_card(id_card, export_row)
+
         ops, c_count, u_count = _build_ops_for_doctor(
             doctor=doctor,
             doctor_name=doctor_name,
             doctor_file_id=doctor_file_id,
-            id_card=id_card,
+            id_card=submit_id_card,
             cert=cert,
             export_row=export_row,
             practice_source=practice_source,
@@ -328,4 +340,4 @@ def _collect_export_only(
 
 def capture_key(payload: dict[str, Any]) -> str:
     meta = payload.get("_capture") or {}
-    return f"{payload.get('doctorName')}|{meta.get('idCard', '')}"
+    return f"{payload.get('doctorName')}|{meta.get('certCode', '')}"
