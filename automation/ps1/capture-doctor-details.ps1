@@ -135,6 +135,7 @@ public static class NativeWin32 {
     [DllImport("imm32.dll")] public static extern IntPtr ImmGetDefaultIMEWnd(IntPtr hWnd);
     public const int VK_SPACE = 0x20;
     public const int VK_CONTROL = 0x11;
+    public const int VK_ESCAPE = 0x1B;
     public const uint WM_IME_CONTROL = 0x0283;
     public const int IMC_SETOPENSTATUS = 0x0006;
 }
@@ -731,6 +732,7 @@ function Invoke-ScreenClick {
         [System.Windows.Automation.AutomationElement]$FocusWindow = $null,
         [switch]$DoubleClick
     )
+    Wait-IfPauseRequested
     if ($null -ne $FocusWindow) { Bring-ToFront $FocusWindow }
     [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point($X, $Y)
     Start-Sleep -Milliseconds 120
@@ -882,6 +884,7 @@ function Read-CaptureState {
 
 function Clear-CaptureState {
     if (Test-Path $StatePath) {
+        Assert-SafeToDeletePath -Path $StatePath
         Remove-Item -Path $StatePath -Force
     }
 }
@@ -1962,32 +1965,89 @@ function Initialize-Ocr {
     return $true
 }
 
-function Get-OcrTextFromBitmap {
-    param([System.Drawing.Bitmap]$Bitmap)
-    if (-not (Initialize-Ocr)) { return $null }
-    $ms = New-Object System.IO.MemoryStream
+$script:DetailOcrProcess = $null
+$script:DetailOcrWriter = $null
+$script:DetailOcrReader = $null
+
+function Start-DetailOcrServer {
+    if ($null -ne $script:DetailOcrProcess -and -not $script:DetailOcrProcess.HasExited) { return }
+    $python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+    $ocrScript = Join-Path $AutomationRoot 'py\recognize_detail.py'
+    if (-not (Test-Path $python)) { throw 'Detail OCR venv not found (.venv\Scripts\python.exe).' }
+    if (-not (Test-Path $ocrScript)) { throw "Missing detail OCR script: $ocrScript" }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $python
+    $psi.Arguments = "`"$ocrScript`" --serve"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $false
+    $psi.CreateNoWindow = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+
+    $script:DetailOcrProcess = [System.Diagnostics.Process]::Start($psi)
+    $script:DetailOcrWriter = $script:DetailOcrProcess.StandardInput
+    $script:DetailOcrReader = $script:DetailOcrProcess.StandardOutput
+    # rapidocr 模型首次加载需要几秒
+    Start-Sleep -Milliseconds 800
+}
+
+function Stop-DetailOcrServer {
+    if ($null -eq $script:DetailOcrProcess) { return }
     try {
-        $Bitmap.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-        $bytes = $ms.ToArray()
+        if (-not $script:DetailOcrProcess.HasExited) {
+            $script:DetailOcrWriter.WriteLine('__quit__')
+            $script:DetailOcrWriter.Flush()
+            if (-not $script:DetailOcrProcess.WaitForExit(3000)) {
+                $script:DetailOcrProcess.Kill()
+            }
+        }
+    }
+    catch { }
+    finally {
+        $script:DetailOcrProcess = $null
+        $script:DetailOcrWriter = $null
+        $script:DetailOcrReader = $null
+    }
+}
 
-        $stream = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
-        $writer = New-Object Windows.Storage.Streams.DataWriter($stream)
-        $writer.WriteBytes($bytes)
-        Invoke-WinRtAwait ($writer.StoreAsync()) ([uint32]) | Out-Null
-        $writer.DetachStream() | Out-Null
-        $stream.Seek(0)
-
-        $decoder = Invoke-WinRtAwait ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-        $softwareBitmap = Invoke-WinRtAwait ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-        $result = Invoke-WinRtAwait ($script:OcrEngine.RecognizeAsync($softwareBitmap)) ([Windows.Media.Ocr.OcrResult])
-        return $result.Text
+function Invoke-DetailOcr {
+    param([string]$ImagePath)
+    Start-DetailOcrServer
+    if ($null -eq $script:DetailOcrProcess -or $script:DetailOcrProcess.HasExited) {
+        throw 'Detail OCR server not running.'
+    }
+    $script:DetailOcrWriter.WriteLine($ImagePath)
+    $script:DetailOcrWriter.Flush()
+    $jsonLine = $script:DetailOcrReader.ReadLine()
+    if ([string]::IsNullOrWhiteSpace($jsonLine)) { return $null }
+    try {
+        $text = [string]($jsonLine | ConvertFrom-Json)
+        return $text
     }
     catch {
-        Write-Step ("OCR recognize failed: {0}" -f $_.Exception.Message)
+        return $jsonLine
+    }
+}
+
+function Get-OcrTextFromBitmap {
+    param([System.Drawing.Bitmap]$Bitmap)
+    if ($null -eq $Bitmap) { return $null }
+    $tmpPath = Join-Path $env:TEMP ('detail_ocr_' + [Guid]::NewGuid().ToString('N') + '.png')
+    try {
+        $Bitmap.Save($tmpPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        return (Invoke-DetailOcr -ImagePath $tmpPath)
+    }
+    catch {
+        Write-Step ("Detail OCR failed: {0}" -f $_.Exception.Message)
         return $null
     }
     finally {
-        $ms.Dispose()
+        if (Test-Path $tmpPath) {
+            Assert-SafeToDeletePath -Path $tmpPath
+            Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -2625,6 +2685,69 @@ function Test-CtrlSpaceKeyEdge {
     return $edge
 }
 
+function Test-EscapeKeyPressed {
+    <#
+        检测 ESC 键是否被按下（用于紧急停止）。
+        GetAsyncKeyState 高位(0x8000)=当前按住；低位(0x0001)=自上次调用以来被按过。
+        两者任一为真即判定为按下，确保瞬时点击也能捕获。
+    #>
+    try {
+        $state = [NativeWin32]::GetAsyncKeyState([NativeWin32]::VK_ESCAPE)
+        return (($state -band 0x8000) -ne 0) -or (($state -band 0x0001) -ne 0)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Assert-NoEmergencyStop {
+    <#
+        紧急停止闸门：在每次暂停轮询点检测 ESC，按下立即 throw 终止整个脚本。
+        throw 在主流程 switch 块无外层 catch，会直接退出进程。
+    #>
+    if (Test-EscapeKeyPressed) {
+        Write-Step '【紧急停止】检测到 ESC 按键，立即终止脚本。'
+        throw '用户按下 ESC 触发紧急停止。'
+    }
+}
+
+function Assert-SafeToDeletePath {
+    <#
+        删除安全边界：禁止删除项目受保护目录、空路径、含通配符路径。
+        防止「变量为空 → 退化为当前目录」或「通配兜底」误删 workspace/captures/.venv/项目根。
+        所有 Remove-Item 调用前必须先调用本函数。
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw '拒绝删除：路径为空（防止误删当前目录）。'
+    }
+    if ($Path -match '[\*\?]') {
+        throw "拒绝删除含通配符的路径：$Path（防止通配兜底误删）。"
+    }
+    $root = $ProjectRoot
+    if ([string]::IsNullOrWhiteSpace($root)) { $root = (Get-Location).Path }
+    $protected = @(
+        $root,
+        (Join-Path $root 'workspace'),
+        (Join-Path $root 'captures'),
+        (Join-Path $root '.venv'),
+        (Join-Path $root 'src'),
+        (Join-Path $root 'automation'),
+        (Join-Path $root 'cmd'),
+        (Join-Path $root 'docs'),
+        (Join-Path $root 'exports')
+    )
+    $full = $Path
+    try { $full = [System.IO.Path]::GetFullPath($Path) } catch { }
+    foreach ($p in $protected) {
+        $pFull = $p
+        try { $pFull = [System.IO.Path]::GetFullPath($p) } catch { }
+        if ($full -eq $pFull) {
+            throw "拒绝删除受保护路径：$full"
+        }
+    }
+}
+
 function Read-CtrlSpaceFromConsoleBuffer {
     $pressed = $false
     while ([Console]::KeyAvailable) {
@@ -2808,6 +2931,7 @@ function Update-ForegroundPauseState {
 }
 
 function Wait-IfPauseRequested {
+    Assert-NoEmergencyStop
     try {
         if (Test-PauseToggleRequested) {
             $script:IsCapturePaused = -not $script:IsCapturePaused
@@ -3882,7 +4006,7 @@ print(f'OK:api_first_page={api_count}:file_bytes={file_bytes}')
         Write-Step ("  [校验] 执行失败（已忽略）：{0}" -f $_.Exception.Message)
     }
     finally {
-        if (Test-Path $tempPy) { Remove-Item $tempPy -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $tempPy) { Assert-SafeToDeletePath -Path $tempPy; Remove-Item $tempPy -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -4054,6 +4178,7 @@ function Get-CaptchaCodeFromScreen {
     }
     finally {
         if (Test-Path $tempImg) {
+            Assert-SafeToDeletePath -Path $tempImg
             Remove-Item $tempImg -Force -ErrorAction SilentlyContinue
         }
     }
@@ -4509,6 +4634,7 @@ function Test-CaptchaImageReady {
     }
     finally {
         if (Test-Path $tempImg) {
+            Assert-SafeToDeletePath -Path $tempImg
             Remove-Item $tempImg -Force -ErrorAction SilentlyContinue
         }
     }
@@ -4550,7 +4676,7 @@ function Initialize-CaptchaOcrWarmup {
     }
     catch { }
     finally {
-        if (Test-Path $warmImg) { Remove-Item $warmImg -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $warmImg) { Assert-SafeToDeletePath -Path $warmImg; Remove-Item $warmImg -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -5504,25 +5630,31 @@ function Invoke-ExportWithLogin {
 
 Apply-AppConfig
 
-switch ($Mode) {
-    'Probe' { Probe-Environment }
-    'Calibrate' { Invoke-Calibration }
-    'LoginCalibrate' { Invoke-LoginCalibration }
-    'CalibrateAll' { Invoke-AllCalibration }
-    'Prototype' {
-        if ($Limit -le 0) { $Limit = 5 }
-        Capture-Details -EffectiveLimit $Limit
-        Review-Output
+try {
+    switch ($Mode) {
+        'Probe' { Probe-Environment }
+        'Calibrate' { Invoke-Calibration }
+        'LoginCalibrate' { Invoke-LoginCalibration }
+        'CalibrateAll' { Invoke-AllCalibration }
+        'Prototype' {
+            if ($Limit -le 0) { $Limit = 5 }
+            Capture-Details -EffectiveLimit $Limit
+            Review-Output
+        }
+        'Batch' { Capture-Details -EffectiveLimit $Limit; Review-Output }
+        'Search' { Capture-NameSeries }
+        'SearchNames' { Capture-NameSeries }
+        'LoginToHome' { [void](Invoke-LoginToHome) }
+        'OpenListAndSearchNames' { Invoke-OpenListAndCaptureNames }
+        'LoginAndSearchNames' { Invoke-LoginAndCaptureNames }
+        'Review' { Review-Output }
+        'ExportCalibrate' { Invoke-ExportCalibration }
+        'CaptchaRecoveryProbe' { Invoke-CaptchaRecoveryProbe }
+        'CaptureGetLatest' { Invoke-CaptureGetLatestFlow }
+        'Export' { Invoke-ExportWithLogin }
     }
-    'Batch' { Capture-Details -EffectiveLimit $Limit; Review-Output }
-    'Search' { Capture-NameSeries }
-    'SearchNames' { Capture-NameSeries }
-    'LoginToHome' { [void](Invoke-LoginToHome) }
-    'OpenListAndSearchNames' { Invoke-OpenListAndCaptureNames }
-    'LoginAndSearchNames' { Invoke-LoginAndCaptureNames }
-    'Review' { Review-Output }
-    'ExportCalibrate' { Invoke-ExportCalibration }
-    'CaptchaRecoveryProbe' { Invoke-CaptchaRecoveryProbe }
-    'CaptureGetLatest' { Invoke-CaptureGetLatestFlow }
-    'Export' { Invoke-ExportWithLogin }
+}
+finally {
+    Stop-DetailOcrServer
+    Stop-CaptchaOcrServer
 }
