@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from typing import Any
 
 from src.institution_export import extract_cert_code as export_cert_code
@@ -134,7 +135,7 @@ def _build_ops_for_doctor(
     cert: str,
     export_row: dict[str, Any],
     practice_source: str,
-) -> tuple[list[dict[str, Any]], int, int]:
+) -> tuple[list[dict[str, Any]], int, int, Counter]:
     normalized_doctor = {
         **doctor,
         "doctorName": doctor_name,
@@ -148,6 +149,7 @@ def _build_ops_for_doctor(
     ops: list[dict[str, Any]] = []
     create_count = 0
     update_count = 0
+    dropped_fields: Counter = Counter()
 
     if not has_lianou:
         ops.append(
@@ -172,6 +174,9 @@ def _build_ops_for_doctor(
             export_row=export_row,
             practice_source=practice_source,
         )
+        for field in missing:
+            if field not in mapped:
+                dropped_fields[field] += 1
         if not mapped:
             continue
         ops.append(
@@ -188,7 +193,7 @@ def _build_ops_for_doctor(
         )
         update_count += 1
 
-    return ops, create_count, update_count
+    return ops, create_count, update_count, dropped_fields
 
 
 def _dedupe_roster(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -228,6 +233,7 @@ def reconcile_doctors(
     matched_doctors = 0
     create_ops = 0
     update_ops = 0
+    dropped_fields: Counter = Counter()
 
     for doctor in doctors:
         cert = extract_practicing_cert(doctor)
@@ -272,7 +278,7 @@ def reconcile_doctors(
         # export_row 已通过 姓名+执业证书编号 双字段匹配；API 无身份证时用该导出行补充
         submit_id_card = _display_id_card(id_card, export_row)
 
-        ops, c_count, u_count = _build_ops_for_doctor(
+        ops, c_count, u_count, doc_dropped = _build_ops_for_doctor(
             doctor=doctor,
             doctor_name=doctor_name,
             doctor_file_id=doctor_file_id,
@@ -284,6 +290,7 @@ def reconcile_doctors(
         to_submit.extend(ops)
         create_ops += c_count
         update_ops += u_count
+        dropped_fields.update(doc_dropped)
 
     lianou_id_by_cert = _build_lianou_id_by_cert(doctors)
     export_only = _collect_export_only(
@@ -304,6 +311,7 @@ def reconcile_doctors(
             "missingNotInExport": missing_not_in_export,
             "nameMismatch": name_mismatch,
             "exportOnly": len(export_only),
+            "droppedFields": dict(dropped_fields),
         },
         "toSubmit": to_submit,
         "exportOnly": export_only,

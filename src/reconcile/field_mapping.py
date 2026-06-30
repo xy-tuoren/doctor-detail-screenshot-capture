@@ -21,7 +21,7 @@ FIELD_LABELS: dict[str, str] = {
     "practiceCity": "城市",
     "hospital": "医院",
     "hospitalLevel": "医院等级",
-    "departmentName": "科室名称",
+    "professionalList": "执业范围",
     "recordDate": "备案日期",
     "recordExpireDate": "备案到期日期",
     "healthCommissionBase": "卫健委图片",
@@ -35,19 +35,58 @@ DATE_FIELDS = frozenset(
     }
 )
 
-_DEPARTMENT_EXPORT_KEY = "执业范围"
+_PROFESSIONAL_EXPORT_KEY = "执业范围"
+_CATEGORY_EXPORT_KEY = "医师类别"
+
+# 机构端「医师类别」→ 莲藕 professionalType（1=临床 2=中医 3=口腔 4=公共卫生）
+# 「中西医结合」按业务约定归入中医(2)
+PROFESSIONAL_TYPE_MAP: dict[str, int] = {
+    "临床": 1,
+    "中医": 2,
+    "中西医结合": 2,
+    "口腔": 3,
+    "公共卫生": 4,
+}
 
 
-def map_department_name(export_row: dict[str, Any]) -> str:
-    """departmentName ← 导出「执业范围」；列表分隔符逗号统一为分号。"""
-    value = export_row.get(_DEPARTMENT_EXPORT_KEY)
+def _professional_type(export_row: dict[str, Any]) -> int:
+    raw = export_row.get(_CATEGORY_EXPORT_KEY)
+    if raw is None:
+        return 0
+    key = str(raw).strip()
+    if not key:
+        return 0
+    # 容错：去掉「医师」后缀再匹配，如「临床医师」→「临床」
+    if key in PROFESSIONAL_TYPE_MAP:
+        return PROFESSIONAL_TYPE_MAP[key]
+    for needle, code in PROFESSIONAL_TYPE_MAP.items():
+        if needle in key:
+            return code
+    return 0
+
+
+def _split_professional_names(value: Any) -> list[str]:
     if value is None:
-        return ""
+        return []
     text = str(value).strip()
     if not text:
-        return ""
-    text = text.replace("，", ";").replace(",", ";")
-    return text
+        return []
+    for sep in (";", "；", ",", "，", "、"):
+        text = text.replace(sep, "\n")
+    return [part.strip() for part in text.splitlines() if part.strip()]
+
+
+def map_professional_list(export_row: dict[str, Any]) -> list[dict[str, Any]]:
+    """professionalList ← 导出「执业范围」(可多项) + 「医师类别」→ professionalType。
+
+    返回 [{"professionalType": int, "professionalName": str}, ...]；
+    无执业范围数据时返回空列表。
+    """
+    names = _split_professional_names(export_row.get(_PROFESSIONAL_EXPORT_KEY))
+    if not names:
+        return []
+    professional_type = _professional_type(export_row)
+    return [{"professionalType": professional_type, "professionalName": name} for name in names]
 
 
 def map_export_values(practice_source: str, export_row: dict[str, Any]) -> dict[str, str]:

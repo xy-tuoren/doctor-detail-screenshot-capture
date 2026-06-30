@@ -23,6 +23,16 @@ def normalize_row(item: dict[str, Any]) -> dict[str, Any]:
     hospital_level = row.get("hospitalLevel")
     row["_hospitalLevelLabel"] = HOSPITAL_LEVEL_LABELS.get(hospital_level, "")
 
+    professional_list = row.get("professionalList")
+    if isinstance(professional_list, list):
+        row["_professionalListLabel"] = ";".join(
+            str(item.get("professionalName", "")).strip()
+            for item in professional_list
+            if isinstance(item, dict) and str(item.get("professionalName", "")).strip()
+        )
+    else:
+        row["_professionalListLabel"] = ""
+
     return row
 
 

@@ -215,6 +215,15 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         print(f"saved to_submit.json -> {submit_path}")
         print(f"saved reconcile_report.xlsx -> {report_path}")
         print(f"saved reconcile_summary.json -> {reconcile_summary_json(workspace)}")
+
+        dropped = summary.get("droppedFields") or {}
+        if dropped:
+            parts = [f"{field}={count}" for field, count in sorted(dropped.items(), key=lambda kv: (-kv[1], kv[0]))]
+            print(
+                "[WARN] 以下字段被莲藕 API 点名缺失，但机构端导出无法填充（已跳过）： "
+                + ", ".join(parts),
+                file=sys.stderr,
+            )
         return 0
     except Exception as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)

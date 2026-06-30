@@ -19,8 +19,8 @@ from .field_mapping import (
     MAIN_PRACTICE,
     MAIN_PRACTICE_EXCLUDED_FIELDS,
     MULTI_PRACTICE,
-    map_department_name,
     map_export_values,
+    map_professional_list,
 )
 
 LIANOU_HOSPITAL = "莲藕健康医院"
@@ -36,7 +36,7 @@ _CREATE_OPTIONAL_FIELDS = (
     "practiceCity",
     "hospital",
     "hospitalLevel",
-    "departmentName",
+    "professionalList",
     "recordDate",
     "recordExpireDate",
     "healthCommissionBase",
@@ -54,8 +54,8 @@ def _practice_type(practice_source: str) -> int:
     return 2 if practice_source == MULTI_PRACTICE else 1
 
 
-def _export_department(row: dict[str, Any]) -> str:
-    return map_department_name(row)
+def _export_professional_list(row: dict[str, Any]) -> list[dict[str, Any]]:
+    return map_professional_list(row)
 
 
 def _required_identity(doctor: dict[str, Any], cert_code: str, id_card: str) -> dict[str, Any]:
@@ -85,7 +85,7 @@ def _map_missing_to_values(
 ) -> dict[str, Any]:
     """将 API 点名的缺失字段映射为待提交键值（仅含本次会写入的项）。"""
     export_mapped = map_export_values(practice_source, export_row)
-    department = _export_department(export_row)
+    professional_list = _export_professional_list(export_row)
     values: dict[str, Any] = {}
 
     for field in sorted(missing_fields):
@@ -93,9 +93,9 @@ def _map_missing_to_values(
             continue
         if field == "medicalInstitutionType":
             values["medicalInstitutionType"] = _practice_type(practice_source)
-        elif field == "departmentName":
-            if department:
-                values["departmentName"] = department
+        elif field == "professionalList":
+            if professional_list:
+                values["professionalList"] = professional_list
         elif field == "practiceProvince":
             values["practiceProvince"] = DEFAULT_PRACTICE_PROVINCE
         elif field == "practiceCity":
@@ -142,7 +142,7 @@ def build_create_op(
 ) -> dict[str, Any]:
     """缺少莲藕健康医院 → 新增一条本院记录（operationType=0）。"""
     export_mapped = map_export_values(practice_source, export_row)
-    department = _export_department(export_row)
+    professional_list = _export_professional_list(export_row)
 
     update_field: dict[str, Any] = {
         "medicalInstitutionType": _practice_type(practice_source),
@@ -150,7 +150,7 @@ def build_create_op(
         "practiceCity": DEFAULT_PRACTICE_CITY,
         "hospitalLevel": DEFAULT_HOSPITAL_LEVEL,
         "hospital": lianou_hospital,
-        "departmentName": department,
+        "professionalList": professional_list,
         "healthCommissionBase": "",
         "institutionBase": "",
     }

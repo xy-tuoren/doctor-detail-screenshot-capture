@@ -1,0 +1,310 @@
+# 医生数据采集与补全（Doctor Data Capture & Completion）
+
+本仓库用于**医生执业相关数据的采集、核对与补全**：从莲藕内部系统拉取我方管理的医生名单及缺失字段，与机构端注册导出核对，补全可映射的文字字段，采集机构端与卫健委公示截图，最终写回莲藕。
+
+**CLI 入口**：`python -m src.cli <子命令>`（默认读取项目根目录 `config.json`）
+
+---
+
+## 快速开始
+
+### 1. 环境准备
+
+```powershell
+# 克隆后进入项目目录
+cd doctor-detail-screenshot-capture
+
+# 创建并激活虚拟环境（Windows）
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# 安装核心依赖
+pip install -e .
+
+# 卫健委采图额外依赖（仅 capture-nhc 需要）
+pip install -e ".[capture-nhc]"
+playwright install chromium
+```
+
+机构端 UI 采图依赖 **PowerShell** 与医师电子化注册信息系统（机构版）桌面客户端；首次使用前需完成坐标校准（见下文「机构端 UI 自动化」）。
+
+### 2. 配置文件
+
+复制 `config.json.example` 为 `config.json`，至少配置：
+
+| 配置块 | 用途 |
+|--------|------|
+| `loginUser` / `loginPassword` | 机构端客户端登录 |
+| `doctorApi` | 莲藕 `GetDoctorMedicalPage` 接口（baseUrl、签名等） |
+| `minkeRegApi` | 机构端 SOAP 导出（`export-reg`） |
+| `names` / `namesMulti` | 机构端 UI 采图时的医生列表（含姓名、身份证；采图命名以执业证书编号为准） |
+| `loginCalibration` / `listCalibration` | 机构端 UI 自动化坐标（`calibrate` 生成） |
+
+`config.json` 含账号密码，**勿提交到 Git**。
+
+### 3. 典型工作流
+
+**完整链路（推荐分步执行，便于在中途检查结果）：**
+
+```powershell
+# ① 拉取机构端最新名单（SOAP，可选；也可手动 UI 导出到 exports/ui/）
+python -m src.cli export-reg
+
+# ② 核对：莲藕 × 机构端 → 生成提交计划
+python -m src.cli reconcile
+
+# ③ 采图（需机构端客户端 / 浏览器环境就绪）
+python -m src.cli capture-institution
+python -m src.cli capture-nhc
+
+# ④ 截图转 base64 写回 to_submit.json
+python -m src.cli fill-images
+
+# ⑤ 写回莲藕（默认 dry-run，确认后再 --commit）
+python -m src.cli submit
+python -m src.cli submit --commit # 仅文字字段
+python -m src.cli submit --commit --include-images # 含图片
+```
+
+**只跑到采图前（核对 + 导出，不启动采图）：**
+
+```powershell
+python -m src.cli export-reg
+python -m src.cli reconcile
+# 检查 workspace/artifacts/reconcile_report.xlsx 与 to_submit.json
+```
+
+**一键串跑：**
+
+| 命令 | 说明 |
+|------|------|
+| `run-all` | 从 `reconcile` 起：采图 → fill-images → submit |
+| `run-all --with-export` | 先 `export-reg`，再核对与后续 |
+| `run-all --skip-capture` | 跳过采图，仅核对后 submit |
+| `run-all --skip-submit` | 核对 + 采图 + 回填，不提交 |
+| `run-all --commit` | submit / fill-images 真调接口 |
+
+---
+
+## 项目结构
+
+```
+doctor-detail-screenshot-capture/
+├── AGENTS.md # 本文件：项目说明与 Agent 指南
+├── config.json # 本地配置（勿提交）
+├── config.json.example
+├── src/ # Python 源码
+│ ├── cli/ # CLI 入口与子命令
+│ ├── api/ # 莲藕 API 拉取
+│ ├── minke_reg/ # 机构端 SOAP 导出
+│ ├── institution_export/# 导出文件解析与索引
+│ ├── reconcile/ # 核对、to_submit 生成、写回载荷
+│ ├── capture/ # 采图编排（机构端 PS1 / 卫健委 Playwright）
+│ └── lianou/ # UpdateDoctorMedical 写回
+├── automation/
+│ ├── ps1/ # 机构端 UI 自动化（capture-doctor-details.ps1）
+│ └── py/ # OCR 校验等
+├── cmd/ # 薄封装 .cmd（automation / reg-api / api）
+├── exports/ # 机构端导出输入
+│ ├── reg-api/ # SOAP 自动导出（.xlsx）
+│ └── ui/ # 客户端 UI 手动导出（.xls）
+├── workspace/ # 管线工作区
+│ ├── artifacts/ # 核对主产物（to_submit、报告、摘要）
+│ ├── cache/ # 莲藕 API 24h 缓存
+│ ├── debug/ # --debug 中间快照
+│ └── tmp/ # 采图临时配置
+├── captures/ # 截图输出（机构端 + 卫健委）
+└── docs/adr/ # 架构决策记录
+```
+
+---
+
+## 管线流程
+
+```mermaid
+flowchart LR
+ subgraph 输入
+ L[莲藕 API]
+ E[机构端导出<br/>exports/ui + reg-api]
+ end
+ R[reconcile]
+ TS[to_submit.json]
+ CI[capture-institution]
+ CN[capture-nhc]
+ FI[fill-images]
+ SU[submit]
+ L --> R
+ E --> R
+ R --> TS
+ TS --> CI
+ TS --> CN
+ CI --> CAP1[captures/]
+ CN --> CAP2[captures/卫健委/]
+ CAP1 --> FI
+ CAP2 --> FI
+ FI --> TS
+ TS --> SU
+ SU --> L
+```
+
+### 分步骤命令
+
+| 步骤 | 命令 | 作用 | 主要产出 |
+|------|------|------|----------|
+| 0（可选） | `export-reg` | SOAP 拉最新主/多执业名单 | `exports/reg-api/主执业导出-*.xlsx`、`多执业导出-*.xlsx` |
+| 1（可选） | `fetch` | 单独拉莲藕全量医生 | `workspace/cache/doctors_api_cache.json` |
+| 2（可选） | `parse-exports` | 单独解析导出建索引 | 控制台统计；`--debug` 时 `debug/export_index.json` |
+| 3 | **`reconcile`** | 莲藕 × 机构端核对 | `artifacts/to_submit.json`、`reconcile_report.xlsx`、`reconcile_summary.json` |
+| 4 | `capture-institution` | 机构端采详情图 | `captures/主执业|多执业/` |
+| 5 | `capture-nhc` | 卫健委公示站采图 | `captures/卫健委/` |
+| 6 | `fill-images` | 截图 base64 写回 JSON | 更新后的 `to_submit.json` |
+| 7 | `submit` | 写回莲藕 UpdateDoctorMedical | 接口响应日志 |
+
+`reconcile` 自动复用 24h 莲藕缓存，并在 `exports/ui/` 与 `exports/reg-api/` 各取**修改时间最新**的主/多执业导出，通常无需单独 `fetch` / `parse-exports`。
+
+### 安全默认（dry-run）
+
+| 命令 | 默认行为 | 真执行 |
+|------|----------|--------|
+| `submit` | 打印将提交的内容 | `--commit` |
+| `fill-images` | 只写回 JSON | `--commit` |
+| `capture-*` | 真采图 | `--dry-run` 仅预览目标数 |
+
+### 可拆开执行
+
+- **仅文字字段**：`reconcile` 后 `submit --commit`；更新时空图片字段不会提交。
+- **含图片**：须 `capture-*` → `fill-images` → `submit --commit --include-images`。
+
+---
+
+## 机构端 UI 自动化
+
+底层脚本：`automation/ps1/capture-doctor-details.ps1`。可通过 CLI 或 `cmd/` 调用。
+
+```powershell
+# 校准登录与列表坐标（首次必做）
+python -m src.cli run-automation calibrate
+# 或：cmd\automation\calibrate.cmd
+
+# UI 手动导出名单到 exports/ui/
+python -m src.cli run-automation export --entry Main
+python -m src.cli run-automation export --entry Multi
+
+# 机构端详情采图（也可由 capture-institution 根据 to_submit 自动驱动）
+python -m src.cli run-automation capture --entry Main
+
+# OCR 校验已有截图
+python -m src.cli run-automation verify-captures
+```
+
+`capture-institution` 会读取 `to_submit.json` 中的 `_capture` 元数据，生成临时配置并调用上述 PS1 脚本。
+
+---
+
+## 术语与命名（Language）
+
+编写代码、文档与用户沟通时请统一用词。
+
+### 数据来源
+
+| 术语 | 含义 | 避免使用 |
+|------|------|----------|
+| **莲藕系统** | 我方内部业务系统（imax，`GetDoctorMedicalPage`）；名单与缺失字段的权威来源，也是写回目标 | 系统、内部系统、imax（除接口实现外） |
+| **机构端** | 医师电子化注册信息系统（机构版）客户端及导出；审核日期、执业范围等注册信息权威来源 | 民科、实际系统、注册库 |
+| **主执业导出 / 多执业导出** | 机构端两张互斥名单文件。主执业含「审核日期」；多执业含「开始/结束日期」 | 第一执业表、多点执业表 |
+| **第一执业 / 多点执业** | 执业类型，对应 `medicalInstitutionType`（1/2）；由匹配到的导出表推断，非查表输入 | 用「主执业/多执业」指类型（那两词专指文件） |
+| **卫健委** | 国家卫健委公示平台（`zgcx.nhc.gov.cn`） | 公示平台、国网 |
+
+### 核对与中间数据
+
+**核对**：以莲藕为基准，`doctorName` + `practicingCertCode` 与导出「姓名」+「执业证书编码」**双字段同时匹配**。禁止仅用姓名；证书号为空 → 莲藕有机构端无。
+
+**to_submit.json**（`workspace/artifacts/`）：双匹配成功后，**仅针对「莲藕健康医院」** 生成的 **UpdateDoctorMedical 操作体数组**（其它 `docMedicalList` 医院不生成提交项）。
+
+- **顶层**：`operationType`、`aId`（更新时）、身份五件套（`doctorFileId` / `doctorName` / `iDCard` / `qualificationCertCode` / `practicingCertCode`）
+- **`updateField`**：本次实际要提交的业务字段（科室、日期、图片 base64 等）
+- **`_capture` / `_op`**：采图定位用，**不提交**接口
+
+生成规则：
+- docMedicalList **缺「莲藕健康医院」** → `operationType=0` 新增
+- docMedicalList **仅有「莲藕健康医院」**且其 `updateField` 非空 → `operationType=1` 更新；图片字段空字符串表示待采图
+- **其它医院**（即使有点名缺失字段）→ **不写入** `to_submit.json`，`submit` / `fill-images` 亦跳过
+- 提交时 `postable_body` 展平顶层与 `updateField`；更新丢弃空值，新增保留空占位
+
+**莲藕健康医院**：本院在 docMedicalList 中的固定医院名。
+
+**未匹配名单**（`workspace/artifacts/reconcile_report.xlsx`，每次覆盖）：
+- sheet `莲藕有机构端无`：双字段无法匹配（含无证书号、导出无此证、姓名不一致）
+- sheet `机构端有莲藕无`：导出有、莲藕无对应证书号
+
+### 工作区产物
+
+**主产物（`workspace/artifacts/`，每次 reconcile 覆盖）：**
+
+| 文件 | 说明 |
+|------|------|
+| `to_submit.json` | 提交操作体；采图、回填、提交均读此文件 |
+| `reconcile_report.xlsx` | 未匹配名单 |
+| `reconcile_summary.json` | 条数统计与导出来源 |
+
+**其它子目录：**
+
+| 路径 | 说明 |
+|------|------|
+| `cache/doctors_api_cache.json` | 莲藕 API 全量缓存（24h） |
+| `debug/` | 仅 `--debug`：`doctors.json`、`export_index.json`、`reconcile_result.json` |
+| `tmp/capture-config-*.json` | 机构端采图临时配置 |
+| `tmp/nhc-failures.log` | 卫健委采图失败日志 |
+
+**机构端导出（`exports/`）：**
+
+| 目录 | 来源 | 格式 |
+|------|------|------|
+| `exports/ui/` | 客户端 UI 手动导出 | 多为 `.xls` |
+| `exports/reg-api/` | `export-reg` SOAP 导出 | `.xlsx` |
+
+**截图（`captures/`）：**
+
+| 类型 | 路径 | 莲藕字段 | 命名 |
+|------|------|----------|------|
+| 机构端 | `captures/主执业\|多执业/` | `institutionBase` | `姓名_执业证书编号.png` |
+| 卫健委 | `captures/卫健委/` | `healthCommissionBase` | 同上规则 |
+
+OCR 与校验均按**执业证书编号**，非身份证。
+
+---
+
+## 字段映射（机构端导出 → 莲藕）
+
+匹配与写回**不以身份证为键**；身份证仅用于报告展示与采图定位。
+
+| 用途 | 莲藕 | 机构端导出 |
+|------|------|------------|
+| 匹配 | `doctorName` + `practicingCertCode` | 「姓名」+「执业证书编码」 |
+| 科室 | `professionalList` | 「执业范围」（`,`/`，` → `;`）+「医师类别」→`professionalType` |
+| 主执业备案日 | `recordDate` | 「审核日期」 |
+| 多执业起止 | `recordDate` / `recordExpireDate` | 「开始日期」/「结束日期」 |
+| 执业类型 | `medicalInstitutionType` | 主=1，多=2（由匹配表推断） |
+| 省/市/等级 | `practiceProvince` / `practiceCity` / `hospitalLevel` | 默认：广东省、广州市、`10`（二级） |
+| 图片 | `institutionBase` / `healthCommissionBase` | 采图脚本生成 base64 |
+
+身份五件套来自莲藕 API，不由机构端导出补写。
+
+---
+
+## Agent 开发须知
+
+1. **路径**：主产物统一在 `workspace/artifacts/`，通过 `src/pipeline/paths.py` 引用，勿硬编码旧根路径。
+2. **匹配**：必须证书号 + 姓名双字段；勿改为仅姓名或仅身份证匹配。
+3. **写回**：`submit` / `fill-images` 默认 dry-run；改 `--commit` 行为需谨慎。
+4. **配置**：不修改、不提交 `config.json`；示例用 `config.json.example`。
+5. **采图**：机构端依赖 Windows 桌面客户端与 PS1；卫健委依赖 Playwright，勿在无头环境强行跑 UI 步骤。
+6. **最小改动**：沿用现有 CLI 子命令与目录约定；新功能优先扩展 `src/cli/pipeline_cmds.py` 与对应模块。
+7. **危险操作**：脚本中**禁止**对项目根目录、`workspace/`、`captures/` 使用 `Remove-Item -Recurse -Force`；任何清理操作必须显式指定文件名/扩展名，禁止用通配符兜底。变量为空时 `Remove-Item "$x\*"` 等价于删除当前目录全部内容。
+
+---
+
+## 相关文档
+
+- 接口字段：[`医生医疗机构接口文档.md`](医生医疗机构接口文档.md)
+- 架构决策：[`docs/adr/0008-cert-match-docmedical-operationtype.md`](docs/adr/0008-cert-match-docmedical-operationtype.md)

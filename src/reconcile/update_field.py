@@ -12,7 +12,7 @@ CANONICAL_FIELDS = frozenset(
         "practiceCity",
         "hospital",
         "hospitalLevel",
-        "departmentName",
+        "professionalList",
         "recordDate",
         "recordExpireDate",
         "healthCommissionBase",

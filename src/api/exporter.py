@@ -21,7 +21,7 @@ COLUMN_DEFS: list[tuple[str, str, str]] = [
     ("practiceCity", "城市", "practiceCity"),
     ("hospitalLevel", "医院等级", "hospitalLevel"),
     ("hospitalLevelLabel", "医院等级说明", "_hospitalLevelLabel"),
-    ("departmentName", "科室名称", "departmentName"),
+    ("professionalList", "执业范围", "_professionalListLabel"),
     ("recordDate", "备案日期", "recordDate"),
     ("recordExpireDate", "备案到期日期", "recordExpireDate"),
     ("healthCommissionBase", "卫健委图片", "healthCommissionBase"),

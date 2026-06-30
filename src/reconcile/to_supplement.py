@@ -26,7 +26,7 @@ _SUPPLEMENT_KEYS = frozenset(
         "practiceCity",
         "hospital",
         "hospitalLevel",
-        "departmentName",
+        "professionalList",
         "recordDate",
         "recordExpireDate",
         "healthCommissionBase",
@@ -115,7 +115,8 @@ def postable_body(payload: dict[str, Any], *, include_images: bool = True) -> di
     for key, value in supplement_fields(payload).items():
         if not include_images and key in IMAGE_API_FIELDS:
             continue
-        if (value == "" or value is None) and not create:
+        is_empty = value is None or value == "" or value == [] or value == {}
+        if is_empty and not create:
             continue
         if value is None:
             value = ""

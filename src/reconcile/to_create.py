@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
-from .field_mapping import MAIN_PRACTICE, MAIN_PRACTICE_EXCLUDED_FIELDS, MULTI_PRACTICE, map_department_name, map_export_values
+from .field_mapping import MAIN_PRACTICE, MAIN_PRACTICE_EXCLUDED_FIELDS, MULTI_PRACTICE, map_export_values, map_professional_list
 
 IMAGE_PLACEHOLDER_FIELDS = frozenset({"healthCommissionBase", "institutionBase"})
 
@@ -23,8 +23,8 @@ def _extract_cert_code(export_row: dict[str, Any]) -> str | None:
     return None
 
 
-def _export_department(row: dict[str, Any]) -> str:
-    return map_department_name(row)
+def _export_professional_list(row: dict[str, Any]) -> list[dict[str, Any]]:
+    return map_professional_list(row)
 
 
 def build_create_payload(
@@ -44,9 +44,9 @@ def build_create_payload(
         "medicalInstitutionType": 2 if practice_source == MULTI_PRACTICE else 1,
     }
 
-    department = _export_department(export_row)
-    if department:
-        payload["departmentName"] = department
+    professional_list = _export_professional_list(export_row)
+    if professional_list:
+        payload["professionalList"] = professional_list
 
     date_fields = ("recordDate",)
     if practice_source == MULTI_PRACTICE:

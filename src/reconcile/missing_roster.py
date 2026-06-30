@@ -51,7 +51,7 @@ _SUPPLEMENT_FIELD_ORDER = (
     "practiceCity",
     "hospital",
     "hospitalLevel",
-    "departmentName",
+    "professionalList",
     "recordDate",
     "recordExpireDate",
     "institutionBase",
