@@ -164,6 +164,9 @@ def _build_ops_for_doctor(
         create_count += 1
 
     for item in doc_list:
+        # 仅对「莲藕健康医院」生成 update 操作体；其它医院即使点名缺失字段也不写入 to_submit
+        if normalize_name(item.get("hospital")) != LIANOU_HOSPITAL:
+            continue
         missing = parse_update_fields(item.get("updateField"))
         if practice_source == MAIN_PRACTICE:
             missing -= MAIN_PRACTICE_EXCLUDED_FIELDS

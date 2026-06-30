@@ -34,20 +34,26 @@ def workspace_tmp_dir(workspace: Path) -> Path:
     return path
 
 
-# --- 管线主产物（固定文件名，每次覆盖）---
+def workspace_artifacts_dir(workspace: Path) -> Path:
+    path = workspace / "artifacts"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+# --- 管线主产物（固定文件名，每次覆盖，统一存放于 artifacts/）---
 
 def to_submit_json(workspace: Path) -> Path:
-    return workspace / "to_submit.json"
+    return workspace_artifacts_dir(workspace) / "to_submit.json"
 
 
 def reconcile_report_xlsx(workspace: Path) -> Path:
     """核对名单：单文件三 sheet（莲藕有机构端无 / 机构端有莲藕无 / 需补充名单）。"""
-    return workspace / "reconcile_report.xlsx"
+    return workspace_artifacts_dir(workspace) / "reconcile_report.xlsx"
 
 
 def reconcile_summary_json(workspace: Path) -> Path:
     """核对摘要：条数统计与导出来源，不含完整操作体。"""
-    return workspace / "reconcile_summary.json"
+    return workspace_artifacts_dir(workspace) / "reconcile_summary.json"
 
 
 def doctors_api_cache_json(workspace: Path) -> Path:
