@@ -32,6 +32,12 @@ def screen_double_click(x: int, y: int, focus_hwnd: int = 0,
         pause_ctrl.wait_if_pause_requested()
     if focus_hwnd:
         windows.bring_to_front(focus_hwnd)
+        # 点击前确认焦点确实在目标窗口（最多重试 2 次）
+        for _ in range(2):
+            fg = win32_api.get_foreground_window()
+            if fg == focus_hwnd:
+                break
+            windows.bring_to_front(focus_hwnd)
     win32_api.set_cursor_pos(x, y)
     time.sleep(0.12)
     # First click
@@ -194,9 +200,34 @@ def click_and_paste_text(
 
 
 def close_window_alt_f4(hwnd: int) -> None:
+    """Alt+F4 关闭窗口，并轮询确认窗口已消失（最多 1 秒），
+    避免下一行双击点到尚未关干净的详情窗。
+    """
     windows.bring_to_front(hwnd)
     _send_alt_f4()
     time.sleep(0.4)
+    # 验证窗口已关闭：轮询最多 1 秒
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        try:
+            fg = win32_api.get_foreground_window()
+            # 如果前台仍是该窗口，说明没关掉，再发一次 Alt+F4
+            if fg == hwnd:
+                _send_alt_f4()
+                time.sleep(0.3)
+                continue
+        except Exception:
+            pass
+        # 检查窗口是否还可见
+        try:
+            if not win32_api.is_window_visible(hwnd):
+                break
+            title = win32_api.get_window_text(hwnd)
+            if not title:
+                break
+        except Exception:
+            break
+        time.sleep(0.15)
 
 
 def move_cursor_away(left: int, top: int, width: int, height: int) -> None:

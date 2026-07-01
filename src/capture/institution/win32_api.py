@@ -103,6 +103,14 @@ user32.GetWindowTextW.restype = ctypes.c_int
 user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 user32.GetWindowRect.restype = wintypes.BOOL
 
+# EnumChildWindows — enumerate child windows (for reading dialog text without UIA)
+user32.EnumChildWindows.argtypes = [wintypes.HWND, WNDENUMPROC, wintypes.LPARAM]
+user32.EnumChildWindows.restype = wintypes.BOOL
+
+# WM_GETTEXT — retrieve window text (works for Static/Label/Edit controls)
+WM_GETTEXT = 0x000D
+WM_GETTEXTLENGTH = 0x000E
+
 
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [
@@ -269,3 +277,39 @@ def get_window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
     if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
         return None
     return (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+
+
+def enum_child_windows(hwnd: int) -> list[int]:
+    """枚举指定窗口的所有子窗口句柄（纯 Win32，不依赖 UIA/COM）。"""
+    handles: list[int] = []
+
+    def _callback(child: int, _lparam: int) -> bool:
+        handles.append(child)
+        return True
+
+    user32.EnumChildWindows(hwnd, WNDENUMPROC(_callback), 0)
+    return handles
+
+
+def get_window_text_via_message(hwnd: int) -> str:
+    """通过 WM_GETTEXT 读取控件文本（对 Static/Label/Edit 有效）。
+    比 GetWindowTextW 更可靠地获取对话框内文本。
+    """
+    length = user32.SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0)
+    if length <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.SendMessageW(hwnd, WM_GETTEXT, length + 1, ctypes.addressof(buf))
+    return buf.value
+
+
+def get_child_window_texts(hwnd: int) -> list[str]:
+    """收集窗口内所有子控件的文本（用于弹窗内容检测，纯 Win32）。"""
+    texts: list[str] = []
+    for child in enum_child_windows(hwnd):
+        if not is_window_visible(child):
+            continue
+        txt = get_window_text_via_message(child)
+        if txt and txt.strip():
+            texts.append(txt.strip())
+    return texts

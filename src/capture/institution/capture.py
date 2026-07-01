@@ -132,6 +132,16 @@ def _wait_detail_content_ready(
     return last_image, last_ocr_text
 
 
+def _detect_error_popup(context: str) -> Optional[str]:
+    """检测接口异常弹窗；若发现则关闭弹窗并返回弹窗文本，否则返回 None。"""
+    popup = error_popup.find_error_popup()
+    if not popup:
+        return None
+    print(f"  [ERROR] 检测到接口异常弹窗（{context}）：{popup[:120]}")
+    error_popup.dismiss_error_popup()
+    return popup
+
+
 def capture_name_series(
     main_win: WindowInfo,
     persons: list[Person],
@@ -189,6 +199,20 @@ def capture_name_series(
 
         print(f"=== 搜索姓名：{search_name}（待抓取 {len(remaining)} 人）===")
 
+        # 搜索前先检测是否有遗留的接口异常弹窗（上一个医生详情触发后未关闭）
+        popup = _detect_error_popup(f"搜索前 name={search_name}")
+        if popup:
+            error_count += 1
+            if error_log_path:
+                last_error_time = error_popup.write_error_popup_log(
+                    error_log_path, f"search-before name={search_name}",
+                    popup, error_count, captured_since_last_popup, last_error_time,
+                )
+            captured_since_last_popup = 0
+            print("  检测到接口异常弹窗，将重启应用并恢复抓取。")
+            result.need_restart = True
+            return result
+
         # Search
         try:
             inp.click_and_paste_text(
@@ -243,17 +267,17 @@ def capture_name_series(
 
             if detail is None:
                 # Check error popup
-                popup = error_popup.find_error_popup()
+                popup = _detect_error_popup(f"name={search_name};row={row + 1}")
                 if popup:
                     error_count += 1
-                    captured_since_last_popup_val = captured_since_last_popup
                     if error_log_path:
                         last_error_time = error_popup.write_error_popup_log(
                             error_log_path,
-                            f"name={search_name};row={row + 1}",
+                            f"no-detail name={search_name};row={row + 1}",
                             popup, error_count,
-                            captured_since_last_popup_val, last_error_time,
+                            captured_since_last_popup, last_error_time,
                         )
+                    captured_since_last_popup = 0
                     print("  检测到接口异常弹窗，将重启应用并恢复抓取。")
                     result.need_restart = True
                     return result
@@ -370,11 +394,30 @@ def capture_name_series(
                     pass
                 pause_ctrl.sleep_ms_with_pause(250)
                 windows.bring_to_front(main_hwnd)
+                # 与 PS1 一致：bring_to_front 后再等 150ms 让主窗口稳定，
+                # 避免下一行双击时主窗口还没完全获得焦点
+                pause_ctrl.sleep_ms_with_pause(150)
                 if 'img' in dir() and img is not None:
                     try:
                         img.close()
                     except Exception:
                         pass
+
+            # 关闭详情窗口后检测弹窗（详情页内触发接口异常但弹窗遗留）
+            popup = _detect_error_popup(f"关详情后 name={search_name};row={row + 1}")
+            if popup:
+                error_count += 1
+                if error_log_path:
+                    last_error_time = error_popup.write_error_popup_log(
+                        error_log_path,
+                        f"close-detail name={search_name};row={row + 1}",
+                        popup, error_count,
+                        captured_since_last_popup, last_error_time,
+                    )
+                captured_since_last_popup = 0
+                print("  检测到接口异常弹窗，将重启应用并恢复抓取。")
+                result.need_restart = True
+                return result
 
         print(f"  '{search_name}' 完成，本次截图 {result.total_saved} 张。")
 

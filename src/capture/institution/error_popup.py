@@ -14,28 +14,135 @@ import psutil
 
 from . import win32_api, windows
 
+# 接口异常 / 身份失效 / 验证码 等需要重启恢复的错误文本
 DEFAULT_ERROR_TEXT_REGEX = (
-    r"非法访问用户身份|禁止\s*Web\s*服务调用|获取详细信息时发生错误|服务调用\(1\)"
+    r"非法访问用户身份|非法的用户身份|禁止\s*Web\s*服务调用|"
+    r"获取详细信息时发生错误|服务调用\(1\)|接口错误|身份.*失效|"
+    r"登录.*失效|会话.*过期|请.*重新登录"
 )
-DEFAULT_ERROR_TITLE_REGEX = r"提示|错误|异常|警告"
+DEFAULT_ERROR_TITLE_REGEX = r"提示|错误|异常|警告|信息"
+
+# 主窗口标题关键词（用于排除主窗口，避免误判）
+MAIN_WINDOW_KEYWORDS = r"医师电子化注册|莲藕健康|版本号"
+
+VK_RETURN = 0x0D
+
+
+def _find_popup_windows_by_title(title_pat: re.Pattern) -> list[tuple[int, str, tuple]]:
+    """用纯 Win32 枚举所有可见顶层窗口，返回标题匹配错误弹窗模式的窗口列表。
+    返回 [(hwnd, title, (left, top, width, height)), ...]
+    排除主窗口（标题含「医师电子化注册」「莲藕健康」等）。
+
+    严格过滤避免误判：
+    - 标题长度 ≤ 10 字符（弹窗标题如「提示」「错误」都很短，
+      避免匹配到「医生医疗机构信息.note - Google Chrome」等长标题）
+    - 窗口尺寸宽 ≥ 150、高 ≥ 80（排除浏览器标签栏等极小窗口）
+    """
+    results: list[tuple[int, str, tuple]] = []
+    main_pat = re.compile(MAIN_WINDOW_KEYWORDS)
+    for hwnd in win32_api.enum_windows():
+        if not win32_api.is_window_visible(hwnd):
+            continue
+        title = win32_api.get_window_text(hwnd)
+        if not title:
+            continue
+        # 排除主窗口
+        if main_pat.search(title):
+            continue
+        # 标题必须匹配弹窗模式且足够短（弹窗标题如「提示」只有 2 字）
+        if not title_pat.search(title):
+            continue
+        if len(title) > 10:
+            continue
+        rect = win32_api.get_window_rect(hwnd)
+        if rect is None:
+            continue
+        left, top, w, h = rect
+        # 排除极小窗口（浏览器标签栏等）
+        if w < 150 or h < 80:
+            continue
+        results.append((hwnd, title, (left, top, w, h)))
+    return results
+
+
+def _ocr_popup_rect(left: int, top: int, w: int, h: int) -> str:
+    """截图指定屏幕区域并 OCR 识别文本。失败返回空字符串。
+    使用纯 PIL ImageGrab，不依赖 UIA（Web 弹窗 UIA 会崩溃）。
+    """
+    try:
+        from . import ocr as ocr_mod, screenshot as ss_mod
+        img = ss_mod.capture_screen_rect(left, top, w, h)
+        if img is None:
+            return ""
+        try:
+            text = ocr_mod.recognize_image(img)
+            return text or ""
+        finally:
+            img.close()
+    except Exception:
+        return ""
 
 
 def find_error_popup(
     text_regex: str = DEFAULT_ERROR_TEXT_REGEX,
     title_regex: str = DEFAULT_ERROR_TITLE_REGEX,
 ) -> Optional[str]:
-    """Scan top-level windows for error popup. Returns combined title|text if found."""
+    """扫描顶层窗口寻找错误弹窗。
+
+    策略（机构端是 Web 内嵌应用，WM_GETTEXT/UIA 读不到弹窗文字）：
+    1. 用 Win32 枚举可见窗口，找标题匹配「提示/错误/警告」的（排除主窗口）
+    2. 对候选窗口截图 + OCR 识别文字内容
+    3. OCR 文字命中错误关键词 → 确认是接口异常弹窗
+    4. OCR 失败/为空但标题是「提示」→ 采图阶段出现此类弹窗几乎都是异常，也判定为弹窗
+    """
     text_pat = re.compile(text_regex)
     title_pat = re.compile(title_regex)
-    for win in windows.get_root_windows():
-        if win.is_offscreen:
-            continue
-        title = win.title
-        text_summary = windows.get_element_text_summary(win.hwnd)
-        combined = f"{title} | {text_summary}"
-        if text_pat.search(combined) or (title and title_pat.search(title) and text_pat.search(text_summary)):
+
+    candidates = _find_popup_windows_by_title(title_pat)
+    if not candidates:
+        return None
+
+    for hwnd, title, (left, top, w, h) in candidates:
+        # 截图 + OCR 识别弹窗内容（纯 PIL，不依赖 UIA）
+        ocr_text = _ocr_popup_rect(left, top, w, h)
+        combined = f"{title} | {ocr_text}"
+        if text_pat.search(combined):
             return combined
+        # OCR 为空但标题是「提示/错误/异常/警告」→ 采图阶段几乎都是异常弹窗
+        if not ocr_text.strip() and title_pat.search(title):
+            print(f"  [诊断] 弹窗「{title}」({w}x{h}) OCR 无文字，按标题判定为异常弹窗。")
+            return f"{title} | (OCR无文字，按标题判定)"
+
     return None
+
+
+def dismiss_error_popup(max_rounds: int = 3) -> bool:
+    """关闭前台错误弹窗（发送 Enter 激活「确定」按钮）。
+    返回 True 表示至少关闭了一个弹窗。
+    只关闭标题短（≤10字符）且匹配弹窗模式的窗口，避免误关浏览器等。
+    """
+    dismissed = False
+    title_pat = re.compile(DEFAULT_ERROR_TITLE_REGEX)
+    main_pat = re.compile(MAIN_WINDOW_KEYWORDS)
+    for _ in range(max_rounds):
+        hwnd = win32_api.get_foreground_window()
+        if hwnd == 0:
+            break
+        title = win32_api.get_window_text(hwnd)
+        if not title:
+            break
+        # 主窗口不关
+        if main_pat.search(title):
+            break
+        # 标题必须匹配弹窗模式且足够短
+        if not title_pat.search(title) or len(title) > 10:
+            break
+        print(f"[INFO] 检测到弹窗「{title}」，发送 Enter 关闭。")
+        win32_api.send_key(VK_RETURN, key_up=False)
+        win32_api.send_key(VK_RETURN, key_up=True)
+        time.sleep(0.3)
+        dismissed = True
+    return dismissed
 
 
 def write_error_popup_log(

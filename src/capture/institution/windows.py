@@ -124,6 +124,40 @@ def wait_window_by_title(title_regex: str, timeout_s: int) -> Optional[WindowInf
     return None
 
 
+def _wait_detail_window_win32(
+    before_handles: set[int],
+    main_hwnd: int,
+    pattern: re.Pattern,
+    timeout_s: int,
+) -> Optional[WindowInfo]:
+    """纯 Win32 回退：枚举窗口找标题匹配的详情窗口。
+    收紧为仅标题匹配（不再用「任意新窗口」），避免误匹配无关窗口。
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        for hwnd in win32_api.enum_windows():
+            if hwnd == 0 or hwnd == main_hwnd:
+                continue
+            if not win32_api.is_window_visible(hwnd):
+                continue
+            rect = win32_api.get_window_rect(hwnd)
+            if rect is None:
+                continue
+            _, _, w, h = rect
+            if w < 400 or h < 250:
+                continue
+            title = win32_api.get_window_text(hwnd)
+            # 必须标题匹配详情窗口正则（收紧，避免误匹配）
+            if title and pattern.search(title):
+                left, top, width, height = rect
+                return WindowInfo(
+                    hwnd=hwnd, title=title,
+                    left=left, top=top, width=width, height=height,
+                )
+        time.sleep(0.2)
+    return None
+
+
 def wait_detail_window(
     before_handles: set[int],
     main_hwnd: int,
@@ -133,27 +167,37 @@ def wait_detail_window(
     pattern = re.compile(title_regex)
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        for win in get_root_windows():
-            if win.hwnd == 0 or win.hwnd == main_hwnd:
-                continue
-            if win.is_offscreen:
-                continue
-            if win.width < 400 or win.height < 250:
-                continue
-            title_match = bool(pattern.search(win.title))
-            is_new = win.hwnd not in before_handles
-            if title_match or is_new:
-                return win
+        try:
+            for win in get_root_windows():
+                if win.hwnd == 0 or win.hwnd == main_hwnd:
+                    continue
+                if win.is_offscreen:
+                    continue
+                if win.width < 400 or win.height < 250:
+                    continue
+                # 收紧：必须标题匹配详情窗口正则（不再用「任意新窗口」误匹配）
+                if win.title and pattern.search(win.title):
+                    return win
+        except Exception:
+            pass
         time.sleep(0.2)
-    return None
+    # UIA 超时/崩溃 → 纯 Win32 回退再扫一轮
+    return _wait_detail_window_win32(before_handles, main_hwnd, pattern, 2)
 
 
 def bring_to_front(hwnd: int) -> None:
-    """与 PS1 Bring-ToFront 一致：仅最小化时 restore，然后 SetForegroundWindow。"""
+    """与 PS1 Bring-ToFront 一致：SW_RESTORE → TOPMOST 舞步 → SetForeground。
+    TOPMOST/NOTOPMOST 舞步用于强制抢回焦点（绕过 Windows 后台进程焦点限制），
+    否则 SetForegroundWindow 在 Cursor/Chrome 在前台时会静默失败 → 点击落到错误窗口。
+    """
     if win32_api.is_iconic(hwnd):
         win32_api.show_window(hwnd, win32_api.SW_RESTORE)
+    # TOPMOST 舞步强制抢焦点
+    win32_api.set_window_pos(hwnd, win32_api.HWND_TOPMOST, flags=win32_api.SWP_NOMOVE | win32_api.SWP_NOSIZE)
+    time.sleep(0.08)
+    win32_api.set_window_pos(hwnd, win32_api.HWND_NOTOPMOST, flags=win32_api.SWP_NOMOVE | win32_api.SWP_NOSIZE)
     win32_api.set_foreground_window(hwnd)
-    time.sleep(0.2)
+    time.sleep(0.25)
 
 
 def maximize_window(hwnd: int) -> None:
@@ -174,7 +218,18 @@ def ensure_main_window_maximized(title_regex: str) -> None:
 
 
 def get_window_handles() -> set[int]:
-    return {win.hwnd for win in get_root_windows() if win.hwnd != 0}
+    handles: set[int] = set()
+    try:
+        handles = {win.hwnd for win in get_root_windows() if win.hwnd != 0}
+    except Exception:
+        handles = set()
+    if not handles:
+        # UIA 崩溃回退
+        handles = {
+            hwnd for hwnd in win32_api.enum_windows()
+            if hwnd != 0 and win32_api.is_window_visible(hwnd)
+        }
+    return handles
 
 
 def get_top_level_titles() -> list[str]:
