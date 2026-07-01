@@ -2031,7 +2031,19 @@ function Invoke-DetailOcr {
     }
     $script:DetailOcrWriter.WriteLine($ImagePath)
     $script:DetailOcrWriter.Flush()
-    $jsonLine = $script:DetailOcrReader.ReadLine()
+
+    # 异步读取 + 暂停轮询：OCR 耗时 10+ 秒，阻塞式 ReadLine 会导致 ESC/前台检测失效。
+    $readTask = $script:DetailOcrReader.ReadLineAsync()
+    $deadline = (Get-Date).AddSeconds(120)
+    while (-not $readTask.IsCompleted) {
+        if ((Get-Date) -ge $deadline) {
+            Write-Step '  Detail OCR 超时(120s)，放弃本次识别。'
+            return $null
+        }
+        Wait-IfPauseRequested
+        Start-Sleep -Milliseconds 150
+    }
+    $jsonLine = $readTask.Result
     if ([string]::IsNullOrWhiteSpace($jsonLine)) { return $null }
     try {
         $text = [string]($jsonLine | ConvertFrom-Json)
@@ -2289,6 +2301,7 @@ function Invoke-ScreenDoubleClick {
         [int]$Y,
         [System.Windows.Automation.AutomationElement]$FocusWindow = $null
     )
+    Wait-IfPauseRequested
     if ($null -ne $FocusWindow) { Bring-ToFront $FocusWindow }
     [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point($X, $Y)
     Start-Sleep -Milliseconds 120
@@ -2496,6 +2509,7 @@ function Invoke-NameSearchInput {
         $Calibration,
         [string]$Name
     )
+    Wait-IfPauseRequested
     Bring-ToFront $MainWindow
     Invoke-ScreenClick -X ([int]$Calibration.SearchBoxX) -Y ([int]$Calibration.SearchBoxY) -FocusWindow $MainWindow
     Start-Sleep -Milliseconds 150
@@ -4122,9 +4136,18 @@ function Invoke-CaptchaOcr {
             $script:CaptchaOcrWriter.WriteLine($ImagePath)
             $script:CaptchaOcrWriter.Flush()
 
-            # 带超时的 ReadLine，避免 python 子进程无响应时永久阻塞
+            # 带超时的异步读取 + 暂停轮询，避免阻塞期间 ESC/前台检测失效
             $readTask = $script:CaptchaOcrReader.ReadLineAsync()
-            if ($readTask.Wait([int]($TimeoutSeconds * 1000))) {
+            $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+            while (-not $readTask.IsCompleted) {
+                if ((Get-Date) -ge $deadline) {
+                    $readTask = $null
+                    break
+                }
+                Wait-IfPauseRequested
+                Start-Sleep -Milliseconds 100
+            }
+            if ($null -ne $readTask -and $readTask.IsCompleted) {
                 $line = $readTask.Result
                 if ($null -ne $line -and -not [string]::IsNullOrWhiteSpace($line)) {
                     return $line.Trim()
