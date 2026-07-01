@@ -123,6 +123,7 @@ using System.Runtime.InteropServices;
 public static class NativeWin32 {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
@@ -491,6 +492,16 @@ function Maximize-Window {
     [NativeWin32]::ShowWindow($handle, 3) | Out-Null
     [NativeWin32]::SetForegroundWindow($handle) | Out-Null
     Start-Sleep -Milliseconds 500
+}
+
+function Ensure-MainWindowMaximized {
+    $main = Find-MainApplicationWindow $MainWindowTitleRegex
+    if ($null -eq $main) { return }
+    $handle = [IntPtr]([int]$main.Current.NativeWindowHandle)
+    if ([NativeWin32]::IsZoomed($handle)) { return }
+    Write-Step '机构端主窗口未最大化，先最大化再继续。'
+    Maximize-Window $main
+    Bring-ToFront $main
 }
 
 function Element-IsVisible {
@@ -2700,15 +2711,30 @@ function Test-EscapeKeyPressed {
     }
 }
 
+$script:EscapeWasDown = $false
+function Test-EscapeEdge {
+    <#
+        ESC 边沿检测：仅在「按下→按住」转换瞬间返回一次 $true，
+        避免按住 ESC 期间重复触发暂停/恢复切换。
+    #>
+    try {
+        $down = (([NativeWin32]::GetAsyncKeyState([NativeWin32]::VK_ESCAPE) -band 0x8000) -ne 0)
+    }
+    catch { return $false }
+    if ($down -and -not $script:EscapeWasDown) {
+        $script:EscapeWasDown = $true
+        return $true
+    }
+    if (-not $down) { $script:EscapeWasDown = $false }
+    return $false
+}
+
 function Assert-NoEmergencyStop {
     <#
-        紧急停止闸门：在每次暂停轮询点检测 ESC，按下立即 throw 终止整个脚本。
-        throw 在主流程 switch 块无外层 catch，会直接退出进程。
+        兼容占位：ESC 现已改为「暂停/恢复切换」键（见 Wait-IfPauseRequested），
+        不再触发紧急终止。保留函数以兼容历史调用点。
+        如需强制终止脚本，请在控制台按 Ctrl+C。
     #>
-    if (Test-EscapeKeyPressed) {
-        Write-Step '【紧急停止】检测到 ESC 按键，立即终止脚本。'
-        throw '用户按下 ESC 触发紧急停止。'
-    }
 }
 
 function Assert-SafeToDeletePath {
@@ -2912,31 +2938,43 @@ function Ensure-DoctorAppForeground {
 function Update-ForegroundPauseState {
     if (-not $script:PauseWhenAppNotForeground) { return }
 
-    if (Test-DoctorAppInForeground) {
-        if ($script:IsForegroundPaused) {
-            $script:IsForegroundPaused = $false
-            $script:ForegroundPauseAnnounced = $false
-            Write-Step '机构端已回到前台，自动恢复运行。'
+    if (-not (Test-DoctorAppInForeground)) {
+        if (-not $script:IsForegroundPaused) {
+            $script:IsForegroundPaused = $true
+            if (-not $script:ForegroundPauseAnnounced) {
+                Write-Step '机构端不在前台，已自动暂停（切回机构端窗口前台后按 ESC 继续）。'
+                $script:ForegroundPauseAnnounced = $true
+            }
         }
         return
-    }
-
-    if (-not $script:IsForegroundPaused) {
-        $script:IsForegroundPaused = $true
-        if (-not $script:ForegroundPauseAnnounced) {
-            Write-Step '机构端不在前台，已自动暂停（切回机构端窗口后将自动继续）。'
-            $script:ForegroundPauseAnnounced = $true
-        }
     }
 }
 
 function Wait-IfPauseRequested {
-    Assert-NoEmergencyStop
     try {
-        if (Test-PauseToggleRequested) {
-            $script:IsCapturePaused = -not $script:IsCapturePaused
-            if (-not $script:IsCapturePaused) {
-                $script:ForegroundPauseAnnounced = $false
+        $toggle = (Test-EscapeEdge) -or (Test-PauseToggleRequested)
+        if ($toggle) {
+            if (Test-DoctorAppInForeground) {
+                if ($script:IsCapturePaused -or $script:IsForegroundPaused) {
+                    Ensure-MainWindowMaximized
+                    $script:IsCapturePaused = $false
+                    $script:IsForegroundPaused = $false
+                    $script:ForegroundPauseAnnounced = $false
+                    Write-Step '已恢复运行。'
+                }
+                else {
+                    $script:IsCapturePaused = $true
+                    Write-Step '已暂停（在机构端窗口前台再按 ESC 恢复）。'
+                }
+            }
+            else {
+                if (-not ($script:IsCapturePaused -or $script:IsForegroundPaused)) {
+                    $script:IsCapturePaused = $true
+                    Write-Step '已暂停（切回机构端窗口前台后按 ESC 恢复）。'
+                }
+                else {
+                    Write-Step '机构端不在前台，请先切回机构端窗口，再按 ESC 恢复。'
+                }
             }
         }
 
@@ -2945,23 +2983,25 @@ function Wait-IfPauseRequested {
         if (-not $script:IsCapturePaused -and -not $script:IsForegroundPaused) { return }
 
         if ($script:IsCapturePaused -and -not $script:IsForegroundPaused) {
-            Write-Step '已暂停（按【Ctrl+空格】继续，无需切换回控制台）...'
+            Write-Step '已暂停（在机构端窗口前台再按 ESC 恢复）...'
         }
 
-        $wasManualPause = [bool]$script:IsCapturePaused
         while ($script:IsCapturePaused -or $script:IsForegroundPaused) {
             Start-Sleep -Milliseconds 150
-            if (Test-PauseToggleRequested) {
-                $script:IsCapturePaused = -not $script:IsCapturePaused
-                if (-not $script:IsCapturePaused) {
+            $toggle = (Test-EscapeEdge) -or (Test-PauseToggleRequested)
+            if ($toggle) {
+                if (Test-DoctorAppInForeground) {
+                    Ensure-MainWindowMaximized
+                    $script:IsCapturePaused = $false
+                    $script:IsForegroundPaused = $false
                     $script:ForegroundPauseAnnounced = $false
+                    Write-Step '已恢复运行。'
+                }
+                else {
+                    Write-Step '机构端不在前台，请先切回机构端窗口，再按 ESC 恢复。'
                 }
             }
             Update-ForegroundPauseState
-        }
-
-        if ($wasManualPause -and -not $script:IsCapturePaused) {
-            Write-Step '已恢复运行。'
         }
     }
     catch {
@@ -3004,13 +3044,13 @@ function Initialize-PauseHotkey {
     [CapturePauseSignal]::ConsumeToggleRequest() | Out-Null
     if (-not $DeferGlobalHotkey) {
         Start-GlobalPauseHotkey | Out-Null
-        Write-Step '提示：运行中随时按【Ctrl+空格】暂停/恢复（全局热键，控制台被遮挡也有效）。'
+        Write-Step '提示：运行中随时按【ESC】暂停/恢复（也可用 Ctrl+空格，全局热键，控制台被遮挡也有效）。'
     }
     else {
-        Write-Step '提示：运行中随时按【Ctrl+空格】暂停/恢复（按键轮询，焦点在医师系统时最稳）。'
+        Write-Step '提示：运行中随时按【ESC】暂停/恢复（也可用 Ctrl+空格，按键轮询，焦点在医师系统时最稳）。'
     }
     if ($script:PauseWhenAppNotForeground) {
-        Write-Step '提示：机构端窗口不在前台时将自动暂停，切回机构端后自动继续。'
+        Write-Step '提示：机构端窗口不在前台时将自动暂停；切回机构端窗口前台后，需再按【ESC】才会继续。'
     }
 }
 
