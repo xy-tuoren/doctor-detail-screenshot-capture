@@ -21,6 +21,9 @@ python -m venv .venv
 # 安装核心依赖
 pip install -e .
 
+# 机构端详情采图额外依赖（仅 capture-institution 需要）
+pip install -e ".[capture-institution]"
+
 # 卫健委采图额外依赖（仅 capture-nhc 需要）
 pip install -e ".[capture-nhc]"
 playwright install chromium
@@ -99,10 +102,11 @@ doctor-detail-screenshot-capture/
 │ ├── minke_reg/ # 机构端 SOAP 导出
 │ ├── institution_export/# 导出文件解析与索引
 │ ├── reconcile/ # 核对、to_submit 生成、写回载荷
-│ ├── capture/ # 采图编排（机构端 PS1 / 卫健委 Playwright）
+│ ├── capture/ # 采图编排（机构端 Python / 卫健委 Playwright）
+│ │ └── institution/ # 机构端详情采图（Python 重写，10 模块）
 │ └── lianou/ # UpdateDoctorMedical 写回
 ├── automation/
-│ ├── ps1/ # 机构端 UI 自动化（capture-doctor-details.ps1）
+│ ├── ps1/ # 机构端 UI 自动化（calibrate/export 用 PS1）
 │ └── py/ # OCR 校验等
 ├── cmd/ # 薄封装 .cmd（automation / reg-api / api）
 ├── exports/ # 机构端导出输入
@@ -179,25 +183,46 @@ flowchart LR
 
 ## 机构端 UI 自动化
 
-底层脚本：`automation/ps1/capture-doctor-details.ps1`。可通过 CLI 或 `cmd/` 调用。
+**详情采图已用 Python 重写**（`src/capture/institution/`），解决 ESC 暂停失效、前台检测失效、孤儿进程三个根本问题；OCR 直接调用 `rapidocr_onnxruntime`，暂停控制全用 `ctypes` 不依赖控制台。
+
+**校准 / 导出 / 验证仍用 PS1**：`automation/ps1/capture-doctor-details.ps1` 的 `CalibrateAll` / `Export` / `ExportCalibrate` / `verify-captures` 等模式仍由 `run-automation` 调用（Python 采图依赖 `calibrate` 生成的 `loginCalibration` / `listCalibration` 坐标）。
 
 ```powershell
-# 校准登录与列表坐标（首次必做）
+# 校准登录与列表坐标（首次必做，PS1）
 python -m src.cli run-automation calibrate
 # 或：cmd\automation\calibrate.cmd
 
-# UI 手动导出名单到 exports/ui/
+# UI 手动导出名单到 exports/ui/（PS1）
 python -m src.cli run-automation export --entry Main
 python -m src.cli run-automation export --entry Multi
 
-# 机构端详情采图（也可由 capture-institution 根据 to_submit 自动驱动）
+# 机构端详情采图（Python，也可由 capture-institution 根据 to_submit 自动驱动）
 python -m src.cli run-automation capture --entry Main
 
-# OCR 校验已有截图
+# OCR 校验已有截图（PS1）
 python -m src.cli run-automation verify-captures
 ```
 
-`capture-institution` 会读取 `to_submit.json` 中的 `_capture` 元数据，生成临时配置并调用上述 PS1 脚本。
+`capture-institution` 读取 `to_submit.json` 中的 `_capture` 元数据，按主/多执业分组后直接调用 `src.capture.institution.runner.run_capture_session`（不再生成临时配置、不再起 PS1 子进程）。
+
+**Python 采图模块**（`src/capture/institution/`）：
+
+| 模块 | 职责 |
+|------|------|
+| `win32_api.py` | ctypes 封装 Win32 API（鼠标/键盘/前台/最大化/IME） |
+| `windows.py` | uiautomation 窗口查找 + win32 前台/最大化 |
+| `input.py` | 点击/双击/粘贴/IME/SendInput 键盘/Alt+F4 |
+| `screenshot.py` | PIL 截图 + SHA256 哈希 + 稳定检测 |
+| `ocr.py` | RapidOCR 直接调用 + 证书号提取正则 |
+| `pause.py` | PauseController（ESC 边沿 + 前台检测，全 ctypes） |
+| `error_popup.py` | 接口异常弹窗检测 + 自动重启 |
+| `login.py` | 登录流程 + 进列表导航 |
+| `capture.py` | 核心采图循环（搜索→双击→截图→OCR→保存） |
+| `runner.py` | 编排器 `run_capture_session` |
+
+**暂停/恢复**：运行中按 `ESC` 暂停/恢复（边沿触发，避免长按重复切换）；机构端窗口失去前台时自动暂停，切回前台后需再按 `ESC` 才继续。
+
+**依赖**：`pip install -e ".[capture-institution]"` 或 `pip install -r requirements/capture-institution.txt`。
 
 ---
 

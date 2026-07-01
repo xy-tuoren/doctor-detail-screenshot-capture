@@ -7,8 +7,7 @@ from typing import Any
 
 from src.api.config import project_root
 from src.capture.paths import default_nhc_captures_dir
-from src.cli.automation import PS1, run_task, AutomationTask
-from src.pipeline.paths import capture_config_json, nhc_failures_log
+from src.pipeline.paths import nhc_failures_log
 
 
 def institution_list_folder(list_entry: str) -> str:
@@ -106,14 +105,25 @@ def run_institution_capture(
     for list_entry, persons in grouped.items():
         if not persons:
             continue
-        temp_config = capture_config_json(workspace, list_entry)
-        build_capture_config(config_path, persons, list_entry, temp_config)
-        task = AutomationTask(ps1_mode="LoginAndSearchNames", list_entry=list_entry)
-        extra = ["-ConfigPath", str(temp_config)]
-        if dry_run:
-            print(f"would capture {len(persons)} {list_entry} doctors via {PS1}")
-            continue
-        code = run_task(task, extra)
+        # Load base config.json and inject the target persons list
+        with config_path.open(encoding="utf-8-sig") as f:
+            config = json.load(f)
+        # Inject persons into config so the capture session has the target list
+        key = "namesMulti" if list_entry == "Multi" else "namesMain"
+        config[key] = persons
+
+        output_dir = captures / institution_list_folder(list_entry)
+        error_log = root / "logs" / "error-popup-log.csv"
+
+        from src.capture.institution.runner import run_capture_session
+        code = run_capture_session(
+            persons=persons,
+            list_entry=list_entry,
+            config=config,
+            output_dir=output_dir,
+            dry_run=dry_run,
+            error_log_path=error_log,
+        )
         if code != 0:
             exit_code = code
     return exit_code

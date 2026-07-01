@@ -166,9 +166,45 @@ def cmd_export_reg_multi(args: argparse.Namespace) -> int:
 
 
 
+def _run_capture_via_python(args: argparse.Namespace) -> int:
+    """Route `run-automation capture` to the Python implementation (replaces PS1)."""
+    import json
+
+    from src.capture.institution.runner import run_capture_session
+
+    root = project_root()
+    config_path = getattr(args, "config", None) or (root / "config.json")
+    with config_path.open(encoding="utf-8-sig") as f:
+        config = json.load(f)
+
+    list_entry = args.entry
+    key = "namesMulti" if list_entry == "Multi" else "namesMain"
+    persons = config.get(key) or []
+    if not persons:
+        print(f"[ERROR] config.json 中 {key} 为空，无可抓取名单。", file=sys.stderr)
+        return 1
+
+    output_dir = root / "captures" / ("多执业" if list_entry == "Multi" else "主执业")
+    error_log = root / "logs" / "error-popup-log.csv"
+
+    return run_capture_session(
+        persons=persons,
+        list_entry=list_entry,
+        config=config,
+        output_dir=output_dir,
+        dry_run=getattr(args, "dry_run", False),
+        error_log_path=error_log,
+    )
+
+
+
 def cmd_run_automation(args: argparse.Namespace) -> int:
 
     key = (args.task, args.entry)
+
+    # `capture` 任务改用 Python 实现，不再调用 PS1 LoginAndSearchNames
+    if args.task == "capture" and args.entry in ("Main", "Multi"):
+        return _run_capture_via_python(args)
 
     task = AUTOMATION_TASKS.get(key)
 
