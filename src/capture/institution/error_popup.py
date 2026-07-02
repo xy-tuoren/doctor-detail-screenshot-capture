@@ -16,11 +16,14 @@ from . import win32_api, windows
 
 # 接口异常 / 身份失效 / 验证码 等需要重启恢复的错误文本
 DEFAULT_ERROR_TEXT_REGEX = (
-    r"非法访问用户身份|非法的用户身份|禁止\s*Web\s*服务调用|"
-    r"获取详细信息时发生错误|服务调用\(1\)|接口错误|身份.*失效|"
-    r"登录.*失效|会话.*过期|请.*重新登录"
+    r"非法访问用户身份|非法的用户身份|生法的用户身份|禁止\s*Web\s*服务调用|"
+    r"获取详细信息时发生错误|欧取.*信息时发生|服务调用\(1\)|"
+    r"接口错误|统口错误|错.*号[:：]?\s*\d{6,}|"
+    r"身份.*失效|登录.*失效|会话.*过期|请.*重新登录"
 )
 DEFAULT_ERROR_TITLE_REGEX = r"提示|错误|异常|警告|信息"
+# 采图阶段：这些短标题几乎一定是接口异常弹窗（无需 OCR 命中关键词）
+_ERROR_TITLE_EXACT = re.compile(r"^(提示|错误|异常|警告|信息)$")
 
 # 主窗口标题关键词（用于排除主窗口，避免误判）
 MAIN_WINDOW_KEYWORDS = r"医师电子化注册|莲藕健康|版本号"
@@ -83,35 +86,79 @@ def _ocr_popup_rect(left: int, top: int, w: int, h: int) -> str:
         return ""
 
 
+def _scan_main_window_for_error(main_hwnd: int, text_pat: re.Pattern) -> Optional[str]:
+    """主窗口内嵌弹窗（无独立 hwnd）时，OCR 主窗口中央区域。"""
+    if main_hwnd == 0:
+        return None
+    rect = win32_api.get_window_rect(main_hwnd)
+    if rect is None:
+        return None
+    left, top, w, h = rect
+    if w < 200 or h < 200:
+        return None
+    # 中央偏上：列表页接口异常弹窗通常在此
+    cx0 = left + int(w * 0.18)
+    cy0 = top + int(h * 0.22)
+    cx1 = left + int(w * 0.82)
+    cy1 = top + int(h * 0.72)
+    ocr_text = _ocr_popup_rect(cx0, cy0, cx1 - cx0, cy1 - cy0)
+    if not ocr_text.strip():
+        return None
+    combined = f"main-window | {ocr_text}"
+    if text_pat.search(combined):
+        return combined
+    return None
+
+
 def find_error_popup(
     text_regex: str = DEFAULT_ERROR_TEXT_REGEX,
     title_regex: str = DEFAULT_ERROR_TITLE_REGEX,
+    *,
+    main_hwnd: int = 0,
+    deep_scan: bool = False,
 ) -> Optional[str]:
     """扫描顶层窗口寻找错误弹窗。
 
-    策略（机构端是 Web 内嵌应用，WM_GETTEXT/UIA 读不到弹窗文字）：
-    1. 用 Win32 枚举可见窗口，找标题匹配「提示/错误/警告」的（排除主窗口）
-    2. 对候选窗口截图 + OCR 识别文字内容
-    3. OCR 文字命中错误关键词 → 确认是接口异常弹窗
-    4. OCR 失败/为空但标题是「提示」→ 采图阶段出现此类弹窗几乎都是异常，也判定为弹窗
+    deep_scan=False（默认）：仅 Win32 找「提示/错误」短标题窗，命中即返回，不 OCR 主窗口。
+    deep_scan=True：额外 OCR 弹窗正文、主窗口中央、UIA 回退（用于详情失败等可疑场景）。
     """
     text_pat = re.compile(text_regex)
     title_pat = re.compile(title_regex)
+    main_pat = re.compile(MAIN_WINDOW_KEYWORDS)
 
     candidates = _find_popup_windows_by_title(title_pat)
-    if not candidates:
-        return None
-
     for hwnd, title, (left, top, w, h) in candidates:
-        # 截图 + OCR 识别弹窗内容（纯 PIL，不依赖 UIA）
+        if _ERROR_TITLE_EXACT.match(title.strip()):
+            return f"{title} | (按标题判定)"
+        if not deep_scan:
+            continue
         ocr_text = _ocr_popup_rect(left, top, w, h)
         combined = f"{title} | {ocr_text}"
         if text_pat.search(combined):
             return combined
-        # OCR 为空但标题是「提示/错误/异常/警告」→ 采图阶段几乎都是异常弹窗
-        if not ocr_text.strip() and title_pat.search(title):
-            print(f"  [诊断] 弹窗「{title}」({w}x{h}) OCR 无文字，按标题判定为异常弹窗。")
-            return f"{title} | (OCR无文字，按标题判定)"
+
+    if not deep_scan:
+        return None
+
+    embedded = _scan_main_window_for_error(main_hwnd, text_pat)
+    if embedded:
+        return embedded
+
+    try:
+        for hwnd in win32_api.enum_windows():
+            if not win32_api.is_window_visible(hwnd):
+                continue
+            title = win32_api.get_window_text(hwnd) or ""
+            if main_pat.search(title):
+                continue
+            summary = windows.get_element_text_summary(hwnd)
+            if not summary:
+                continue
+            combined = f"{title} | {summary}"
+            if text_pat.search(combined):
+                return combined
+    except Exception:
+        pass
 
     return None
 

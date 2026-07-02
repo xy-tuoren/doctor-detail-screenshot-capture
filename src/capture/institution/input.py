@@ -14,10 +14,32 @@ if TYPE_CHECKING:
     from .pause import PauseController
 
 
+def _wait_if_paused(pause_ctrl: Optional["PauseController"]) -> None:
+    """点击前的快速暂停检查：只看标志，不做前台检测/热键轮询（不会抢焦点）。
+    若已暂停则阻塞到恢复，避免暂停时仍然执行点击导致时序错乱。
+    """
+    if pause_ctrl is None:
+        return
+    if not pause_ctrl.is_pause_active():
+        return
+    # 已暂停 → 等待恢复（走完整检查点逻辑）
+    pause_ctrl.wait_if_pause_requested()
+
+
+def press_enter(pause_ctrl: Optional["PauseController"] = None) -> None:
+    """发送 Enter 键（用于搜索框提交等）。"""
+    _wait_if_paused(pause_ctrl)
+    win32_api.send_key(0x0D, key_up=False)
+    win32_api.send_key(0x0D, key_up=True)
+    time.sleep(0.15)
+
+
 def screen_click(x: int, y: int, focus_hwnd: int = 0,
                  pause_ctrl: Optional["PauseController"] = None) -> None:
+    _wait_if_paused(pause_ctrl)
     if focus_hwnd:
         windows.ensure_foreground(focus_hwnd, context="单击")
+    _wait_if_paused(pause_ctrl)  # bring_to_front 后再查一次，避免暂停时仍点击
     win32_api.set_cursor_pos(x, y)
     time.sleep(0.12)
     win32_api.mouse_event(win32_api.MOUSEEVENTF_LEFTDOWN)
@@ -26,8 +48,10 @@ def screen_click(x: int, y: int, focus_hwnd: int = 0,
 
 def screen_double_click(x: int, y: int, focus_hwnd: int = 0,
                         pause_ctrl: Optional["PauseController"] = None) -> None:
+    _wait_if_paused(pause_ctrl)
     if focus_hwnd:
         windows.ensure_foreground(focus_hwnd, context="双击")
+    _wait_if_paused(pause_ctrl)  # bring_to_front 后再查一次
     win32_api.set_cursor_pos(x, y)
     time.sleep(0.12)
     # First click

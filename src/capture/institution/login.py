@@ -404,9 +404,8 @@ def enter_list_from_home(
     *,
     post_login_wait_s: int = 8,
 ) -> windows.WindowInfo:
-    """从主页进入医生列表；若已在列表页则跳过入口点击。"""
+    """从主页点击入口进入目标医生列表（Main / Multi）。"""
     login_cfg = config.get("loginCalibration") or {}
-    list_cfg = config.get("listCalibration") or {}
 
     print("[INFO] 激活并最大化医师系统窗口。")
     windows.bring_to_front(main_win.hwnd)
@@ -420,11 +419,8 @@ def enter_list_from_home(
         timeout_s=post_login_wait_s, stable_checks=2,
     )
 
-    # 探测是否已在列表页（UIA 找到搜索框 Edit 控件）
-    if detect_list_page(main_win.hwnd, list_cfg):
-        print("[INFO] 探测到已在列表页，跳过入口点击。")
-        return main_win
-
+    # 与 PS1 Invoke-EnterListFromHome 一致：始终点击目标入口。
+    # 主/多执业列表页都有搜索框，不能用 detect_list_page 跳过，否则会留在错误列表。
     if list_entry == "Multi":
         entry_x = int(login_cfg.get("MultiInstitutionX", 0))
         entry_y = int(login_cfg.get("MultiInstitutionY", 0))

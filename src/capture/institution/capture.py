@@ -26,6 +26,51 @@ DEFAULT_RESTART_WAIT_S = 5
 DEFAULT_REST_INTERVAL = 100
 DEFAULT_REST_MINUTES = 5
 
+# 列表表头常见词（首行 OCR 命中这些且无姓名 → 视为无数据）
+_LIST_HEADER_WORDS = frozenset({
+    "姓名", "性别", "年龄", "民族", "医师类别", "医师级别", "执业范围",
+    "资格证书编码", "执业证书编码", "所在科室", "任职资格", "详细信息",
+    "医师账户状态", "是否修改", "查看", "电子证照",
+})
+
+
+def _ocr_list_first_row(name_x: int, first_row_y: int, row_height: int) -> str:
+    """OCR 列表第 1 行姓名列区域（使用校准屏幕坐标）。"""
+    pad_x = 40
+    width = max(280, row_height * 10)
+    height = max(row_height, 28)
+    left = max(0, name_x - pad_x)
+    top = first_row_y
+    img = screenshot.capture_screen_rect(left, top, width, height)
+    try:
+        return ocr.recognize_image(img)
+    finally:
+        img.close()
+
+
+def _row_text_looks_like_name(text: str) -> bool:
+    if not text or not text.strip():
+        return False
+    compact = re.sub(r"\s+", "", text)
+    if re.search(
+        r"执业证书编码|资格证书编码|详细信息|医师账户状态|医师类别|医师级别|是否修改",
+        compact,
+    ):
+        return False
+    for m in re.finditer(r"[\u4e00-\u9fa5·]{2,4}", compact):
+        if m.group() not in _LIST_HEADER_WORDS:
+            return True
+    return False
+
+
+def _is_search_result_empty(name_x: int, first_row_y: int, row_height: int) -> bool:
+    """搜索后列表第 1 行无姓名 → 判定无结果。"""
+    try:
+        text = _ocr_list_first_row(name_x, first_row_y, row_height)
+    except Exception:
+        return False
+    return not _row_text_looks_like_name(text)
+
 
 @dataclass
 class Person:
@@ -87,16 +132,16 @@ def _wait_detail_content_ready(
     hwnd: int,
     pause_ctrl: PauseController,
     timeout_s: int = DEFAULT_CONTENT_TIMEOUT_S,
-) -> tuple[Optional[object], Optional[str]]:
+) -> tuple[Optional[object], Optional[dict]]:
     """
     Wait for detail window content to finish loading.
-    Returns (PIL Image, OCR text) or (None, None) on timeout.
+    Returns (PIL Image, OCR fields dict) or (last_image, None) on timeout.
     """
     deadline = time.time() + timeout_s
     prev_hash = ""
     stable_count = 0
     last_image = None
-    last_ocr_text = None
+    last_fields: Optional[dict] = None
 
     while time.time() < deadline:
         pause_ctrl.wait_if_pause_requested()
@@ -116,30 +161,60 @@ def _wait_detail_content_ready(
         if last_image is not None:
             last_image.close()
         last_image = img
-        last_ocr_text = None
 
         if stable_count >= 1:
-            # Content seems stable — verify with OCR
-            ocr_text = ocr.recognize_image(img)
-            if not ocr.test_loading_text(ocr_text):
-                cert = ocr.get_cert_code_from_text(ocr_text)
-                if cert:
-                    return img, ocr_text
-            last_ocr_text = ocr_text
+            # 画面稳定后 OCR 一次：证书区判定加载完成，并顺带提取姓名
+            cert_text = ocr.recognize_cert_region(img)
+            if not ocr.test_loading_text(cert_text):
+                fields = ocr.recognize_detail_fields(img, cert_text=cert_text)
+                if fields.get("certCode"):
+                    return img, fields
+                last_fields = fields
 
-        pause_ctrl.sleep_with_pause(0.35)
+        pause_ctrl.sleep_with_pause(0.25)
 
-    return last_image, last_ocr_text
+    return last_image, last_fields
 
 
-def _detect_error_popup(context: str) -> Optional[str]:
+def _detect_error_popup(
+    context: str,
+    main_hwnd: int = 0,
+    *,
+    deep_scan: bool = False,
+) -> Optional[str]:
     """检测接口异常弹窗；若发现则关闭弹窗并返回弹窗文本，否则返回 None。"""
-    popup = error_popup.find_error_popup()
+    popup = error_popup.find_error_popup(main_hwnd=main_hwnd, deep_scan=deep_scan)
     if not popup:
         return None
     print(f"  [ERROR] 检测到接口异常弹窗（{context}）：{popup[:120]}")
     error_popup.dismiss_error_popup()
     return popup
+
+
+def _handle_error_popup_restart(
+    result: CaptureResult,
+    context: str,
+    main_hwnd: int,
+    *,
+    error_log_path: Optional[Path],
+    error_count: int,
+    captured_since_last_popup: int,
+    last_error_time: Optional[object],
+    deep_scan: bool = False,
+) -> tuple[bool, int, int, Optional[object]]:
+    """若检测到接口异常弹窗则标记 need_restart。返回 (triggered, error_count, captured_since, last_time)。"""
+    popup = _detect_error_popup(context, main_hwnd, deep_scan=deep_scan)
+    if not popup:
+        return False, error_count, captured_since_last_popup, last_error_time
+    error_count += 1
+    if error_log_path:
+        last_error_time = error_popup.write_error_popup_log(
+            error_log_path, context, popup, error_count,
+            captured_since_last_popup, last_error_time,
+        )
+    print("  检测到接口异常弹窗，将重启应用并恢复抓取。")
+    result.need_restart = True
+    return True, error_count, 0, last_error_time
 
 
 def capture_name_series(
@@ -192,6 +267,8 @@ def capture_name_series(
     last_error_time = None
     captured_since_last_popup = 0
     main_hwnd = main_win.hwnd
+    popup_checked_recently = False
+    last_capture_saved = False
 
     for search_name, group_persons in groups.items():
         pause_ctrl.wait_if_pause_requested()
@@ -199,26 +276,27 @@ def capture_name_series(
 
         print(f"=== 搜索姓名：{search_name}（待抓取 {len(remaining)} 人）===")
 
-        # 搜索前先检测是否有遗留的接口异常弹窗（上一个医生详情触发后未关闭）
-        popup = _detect_error_popup(f"搜索前 name={search_name}")
-        if popup:
-            error_count += 1
-            if error_log_path:
-                last_error_time = error_popup.write_error_popup_log(
-                    error_log_path, f"search-before name={search_name}",
-                    popup, error_count, captured_since_last_popup, last_error_time,
-                )
-            captured_since_last_popup = 0
-            print("  检测到接口异常弹窗，将重启应用并恢复抓取。")
-            result.need_restart = True
-            return result
+        # 搜索前检测遗留弹窗（若上一轮关详情刚查过则跳过，避免重复 OCR）
+        if not popup_checked_recently:
+            triggered, error_count, captured_since_last_popup, last_error_time = _handle_error_popup_restart(
+                result, f"搜索前 name={search_name}", main_hwnd,
+                error_log_path=error_log_path,
+                error_count=error_count,
+                captured_since_last_popup=captured_since_last_popup,
+                last_error_time=last_error_time,
+                deep_scan=False,
+            )
+            if triggered:
+                return result
+        popup_checked_recently = False
 
-        # Search
+        # Search（与 PS1 一致：粘贴后按 Enter 触发查询，再等待列表刷新）
         try:
             inp.click_and_paste_text(
                 search_x, search_y, search_name,
                 focus_hwnd=main_hwnd, pause_ctrl=pause_ctrl,
             )
+            inp.press_enter(pause_ctrl=pause_ctrl)
         except Exception as e:
             print(f"  输入姓名失败：{e}")
             continue
@@ -232,6 +310,12 @@ def capture_name_series(
                 continue
 
         pause_ctrl.sleep_with_pause(search_wait_s)
+
+        # 上一轮已成功采图时列表通常正常，跳过空列表 OCR（省 ~4s）
+        if not last_capture_saved and _is_search_result_empty(name_x, first_row_y, row_height):
+            print(f"  搜索 '{search_name}' 列表无结果，跳过该姓名。")
+            continue
+        last_capture_saved = False
 
         seen_signatures: set[str] = set()
         seen_ocr_certs: set[str] = set()
@@ -256,30 +340,40 @@ def capture_name_series(
                 before_handles, main_hwnd, DETAIL_WINDOW_REGEX, detail_wait_s,
             )
 
-            # Retry once for first row
+            # 首行未检测到详情：若已有新窗口（详情加载中），继续等，不要立刻再双击
             if detail is None and row == 0:
-                pause_ctrl.sleep_with_pause(1.0)
-                before_handles = windows.get_window_handles()
-                inp.screen_double_click(x, y, focus_hwnd=main_hwnd, pause_ctrl=pause_ctrl)
-                detail = windows.wait_detail_window(
-                    before_handles, main_hwnd, DETAIL_WINDOW_REGEX, detail_wait_s,
-                )
+                if windows.has_new_sizable_window(before_handles, main_hwnd):
+                    print("  检测到新窗口（详情加载中），延长等待，不重复双击。")
+                    detail = windows.wait_detail_window(
+                        before_handles, main_hwnd, DETAIL_WINDOW_REGEX, detail_wait_s + 4,
+                    )
+                if detail is None:
+                    pause_ctrl.sleep_with_pause(1.5)
+                    # 只有完全没有新窗口时才重试双击
+                    if not windows.has_new_sizable_window(before_handles, main_hwnd):
+                        print("  未检测到详情窗口，重试双击第 1 行。")
+                        before_handles = windows.get_window_handles()
+                        inp.screen_double_click(
+                            x, y, focus_hwnd=main_hwnd, pause_ctrl=pause_ctrl,
+                        )
+                        detail = windows.wait_detail_window(
+                            before_handles, main_hwnd, DETAIL_WINDOW_REGEX, detail_wait_s,
+                        )
+                    else:
+                        detail = windows.wait_detail_window(
+                            before_handles, main_hwnd, DETAIL_WINDOW_REGEX, detail_wait_s + 2,
+                        )
 
             if detail is None:
-                # Check error popup
-                popup = _detect_error_popup(f"name={search_name};row={row + 1}")
-                if popup:
-                    error_count += 1
-                    if error_log_path:
-                        last_error_time = error_popup.write_error_popup_log(
-                            error_log_path,
-                            f"no-detail name={search_name};row={row + 1}",
-                            popup, error_count,
-                            captured_since_last_popup, last_error_time,
-                        )
-                    captured_since_last_popup = 0
-                    print("  检测到接口异常弹窗，将重启应用并恢复抓取。")
-                    result.need_restart = True
+                triggered, error_count, captured_since_last_popup, last_error_time = _handle_error_popup_restart(
+                    result, f"name={search_name};row={row + 1}", main_hwnd,
+                    error_log_path=error_log_path,
+                    error_count=error_count,
+                    captured_since_last_popup=captured_since_last_popup,
+                    last_error_time=last_error_time,
+                    deep_scan=True,
+                )
+                if triggered:
                     return result
                 if row == 0:
                     print(f"  未出现详情窗口，'{search_name}' 可能无结果。")
@@ -292,12 +386,25 @@ def capture_name_series(
             target_person = None
 
             try:
-                # Wait for content ready
-                img, ready_ocr_text = _wait_detail_content_ready(
+                # Wait for content ready（稳定后 OCR 一次，结果复用）
+                img, ready_fields = _wait_detail_content_ready(
                     detail_hwnd, pause_ctrl, content_timeout_s,
                 )
                 if img is None:
+                    triggered, error_count, captured_since_last_popup, last_error_time = _handle_error_popup_restart(
+                        result, f"content-timeout name={search_name};row={row + 1}", main_hwnd,
+                        error_log_path=error_log_path,
+                        error_count=error_count,
+                        captured_since_last_popup=captured_since_last_popup,
+                        last_error_time=last_error_time,
+                        deep_scan=True,
+                    )
+                    if triggered:
+                        return result
                     print(f"  第 {row + 1} 行详情内容等待超时。")
+                    if row == 0:
+                        print(f"  搜索 '{search_name}' 列表无有效详情，跳过该姓名。")
+                        break
                     consecutive_failures += 1
                     if consecutive_failures >= stop_after_failures:
                         print(f"  连续 {consecutive_failures} 行失败，停止该姓名。")
@@ -311,23 +418,33 @@ def capture_name_series(
                     break
                 previous_detail_hash = detail_hash
 
-                # OCR
-                ocr_text = ready_ocr_text
-                if ocr_text is None:
-                    ocr_text = ocr.recognize_image(img)
+                fields = ready_fields or ocr.recognize_detail_fields(img)
+                ocr_cert = fields.get("certCode")
+                ocr_name = fields.get("name")
 
-                if ocr.test_loading_text(ocr_text):
-                    print(f"  第 {row + 1} 行仍处于加载中，跳过。")
+                if ocr_name and ocr_name != search_name:
+                    print(
+                        f"  第 {row + 1} 行 OCR 姓名={ocr_name} 与搜索名 {search_name} 不一致，跳过。"
+                    )
                     img.close()
-                    consecutive_failures += 1
                     continue
 
-                fields = ocr.get_detail_fields_from_text(ocr_text)
-                ocr_cert = fields.get("certCode")
-
                 if not ocr_cert:
+                    triggered, error_count, captured_since_last_popup, last_error_time = _handle_error_popup_restart(
+                        result, f"no-cert name={search_name};row={row + 1}", main_hwnd,
+                        error_log_path=error_log_path,
+                        error_count=error_count,
+                        captured_since_last_popup=captured_since_last_popup,
+                        last_error_time=last_error_time,
+                        deep_scan=True,
+                    )
+                    if triggered:
+                        return result
                     print(f"  第 {row + 1} 行未识别到执业证书编号，跳过。")
                     img.close()
+                    if row == 0:
+                        print(f"  搜索 '{search_name}' 列表无有效详情，跳过该姓名。")
+                        break
                     consecutive_failures += 1
                     if consecutive_failures >= stop_after_failures:
                         print(f"  连续 {consecutive_failures} 行失败，停止该姓名。")
@@ -374,6 +491,7 @@ def capture_name_series(
                 result.saved_files.append(file_name)
                 captured_since_last_popup += 1
                 consecutive_failures = 0
+                last_capture_saved = True
 
                 # Batch rest
                 if rest_interval > 0 and rest_minutes > 0 and result.total_saved % rest_interval == 0:
@@ -394,9 +512,7 @@ def capture_name_series(
                     pass
                 pause_ctrl.sleep_ms_with_pause(250)
                 windows.bring_to_front(main_hwnd)
-                # 与 PS1 一致：bring_to_front 后再等 150ms 让主窗口稳定，
-                # 避免下一行双击时主窗口还没完全获得焦点
-                pause_ctrl.sleep_ms_with_pause(150)
+                pause_ctrl.sleep_ms_with_pause(200)
                 if 'img' in dir() and img is not None:
                     try:
                         img.close()
@@ -404,20 +520,17 @@ def capture_name_series(
                         pass
 
             # 关闭详情窗口后检测弹窗（详情页内触发接口异常但弹窗遗留）
-            popup = _detect_error_popup(f"关详情后 name={search_name};row={row + 1}")
-            if popup:
-                error_count += 1
-                if error_log_path:
-                    last_error_time = error_popup.write_error_popup_log(
-                        error_log_path,
-                        f"close-detail name={search_name};row={row + 1}",
-                        popup, error_count,
-                        captured_since_last_popup, last_error_time,
-                    )
-                captured_since_last_popup = 0
-                print("  检测到接口异常弹窗，将重启应用并恢复抓取。")
-                result.need_restart = True
+            triggered, error_count, captured_since_last_popup, last_error_time = _handle_error_popup_restart(
+                result, f"关详情后 name={search_name};row={row + 1}", main_hwnd,
+                error_log_path=error_log_path,
+                error_count=error_count,
+                captured_since_last_popup=captured_since_last_popup,
+                last_error_time=last_error_time,
+                deep_scan=False,
+            )
+            if triggered:
                 return result
+            popup_checked_recently = True
 
         print(f"  '{search_name}' 完成，本次截图 {result.total_saved} 张。")
 

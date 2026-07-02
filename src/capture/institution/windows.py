@@ -11,6 +11,68 @@ import uiautomation as ua
 
 from . import win32_api
 
+# 短标题弹窗（非详情窗），is_new 检测时排除
+_POPUP_TITLE_PATTERN = re.compile(r"^(提示|错误|警告|异常|信息)$")
+_MIN_DETAIL_WIDTH = 400
+_MIN_DETAIL_HEIGHT = 250
+
+
+def _is_popup_title(title: str) -> bool:
+    if not title or len(title) > 10:
+        return False
+    return bool(_POPUP_TITLE_PATTERN.match(title.strip()))
+
+
+def _window_info_from_hwnd(hwnd: int, title: str, rect: tuple) -> WindowInfo:
+    left, top, w, h = rect
+    return WindowInfo(hwnd=hwnd, title=title, left=left, top=top, width=w, height=h)
+
+
+def _is_detail_candidate(
+    hwnd: int,
+    main_hwnd: int,
+    before_handles: set[int],
+    pattern: re.Pattern,
+    title: str,
+    width: int,
+    height: int,
+) -> bool:
+    if hwnd == 0 or hwnd == main_hwnd:
+        return False
+    if width < _MIN_DETAIL_WIDTH or height < _MIN_DETAIL_HEIGHT:
+        return False
+    if _is_popup_title(title):
+        return False
+    title_match = bool(title and pattern.search(title))
+    is_new = hwnd not in before_handles and height >= 300
+    return title_match or is_new
+
+
+def has_new_sizable_window(
+    before_handles: set[int],
+    main_hwnd: int,
+    *,
+    min_width: int = _MIN_DETAIL_WIDTH,
+    min_height: int = 200,
+) -> bool:
+    """双击后是否已出现新的可见窗口（详情可能仍在加载、标题未就绪）。"""
+    for hwnd in win32_api.enum_windows():
+        if hwnd == 0 or hwnd == main_hwnd or hwnd in before_handles:
+            continue
+        if not win32_api.is_window_visible(hwnd):
+            continue
+        rect = win32_api.get_window_rect(hwnd)
+        if rect is None:
+            continue
+        _, _, w, h = rect
+        if w < min_width or h < min_height:
+            continue
+        title = win32_api.get_window_text(hwnd)
+        if _is_popup_title(title):
+            continue
+        return True
+    return False
+
 
 @dataclass
 class WindowInfo:
@@ -130,30 +192,20 @@ def _wait_detail_window_win32(
     pattern: re.Pattern,
     timeout_s: int,
 ) -> Optional[WindowInfo]:
-    """纯 Win32 回退：枚举窗口找标题匹配的详情窗口。
-    收紧为仅标题匹配（不再用「任意新窗口」），避免误匹配无关窗口。
-    """
+    """纯 Win32 回退：与 PS1 一致，标题匹配或新窗口（排除短标题弹窗）。"""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         for hwnd in win32_api.enum_windows():
-            if hwnd == 0 or hwnd == main_hwnd:
-                continue
             if not win32_api.is_window_visible(hwnd):
                 continue
             rect = win32_api.get_window_rect(hwnd)
             if rect is None:
                 continue
-            _, _, w, h = rect
-            if w < 400 or h < 250:
-                continue
+            left, top, w, h = rect
             title = win32_api.get_window_text(hwnd)
-            # 必须标题匹配详情窗口正则（收紧，避免误匹配）
-            if title and pattern.search(title):
-                left, top, width, height = rect
-                return WindowInfo(
-                    hwnd=hwnd, title=title,
-                    left=left, top=top, width=width, height=height,
-                )
+            if not _is_detail_candidate(hwnd, main_hwnd, before_handles, pattern, title, w, h):
+                continue
+            return _window_info_from_hwnd(hwnd, title, (left, top, w, h))
         time.sleep(0.2)
     return None
 
@@ -169,15 +221,11 @@ def wait_detail_window(
     while time.time() < deadline:
         try:
             for win in get_root_windows():
-                if win.hwnd == 0 or win.hwnd == main_hwnd:
+                if not _is_detail_candidate(
+                    win.hwnd, main_hwnd, before_handles, pattern, win.title, win.width, win.height,
+                ):
                     continue
-                if win.is_offscreen:
-                    continue
-                if win.width < 400 or win.height < 250:
-                    continue
-                # 收紧：必须标题匹配详情窗口正则（不再用「任意新窗口」误匹配）
-                if win.title and pattern.search(win.title):
-                    return win
+                return win
         except Exception:
             pass
         time.sleep(0.2)
@@ -198,6 +246,8 @@ def ensure_foreground(hwnd: int, *, context: str = "") -> bool:
     """Bring target to foreground; log warning if still not foreground."""
     if hwnd == 0:
         return False
+    if win32_api.get_foreground_window() == hwnd:
+        return True
     ok = bring_to_front(hwnd)
     fg = win32_api.get_foreground_window()
     if fg == hwnd:

@@ -55,6 +55,7 @@ def run_capture_session(
         doctor_app_pids=doctor_pids,
         pause_when_not_foreground=not no_fg_pause,
     )
+    pause_ctrl.start_hotkey_thread()  # 启动 Ctrl+Space 后台轮询，确保暂停即时响应
     if no_fg_pause:
         print("[INFO] 已禁用前台暂停（无人值守模式），适合后台/重定向运行。")
 
@@ -70,8 +71,8 @@ def run_capture_session(
     main_win = enter_list_from_home(main_win, list_entry, config, pause_ctrl)
 
     # Pause hints
-    print("[INFO] 提示：运行中随时按【ESC】暂停/恢复。")
-    print("[INFO] 提示：机构端窗口不在前台时将自动暂停；切回前台后，需再按【ESC】才会继续。")
+    print("[INFO] 提示：运行中随时按【Ctrl+空格】暂停/恢复。")
+    print("[INFO] 提示：机构端窗口不在前台时将自动暂停；切回前台后，需再按【Ctrl+空格】才会继续。")
 
     # Capture with recovery
     result = invoke_capture_with_recovery(
