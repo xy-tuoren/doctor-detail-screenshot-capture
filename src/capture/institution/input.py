@@ -16,10 +16,8 @@ if TYPE_CHECKING:
 
 def screen_click(x: int, y: int, focus_hwnd: int = 0,
                  pause_ctrl: Optional["PauseController"] = None) -> None:
-    if pause_ctrl is not None:
-        pause_ctrl.wait_if_pause_requested()
     if focus_hwnd:
-        windows.bring_to_front(focus_hwnd)
+        windows.ensure_foreground(focus_hwnd, context="单击")
     win32_api.set_cursor_pos(x, y)
     time.sleep(0.12)
     win32_api.mouse_event(win32_api.MOUSEEVENTF_LEFTDOWN)
@@ -28,16 +26,8 @@ def screen_click(x: int, y: int, focus_hwnd: int = 0,
 
 def screen_double_click(x: int, y: int, focus_hwnd: int = 0,
                         pause_ctrl: Optional["PauseController"] = None) -> None:
-    if pause_ctrl is not None:
-        pause_ctrl.wait_if_pause_requested()
     if focus_hwnd:
-        windows.bring_to_front(focus_hwnd)
-        # 点击前确认焦点确实在目标窗口（最多重试 2 次）
-        for _ in range(2):
-            fg = win32_api.get_foreground_window()
-            if fg == focus_hwnd:
-                break
-            windows.bring_to_front(focus_hwnd)
+        windows.ensure_foreground(focus_hwnd, context="双击")
     win32_api.set_cursor_pos(x, y)
     time.sleep(0.12)
     # First click

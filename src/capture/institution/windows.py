@@ -185,19 +185,38 @@ def wait_detail_window(
     return _wait_detail_window_win32(before_handles, main_hwnd, pattern, 2)
 
 
-def bring_to_front(hwnd: int) -> None:
-    """与 PS1 Bring-ToFront 一致：SW_RESTORE → TOPMOST 舞步 → SetForeground。
-    TOPMOST/NOTOPMOST 舞步用于强制抢回焦点（绕过 Windows 后台进程焦点限制），
-    否则 SetForegroundWindow 在 Cursor/Chrome 在前台时会静默失败 → 点击落到错误窗口。
-    """
-    if win32_api.is_iconic(hwnd):
-        win32_api.show_window(hwnd, win32_api.SW_RESTORE)
-    # TOPMOST 舞步强制抢焦点
-    win32_api.set_window_pos(hwnd, win32_api.HWND_TOPMOST, flags=win32_api.SWP_NOMOVE | win32_api.SWP_NOSIZE)
-    time.sleep(0.08)
-    win32_api.set_window_pos(hwnd, win32_api.HWND_NOTOPMOST, flags=win32_api.SWP_NOMOVE | win32_api.SWP_NOSIZE)
-    win32_api.set_foreground_window(hwnd)
-    time.sleep(0.25)
+def bring_to_front(hwnd: int) -> bool:
+    """强制将窗口置于前台。返回 True 表示前台 hwnd 已匹配目标。"""
+    if hwnd == 0:
+        return False
+    ok = win32_api.force_foreground_window(hwnd)
+    time.sleep(0.15)
+    return ok
+
+
+def ensure_foreground(hwnd: int, *, context: str = "") -> bool:
+    """Bring target to foreground; log warning if still not foreground."""
+    if hwnd == 0:
+        return False
+    ok = bring_to_front(hwnd)
+    fg = win32_api.get_foreground_window()
+    if fg == hwnd:
+        return True
+    # 再试一次
+    ok = bring_to_front(hwnd)
+    fg = win32_api.get_foreground_window()
+    if fg != hwnd:
+        fg_title = win32_api.get_window_text(fg) if fg else ""
+        target_title = win32_api.get_window_text(hwnd)
+        tag = f"（{context}）" if context else ""
+        print(
+            f"[WARN] 无法将机构端窗口置于前台{tag}。"
+            f"目标='{target_title}' hwnd={hwnd}，"
+            f"当前前台='{fg_title}' hwnd={fg}。"
+            f"请手动点击机构端窗口一次，脚本将继续尝试点击。"
+        )
+        return False
+    return True
 
 
 def maximize_window(hwnd: int) -> None:

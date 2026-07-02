@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import time
 from ctypes import wintypes
 from typing import Optional
 
@@ -110,6 +111,19 @@ user32.EnumChildWindows.restype = wintypes.BOOL
 # WM_GETTEXT — retrieve window text (works for Static/Label/Edit controls)
 WM_GETTEXT = 0x000D
 WM_GETTEXTLENGTH = 0x000E
+
+# AttachThreadInput — for reliable SetForegroundWindow from background process
+user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+user32.AttachThreadInput.restype = wintypes.BOOL
+
+kernel32.GetCurrentThreadId.argtypes = []
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+# SwitchToThisWindow — undocumented but widely used for forcing foreground
+user32.SwitchToThisWindow.argtypes = [wintypes.HWND, wintypes.BOOL]
+user32.SwitchToThisWindow.restype = None
+
+SWP_SHOWWINDOW = 0x0040
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -313,3 +327,83 @@ def get_child_window_texts(hwnd: int) -> list[str]:
         if txt and txt.strip():
             texts.append(txt.strip())
     return texts
+
+
+def attach_thread_input(tid_attach: int, tid_attach_to: int, attach: bool) -> bool:
+    """AttachThreadInput — 共享输入队列，用于绕过 Windows 前台焦点限制。"""
+    return bool(user32.AttachThreadInput(tid_attach, tid_attach_to, attach))
+
+
+def get_current_thread_id() -> int:
+    return kernel32.GetCurrentThreadId()
+
+
+def switch_to_this_window(hwnd: int) -> None:
+    """Undocumented API — often succeeds when SetForegroundWindow is blocked."""
+    if hwnd:
+        user32.SwitchToThisWindow(hwnd, True)
+
+
+def force_foreground_window(hwnd: int, *, max_attempts: int = 6) -> bool:
+    """Force a window to the foreground from a background Python process.
+
+    Combines PS1 TOPMOST dance, Alt-key trick, dual AttachThreadInput, and
+    SwitchToThisWindow. Returns True if foreground hwnd matches target.
+    """
+    if hwnd == 0:
+        return False
+
+    swp_flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+    target_tid, _ = get_window_thread_process_id(hwnd)
+    cur_tid = get_current_thread_id()
+
+    for _ in range(max_attempts):
+        show_window(hwnd, SW_RESTORE)
+        set_window_pos(hwnd, HWND_TOPMOST, flags=swp_flags)
+        time.sleep(0.05)
+        set_window_pos(hwnd, HWND_NOTOPMOST, flags=swp_flags)
+
+        # Alt trick — grants SetForegroundWindow permission in many cases
+        send_key(VK_MENU, key_up=False)
+        send_key(VK_MENU, key_up=True)
+
+        fg_hwnd = get_foreground_window()
+        fg_tid = 0
+        if fg_hwnd:
+            fg_tid, _ = get_window_thread_process_id(fg_hwnd)
+
+        attached_fg = False
+        attached_target = False
+        try:
+            if fg_tid and fg_tid != cur_tid:
+                attach_thread_input(cur_tid, fg_tid, True)
+                attached_fg = True
+            if target_tid and target_tid != cur_tid:
+                attach_thread_input(cur_tid, target_tid, True)
+                attached_target = True
+            set_foreground_window(hwnd)
+            switch_to_this_window(hwnd)
+        finally:
+            if attached_target:
+                attach_thread_input(cur_tid, target_tid, False)
+            if attached_fg:
+                attach_thread_input(cur_tid, fg_tid, False)
+
+        time.sleep(0.12)
+        if get_foreground_window() == hwnd:
+            return True
+
+        # 最后手段：点击窗口标题栏区域（模拟用户操作，Windows 通常允许激活）
+        rect = get_window_rect(hwnd)
+        if rect is not None:
+            left, top, w, _h = rect
+            if w > 50:
+                set_cursor_pos(left + w // 2, top + 12)
+                time.sleep(0.05)
+                mouse_event(MOUSEEVENTF_LEFTDOWN)
+                mouse_event(MOUSEEVENTF_LEFTUP)
+                time.sleep(0.12)
+                if get_foreground_window() == hwnd:
+                    return True
+
+    return get_foreground_window() == hwnd

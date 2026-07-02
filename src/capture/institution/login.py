@@ -258,7 +258,8 @@ def _do_login_clicks(
     # 先清除可能遗留的弹窗（上次登录失败的「请您输入密码」等）
     _dismiss_blocking_popups(pause_ctrl)
 
-    windows.bring_to_front(login_win.hwnd)
+    print(f"[INFO] 将机构端登录窗口置于前台（hwnd={login_win.hwnd}）。")
+    windows.ensure_foreground(login_win.hwnd, context="登录")
 
     if switch_login_method:
         print("[INFO] 点击\"切换登录方式\"（新启动应用，从扫码模式切到账号密码模式）。")

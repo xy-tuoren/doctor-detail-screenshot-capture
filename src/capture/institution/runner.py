@@ -43,7 +43,20 @@ def run_capture_session(
     # Get app PIDs for foreground detection (title matching is primary, PIDs are bonus)
     app_path = config.get("appPath", "")
     doctor_pids = get_doctor_app_pids(app_path)
-    pause_ctrl = PauseController(doctor_app_pids=doctor_pids)
+    # 无人值守运行时禁用前台暂停：
+    # 1) 环境变量 CAPTURE_NO_FOREGROUND_PAUSE=1 显式指定
+    # 2) stdout 被重定向（非 tty）→ 自动判定为无人值守
+    import os, sys
+    no_fg_pause = (
+        os.environ.get("CAPTURE_NO_FOREGROUND_PAUSE", "").strip() in ("1", "true", "yes")
+        or not sys.stdout.isatty()
+    )
+    pause_ctrl = PauseController(
+        doctor_app_pids=doctor_pids,
+        pause_when_not_foreground=not no_fg_pause,
+    )
+    if no_fg_pause:
+        print("[INFO] 已禁用前台暂停（无人值守模式），适合后台/重定向运行。")
 
     # Initialize OCR engine (pre-load model)
     print("[INFO] 初始化 OCR 引擎...")

@@ -13,7 +13,11 @@ from typing import Optional, Set
 from . import win32_api
 
 # 机构端窗口标题特征：登录窗口 / 主窗口都含此关键字
-DOCTOR_APP_TITLE_REGEX = r"医师电子化注册信息系统|医师电子化注册"
+DOCTOR_APP_TITLE_REGEX = (
+    r"医师电子化注册信息系统|医师电子化注册|"
+    r"用户登录|"  # 登录窗口也属于机构端
+    r"信息展示|执业信息|详细信息"  # 详情窗口也属于机构端
+)
 
 
 class PauseController:
