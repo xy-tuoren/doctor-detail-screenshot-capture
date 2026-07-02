@@ -197,6 +197,26 @@ def _run_capture_via_python(args: argparse.Namespace) -> int:
     )
 
 
+def _run_calibrate_via_python(args: argparse.Namespace) -> int:
+    """Route `run-automation calibrate` to the Python implementation (replaces PS1 CalibrateAll)."""
+    if getattr(args, "dry_run", False):
+        print("would run: python -m src.capture.institution.calibrate.calibrate_all")
+        return 0
+    from src.capture.institution import calibrate as calib_mod
+
+    root = project_root()
+    config_path = getattr(args, "config", None) or (root / "config.json")
+    if not Path(config_path).exists():
+        print(f"[ERROR] config.json 不存在：{config_path}", file=sys.stderr)
+        return 1
+    try:
+        calib_mod.calibrate_all(Path(config_path))
+    except RuntimeError as e:
+        print(f"[INFO] {e}")
+        return 130
+    return 0
+
+
 
 def cmd_run_automation(args: argparse.Namespace) -> int:
 
@@ -205,6 +225,10 @@ def cmd_run_automation(args: argparse.Namespace) -> int:
     # `capture` 任务改用 Python 实现，不再调用 PS1 LoginAndSearchNames
     if args.task == "capture" and args.entry in ("Main", "Multi"):
         return _run_capture_via_python(args)
+
+    # `calibrate` 任务改用 Python 实现，不再调用 PS1 CalibrateAll
+    if args.task == "calibrate":
+        return _run_calibrate_via_python(args)
 
     task = AUTOMATION_TASKS.get(key)
 

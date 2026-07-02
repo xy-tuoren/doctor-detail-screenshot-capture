@@ -171,6 +171,22 @@ user32.VkKeyScanW.restype = ctypes.c_short
 KEYEVENTF_UNICODE = 0x0004
 
 
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+user32.GetCursorPos.argtypes = [ctypes.POINTER(_POINT)]
+user32.GetCursorPos.restype = wintypes.BOOL
+
+
+def get_cursor_pos() -> tuple[int, int]:
+    """返回当前鼠标物理像素坐标（与 SetCursorPos / mouse_event 同坐标系）。"""
+    pt = _POINT()
+    if not user32.GetCursorPos(ctypes.byref(pt)):
+        return (0, 0)
+    return (int(pt.x), int(pt.y))
+
+
 def set_cursor_pos(x: int, y: int) -> bool:
     return bool(user32.SetCursorPos(x, y))
 

@@ -516,6 +516,146 @@ def cmd_fill_images(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_fetch_practice_table(args: argparse.Namespace) -> int:
+    """获取医生执业医院明细表（独立流程，不属于核对/采图/写回主线）。"""
+    try:
+        from src.minke_reg.practice_table import (
+            all_doctor_names,
+            default_workers,
+            fetch_practice_table,
+            fetch_practice_table_parallel,
+            top_doctor_names,
+            _load_reg_cfg,
+            _fetch_list_for_other,
+            SEARCH_SPECS,
+        )
+        from src.minke_reg.session import login_minke_reg
+
+        reg = _load_reg_cfg(args.config)
+        session = login_minke_reg(reg)
+        print(f"登录: {session.organ_name}")
+
+        list_cache: dict[int, list] = {}
+        use_parallel = bool(getattr(args, "parallel", False)) or bool(getattr(args, "all", False))
+        if getattr(args, "all", False):
+            # 全量名单：st=1 ∪ st=8 全部去重
+            for st in (1, 8):
+                _fetch_list_for_other(reg, session, st, list_cache)
+            names = all_doctor_names(list_cache)
+            print(f"全量名单(st=1∪st=8): {len(names)} 名医生")
+            use_parallel = True
+        elif args.batch:
+            names_arg = args.names
+            if names_arg:
+                names = names_arg
+            else:
+                names = top_doctor_names(reg, session, args.batch, list_cache)
+                print(f"从主执业(st=1)+多执业(st=8)交替取前 {len(names)} 名: {names}")
+        else:
+            names = args.names
+            if not names:
+                print("[ERROR] 请指定医生姓名，或用 --batch N / --all 自动取名单", file=sys.stderr)
+                return 1
+
+        workers = getattr(args, "workers", None)
+        if workers is None:
+            workers = default_workers(reg)
+        if use_parallel:
+            print(f"并行模式: workers={workers}")
+
+        def on_progress(i, total, name, count=None, error=None):
+            def _emit(msg: str) -> None:
+                print(msg, file=sys.stderr, flush=True)
+
+            # 预取阶段回调：i=kind(str), total=done, name=total_count
+            if isinstance(i, str) and i in ("detail", "muti", "detail-retry", "muti-retry"):
+                done, total_count = total, name
+                if isinstance(total_count, int) and total_count > 0:
+                    pct = done * 100 // total_count
+                    _emit(f"[预取] {i}: {done}/{total_count} ({pct}%)")
+                else:
+                    _emit(f"[预取] {i}: {done}/{total_count}")
+                return
+            # 组装/列表阶段
+            if i == 0 and count is None and error is None:
+                _emit(f"[阶段] {name}")
+            elif isinstance(name, str) and name.startswith("预取"):
+                _emit(f"[阶段] {name}")
+            elif error is not None and not isinstance(error, str):
+                pass
+            elif error is not None:
+                _emit(f"[{i}/{total}] {name} 失败: {str(error)[:80]}")
+            elif count is not None:
+                pct = i * 100 // total if total else 0
+                # 全量时按 1% 节流，避免 3000+ 行刷屏；小批量每条都打印
+                step = max(1, total // 100) if total >= 100 else 1
+                if i == 1 or i == total or i % step == 0:
+                    _emit(f"[组装] {i}/{total} ({pct}%) {name} → {count} 行")
+            else:
+                _emit(f"[{i}/{total}] 获取 {name} ...")
+
+        if use_parallel:
+            total, out_path, per_doctor = fetch_practice_table_parallel(
+                doctor_names=names,
+                reg_cfg=reg,
+                output_path=args.output,
+                sheet_name="全量明细" if getattr(args, "all", False) else "明细",
+                on_progress=on_progress,
+                list_cache=list_cache,
+                workers=workers,
+            )
+        else:
+            total, out_path, per_doctor = fetch_practice_table(
+                doctor_names=names,
+                reg_cfg=reg,
+                output_path=args.output,
+                sheet_name=f"批量{len(names)}名" if args.batch and not args.output else "明细",
+                on_progress=on_progress,
+                list_cache=list_cache,
+            )
+        print(f"\n共 {len(names)} 名医生, {total} 行 → {out_path}")
+        print("每医生行数:")
+        for n, c in per_doctor.items():
+            print(f"  {n}: {c}")
+        return 0
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_check_elec_license(args: argparse.Namespace) -> int:
+    """获取医生电子证照预览 URL + 申领状态（独立流程，不依赖执业医院明细）。"""
+    try:
+        from src.minke_reg.practice_table import fetch_elec_license, _load_reg_cfg
+
+        names = args.names
+        if not names:
+            print("[ERROR] 请指定医生姓名", file=sys.stderr)
+            return 1
+
+        def on_progress(i, total, name, count=None, error=None):
+            if error == "未找到":
+                print(f"[{i}/{total}] {name}: 未找到", file=sys.stderr)
+            elif count is not None:
+                tag = error or ""
+                print(f"[{i}/{total}] {name}: {tag}", file=sys.stderr)
+            else:
+                print(f"[{i}/{total}] 检查 {name} ...", file=sys.stderr)
+
+        reg = _load_reg_cfg(args.config)
+        total, out_path = fetch_elec_license(
+            doctor_names=names,
+            reg_cfg=reg,
+            output_path=args.output,
+            on_progress=on_progress,
+        )
+        print(f"\n共 {total} 名医生 → {out_path}")
+        return 0
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+
 def cmd_run_all(args: argparse.Namespace) -> int:
     steps = []
     if getattr(args, "with_export", False):
@@ -802,3 +942,62 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
     run_all.add_argument("--skip-submit", action="store_true")
     run_all.add_argument("--skip-capture", action="store_true")
     run_all.set_defaults(func=cmd_run_all)
+
+    practice = subparsers.add_parser(
+        "fetch-practice-table",
+        parents=[common],
+        help="获取医生执业医院明细表（独立流程：所有省份主执业+多执业备案）",
+    )
+    practice.add_argument(
+        "names",
+        nargs="*",
+        default=[],
+        help="医生姓名列表（空则用 --batch N 或 --all 自动取名单）",
+    )
+    practice.add_argument(
+        "--batch",
+        type=int,
+        default=0,
+        help="自动从主执业(st=1)+多执业(st=8)交替取前 N 名医生",
+    )
+    practice.add_argument(
+        "--all",
+        action="store_true",
+        help="全量名单：st=1∪st=8 全部医生，启用并行预取（推荐大批量使用）",
+    )
+    practice.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="并行预取线程数（默认按 CPU 推算，封顶 32；可用 config.practiceTableWorkers 覆盖）",
+    )
+    practice.add_argument(
+        "--parallel",
+        action="store_true",
+        help="强制启用并行预取（小批量也可用，--all 自动启用）",
+    )
+    practice.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="输出 xlsx 路径（默认 workspace/artifacts/医生执业医院.xlsx）",
+    )
+    practice.set_defaults(func=cmd_fetch_practice_table)
+
+    elec = subparsers.add_parser(
+        "check-elec-license",
+        parents=[common],
+        help="获取医生电子证照预览 URL + 申领状态（独立流程，不拉执业明细）",
+    )
+    elec.add_argument(
+        "names",
+        nargs="+",
+        help="医生姓名列表",
+    )
+    elec.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="输出 xlsx 路径（默认 workspace/artifacts/elec_license_*.xlsx）",
+    )
+    elec.set_defaults(func=cmd_check_elec_license)

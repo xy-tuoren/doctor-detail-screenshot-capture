@@ -99,14 +99,14 @@ doctor-detail-screenshot-capture/
 ├── src/ # Python 源码
 │ ├── cli/ # CLI 入口与子命令
 │ ├── api/ # 莲藕 API 拉取
-│ ├── minke_reg/ # 机构端 SOAP 导出
+│ ├── minke_reg/ # 机构端 SOAP 导出（含 practice_table.py 独立明细流程）
 │ ├── institution_export/# 导出文件解析与索引
 │ ├── reconcile/ # 核对、to_submit 生成、写回载荷
 │ ├── capture/ # 采图编排（机构端 Python / 卫健委 Playwright）
 │ │ └── institution/ # 机构端详情采图（Python 重写，10 模块）
 │ └── lianou/ # UpdateDoctorMedical 写回
 ├── automation/
-│ ├── ps1/ # 机构端 UI 自动化（calibrate/export 用 PS1）
+│ ├── ps1/ # 机构端 UI 自动化（export/export-calibrate/verify-captures 用 PS1）
 │ └── py/ # OCR 校验等
 ├── cmd/ # 薄封装 .cmd（automation / reg-api / api）
 ├── exports/ # 机构端导出输入
@@ -181,16 +181,119 @@ flowchart LR
 
 ---
 
-## 机构端 UI 自动化
+## 独立流程：医生执业医院明细表（`fetch-practice-table`）
 
-**详情采图已用 Python 重写**（`src/capture/institution/`），解决 ESC 暂停失效、前台检测失效、孤儿进程三个根本问题；OCR 直接调用 `rapidocr_onnxruntime`，暂停控制全用 `ctypes` 不依赖控制台。
+这是一条**与核对/采图/写回主线完全独立**的流程，不读取 `to_submit.json`、不写回莲藕、不依赖 UI 自动化坐标。仅通过机构端 SOAP 接口汇总每个医生在所有省份的主执业 + 多执业备案信息，输出 Excel 明细表。**不含电子证照**（电子证照已拆为独立命令 `check-elec-license`，见下节）。
 
-**校准 / 导出 / 验证仍用 PS1**：`automation/ps1/capture-doctor-details.ps1` 的 `CalibrateAll` / `Export` / `ExportCalibrate` / `verify-captures` 等模式仍由 `run-automation` 调用（Python 采图依赖 `calibrate` 生成的 `loginCalibration` / `listCalibration` 坐标）。
+### 用途
+
+- 一次性盘点某医生（或一批医生）在**所有省份**的执业注册全景
+- 取得主执业审批日期、多执业备案起止日期、医院地址等字段
+- 不属于"补全缺失字段并写回莲藕"的主线，仅用于人工核查 / 留档
+
+### 数据来源（全 SOAP，无 UI）
+
+| 接口 | 作用 |
+|------|------|
+| `DoctorUnitGetListForOther` (st=1/8/9/10/11) | 取注册行：本院主执业、外院在本院多执业、本院多机构备案、本院医生外省主执业/多执业 |
+| `GetRegDetailForUnit` | 取注册行详情：审批日期、医院地址、省份（一次调用解析全字段） |
+| `GetMutiRegListByRegisterId` | 取每个注册行下属的多执业备案（含起止日期） |
+
+### 性能
+
+**两档执行模式：**
+
+- **串行模式**（默认，小批量）：跨医生共享全量列表缓存，5 个 `searchType` 全量列表只拉一次，后续医生从内存 filter；`GetRegDetailForUnit` 一次调用解析全字段。实测：单医生 ~22s，批量 5 名 ~40s（平均 ~8s/医生）。
+- **并行模式**（`--all` / `--parallel`，全量/大批量推荐）：列表只拉 1 次 → **并行预取**全部 `GetRegDetailForUnit` + `GetMutiRegListByRegisterId`（线程安全缓存）→ 纯内存组装写表。线程数默认按 CPU 核数×2 推算、封顶 32（可用 `--workers` 或 `config.practiceTableWorkers` 覆盖）。实测：批量 10 名 ~23s（串行 48s），全量 3459 名 ~4.5 分钟 / 14524 行（detail×11730 + muti×8596）。
+
+### 医生筛选口径
+
+- 指定姓名：`fetch-practice-table 艾勇 白广同 ...`
+- 自动取名单：`--batch N`，从主执业在本院（st=1）∪ 多执业含本院（st=8）**交替**取前 N 名（去重），保证两类都覆盖
+- 全量名单：`--all`，st=1∪st=8 全部去重姓名（自动启用并行模式）
+
+对每个入选医生，拿全其在所有省份的主执业 + 多执业备案；多执业备案行按「姓名+执业医院+开始日期+结束日期」全局去重，避免 st=8/9 列表行与 `GetMutiRegListByRegisterId` 返回行重复。
+
+### 命令
 
 ```powershell
-# 校准登录与列表坐标（首次必做，PS1）
+# 单个医生
+python -m src.cli fetch-practice-table 艾勇
+
+# 多个医生，指定输出
+python -m src.cli fetch-practice-table 艾勇 白广同 --output workspace/artifacts/xxx.xlsx
+
+# 自动取 10 名（主执业+多执业交替）
+python -m src.cli fetch-practice-table --batch 10
+
+# 全量名单（st=1∪st=8 全部，并行预取，推荐）
+python -m src.cli fetch-practice-table --all
+
+# 指定输出
+python -m src.cli fetch-practice-table --all --output workspace/artifacts/医生执业医院.xlsx
+
+# 指定线程数（默认按 CPU 推算、封顶 32）
+python -m src.cli fetch-practice-table --all --workers 16
+```
+
+> `--all` 与 `--parallel` 自动启用并行预取；小批量默认串行，加 `--parallel` 也可强制并行。
+
+### 产出
+
+`workspace/artifacts/医生执业医院.xlsx`（默认命名：单医生 `医生执业医院_艾勇.xlsx`；多人/全量 `医生执业医院.xlsx`，可用 `--output` 覆盖）。
+
+列：姓名、身份证号、性别、医师类别、医师级别、执业范围、任职资格、审批日期、开始日期、结束日期、是否主执业机构、是否省外、执业医院、医院地址、省份、数据来源。
+
+### 容错
+
+会话失效（"非法的用户身份"）时自动重新登录、清空列表缓存重新预拉，并重试当前医生一次。
+
+### 依赖
+
+`openpyxl`（写 xlsx），在 `capture-institution` extra 内；单独使用须 `pip install openpyxl`。
+
+---
+
+## 独立流程：电子证照（`check-elec-license`）
+
+与执业医院明细流程**解耦**的独立命令，只生成电子证照预览 URL 并检测申领状态，不拉详情、不拉多执业备案。
+
+### 数据来源
+
+| 来源 | 作用 |
+|------|------|
+| `DoctorUnitGetListForOther` (st=1/8) | 按姓名定位 `Doctor_GID` / `Doctor_RegisterGID`（优先主执业 st=1，其次多执业含本院 st=8） |
+| `make_electronic_license_url`（本地 AES-128-CBC） | 用 GID 拼对生成 `https://license.wsb003.cn/license/doctor?ty=d&encry=...&f=D_U` |
+| HTTP GET 该 URL + 解析 `<title>` | title 含 `--` 与 `信息展示` 视为「已申领」，否则「未申领」；按 URL 缓存结果 |
+
+### 命令
+
+```powershell
+python -m src.cli check-elec-license 艾勇 白广同
+python -m src.cli check-elec-license 艾勇 --output workspace/artifacts/elec.xlsx
+```
+
+### 产出
+
+`workspace/artifacts/elec_license_*.xlsx`（单医生 `elec_license_艾勇.xlsx`；批量 `elec_license_batchN.xlsx`）。
+
+列：姓名、身份证号、医师类别、医师级别、执业范围、查看电子证照、是否已申领电子证照。未在 st=1/st=8 列表中找到的医生，"是否已申领电子证照"填「未找到该医生」。
+
+### 依赖
+
+`pycryptodome`（AES），在 `capture-institution` extra 内；单独使用须 `pip install pycryptodome`。
+
+---
+
+## 机构端 UI 自动化
+
+**详情采图与坐标校准已用 Python 重写**（`src/capture/institution/`），解决 ESC 暂停失效、前台检测失效、孤儿进程三个根本问题；OCR 直接调用 `rapidocr_onnxruntime`，暂停控制全用 `ctypes` 不依赖控制台。
+
+**导出 / 验证仍用 PS1**：`automation/ps1/capture-doctor-details.ps1` 的 `Export` / `ExportCalibrate` / `verify-captures` 等模式仍由 `run-automation` 调用（`calibrate` 已改为 Python，生成的 `loginCalibration` / `listCalibration` 坐标供 Python 采图使用）。
+
+```powershell
+# 校准登录与列表坐标（首次必做，Python）
 python -m src.cli run-automation calibrate
-# 或：cmd\automation\calibrate.cmd
 
 # UI 手动导出名单到 exports/ui/（PS1）
 python -m src.cli run-automation export --entry Main

@@ -424,10 +424,9 @@ def capture_name_series(
 
                 if ocr_name and ocr_name != search_name:
                     print(
-                        f"  第 {row + 1} 行 OCR 姓名={ocr_name} 与搜索名 {search_name} 不一致，跳过。"
+                        f"  [提示] 第 {row + 1} 行 OCR 姓名={ocr_name} 与搜索名 {search_name} 不一致，"
+                        f"改以证书编号为准继续判断。"
                     )
-                    img.close()
-                    continue
 
                 if not ocr_cert:
                     triggered, error_count, captured_since_last_popup, last_error_time = _handle_error_popup_restart(
