@@ -106,13 +106,7 @@ def _person_already_captured(output_dir: Path, person: Person) -> bool:
     if not person.cert_code:
         return False
     path = output_dir / f"{_person_output_base(person)}.png"
-    if path.exists():
-        return True
-    # Fuzzy match: any file starting with name_
-    prefix = f"{_sanitize_filename(person.name)}_"
-    for p in output_dir.glob(f"{prefix}*.png"):
-        return True
-    return False
+    return path.exists()
 
 
 def _find_person_by_cert(candidates: list[Person], ocr_cert: str) -> Optional[Person]:

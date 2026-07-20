@@ -95,6 +95,48 @@ def fetch_doctor_unit_list(
     return rows
 
 
+def fetch_main_list_ex(
+    cfg: dict[str, Any],
+    session: MinkeSession,
+    search_type: int,
+) -> list[dict[str, str]]:
+    """调 DoctorUnitGetListEx：无需 md5，直接返回含 WorkLicenceCode/CpetCode 的全量列表。
+
+    与 fetch_main_list_for_export 相比省掉 N 次 GetRegDetailForUnit 详情调用，
+    但不返回审核日期（LastApprovalTime 仍需 UI「获取最新」后的全量模式），
+    也不返回任职资格（PostCpetName，reconcile 不用此字段）。
+    """
+    client = SoapClient(
+        str(cfg["docUnitServiceUrl"]),
+        NS_DOCTOR_UNIT,
+        timeout=int(cfg.get("requestTimeoutSeconds", 120)),
+    )
+    resp = client.call_operation(
+        "DoctorUnitGetListEx",
+        {"aSeachType": search_type, "aUnitGuid": session.unit_guid},
+        header_xml=session.doctor_header(),
+    )
+    err = extract_error_message(resp)
+    if err:
+        raise RuntimeError(f"DoctorUnitGetListEx error: {err}")
+    rows = parse_dataset_rows(resp, MAIN_ROW_TAGS)
+    if not rows:
+        raise RuntimeError("DoctorUnitGetListEx returned no rows")
+    keys = len(rows[0])
+    audit = _audit_count(rows)
+    print(
+        f"  列表字段 {keys} 个，审核日期 {audit}/{len(rows)}（DoctorUnitGetListEx）",
+        file=sys.stderr,
+    )
+    if audit == 0:
+        print(
+            "  提示：DoctorUnitGetListEx 不返回审核日期。如需审核日期，"
+            "请在机构端 UI 点「获取最新」后用 run-automation export 或配置 forceRefreshMd5。",
+            file=sys.stderr,
+        )
+    return rows
+
+
 def _fetch_doctor_unit_list_once(
     cfg: dict[str, Any],
     session: MinkeSession,

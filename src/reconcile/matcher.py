@@ -53,6 +53,11 @@ def extract_practicing_cert(record: dict[str, Any]) -> str:
     return ""
 
 
+def _doc_hospital(item: dict[str, Any]) -> str:
+    """docMedicalList 元素的执业医院名：优先 hospitalName（新接口），回退 hospital（旧接口/缓存）。"""
+    return normalize_name(item.get("hospitalName") or item.get("hospital"))
+
+
 def _export_name(row: dict[str, Any]) -> str:
     return normalize_name(row.get("姓名") or row.get("doctorName"))
 
@@ -142,9 +147,7 @@ def _build_ops_for_doctor(
         "doctorFileId": doctor_file_id,
     }
     doc_list = doctor.get("docMedicalList") or []
-    has_lianou = any(
-        normalize_name(item.get("hospital")) == LIANOU_HOSPITAL for item in doc_list
-    )
+    has_lianou = any(_doc_hospital(item) == LIANOU_HOSPITAL for item in doc_list)
 
     ops: list[dict[str, Any]] = []
     create_count = 0
@@ -165,7 +168,8 @@ def _build_ops_for_doctor(
 
     for item in doc_list:
         # 仅对「莲藕健康医院」生成 update 操作体；其它医院即使点名缺失字段也不写入 to_submit
-        if normalize_name(item.get("hospital")) != LIANOU_HOSPITAL:
+        item_hospital = _doc_hospital(item)
+        if item_hospital != LIANOU_HOSPITAL:
             continue
         missing = parse_update_fields(item.get("updateField"))
         if practice_source == MAIN_PRACTICE:
@@ -191,7 +195,7 @@ def _build_ops_for_doctor(
                 id_card=id_card,
                 cert_code=cert,
                 a_id=item.get("aId"),
-                hospital=normalize_name(item.get("hospital")),
+                hospital=item_hospital,
             )
         )
         update_count += 1

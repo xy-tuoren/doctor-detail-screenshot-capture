@@ -25,6 +25,7 @@ _SUPPLEMENT_KEYS = frozenset(
         "practiceProvince",
         "practiceCity",
         "hospital",
+        "hospitalName",
         "hospitalLevel",
         "professionalList",
         "recordDate",
@@ -32,6 +33,11 @@ _SUPPLEMENT_KEYS = frozenset(
         "healthCommissionBase",
         "institutionBase",
     }
+)
+
+# operationType=1（更新）时不再提交的身份字段（新接口已从必填表中移除）
+_UPDATE_DROPPED_IDENTITY = frozenset(
+    {"iDCard", "qualificationCertCode", "practicingCertCode"}
 )
 
 
@@ -106,6 +112,8 @@ def postable_body(payload: dict[str, Any], *, include_images: bool = True) -> di
         "practicingCertCode",
     ):
         if key not in payload:
+            continue
+        if not create and key in _UPDATE_DROPPED_IDENTITY:
             continue
         value = payload[key]
         if value is None:

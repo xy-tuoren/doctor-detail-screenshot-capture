@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -29,9 +30,36 @@ def load_minke_reg_config(config_path: Path) -> dict[str, Any]:
     if not merged.get("loginPassword"):
         merged["loginPassword"] = data.get("loginPassword") or ""
 
-    if not str(merged.get("loginUser", "")).strip():
+    merged["loginUser"] = str(merged.get("loginUser", "")).strip()
+    merged["loginPassword"] = str(merged.get("loginPassword", "")).strip()
+
+    env_user = os.environ.get("MINKE_REG_USER", "").strip()
+    env_password = os.environ.get("MINKE_REG_PASSWORD", "").strip()
+    if env_user:
+        merged["loginUser"] = env_user
+    if env_password:
+        merged["loginPassword"] = env_password
+
+    if not merged["loginUser"]:
         raise ValueError("minkeRegApi.loginUser or loginUser is required")
-    if not str(merged.get("loginPassword", "")).strip():
-        raise ValueError("minkeRegApi.loginPassword or loginPassword is required")
+    if not merged["loginPassword"]:
+        raise ValueError(
+            "minkeRegApi.loginPassword or loginPassword is required "
+            "(or set MINKE_REG_PASSWORD)"
+        )
 
     return merged
+
+
+def apply_minke_credential_overrides(
+    cfg: dict[str, Any],
+    *,
+    login_user: str | None = None,
+    login_password: str | None = None,
+) -> dict[str, Any]:
+    updated = dict(cfg)
+    if login_user is not None and str(login_user).strip():
+        updated["loginUser"] = str(login_user).strip()
+    if login_password is not None and str(login_password).strip():
+        updated["loginPassword"] = str(login_password).strip()
+    return updated

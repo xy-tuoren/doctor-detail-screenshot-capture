@@ -5,7 +5,13 @@ from typing import Any
 
 from .constants import EMPTY_GUID, NS_DOCTOR_UNIT, NS_LOGIN
 from .machine import build_machine_fingerprint
-from .soap import SoapClient, build_mk_header, parse_login_user
+from .soap import (
+    SoapClient,
+    assert_login_success,
+    build_mk_header,
+    check_minke_service_route,
+    parse_login_user,
+)
 
 
 @dataclass(frozen=True)
@@ -35,6 +41,10 @@ class MinkeSession:
 
 
 def login_minke_reg(cfg: dict[str, Any]) -> MinkeSession:
+    # 登录前告警：fake-ip 下详情预取会大面积超时（列表有时仍通）
+    check_minke_service_route(str(cfg.get("loginServiceUrl") or ""), on_fake_ip="warn")
+    check_minke_service_route(str(cfg.get("docUnitServiceUrl") or ""), on_fake_ip="warn")
+
     client = SoapClient(
         str(cfg["loginServiceUrl"]),
         NS_LOGIN,
@@ -63,7 +73,8 @@ def login_minke_reg(cfg: dict[str, Any]) -> MinkeSession:
         f"<aUser>{_user_inner_xml(check_user)}</aUser>"
         "</CheckLogin>"
     )
-    client.call(f"{NS_LOGIN}CheckLogin", check_body, header_xml=guest_header)
+    check_resp = client.call(f"{NS_LOGIN}CheckLogin", check_body, header_xml=guest_header)
+    assert_login_success(check_resp, phase="CheckLogin")
 
     login_user = _blank_user(product_id, login_id, password)
     login_user.update(

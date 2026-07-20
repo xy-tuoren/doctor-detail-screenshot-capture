@@ -1,7 +1,9 @@
 {
   "appPath": "",
+  "_appPathNote": "须指向真实安装路径（通常含厂商子目录，勿漏一层）；SOAP 不读此项。detail 大面积超时时先查 jgd.wsb002.cn 是否被 Clash fake-ip（198.18.x.x）劫持",
   "loginUser": "your_account",
   "loginPassword": "your_password",
+  "_loginNote": "export-reg / fetch-practice-table 等 SOAP 命令使用上述账号；也可用环境变量 MINKE_REG_USER / MINKE_REG_PASSWORD 或 export-reg --password 临时覆盖",
   "names": [
     { "name": "张三", "idCard": "110101199001011234" },
     { "name": "李四", "idCard": "110101199002021234" }

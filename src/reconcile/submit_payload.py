@@ -149,6 +149,7 @@ def build_create_op(
         "practiceProvince": DEFAULT_PRACTICE_PROVINCE,
         "practiceCity": DEFAULT_PRACTICE_CITY,
         "hospitalLevel": DEFAULT_HOSPITAL_LEVEL,
+        "hospitalName": lianou_hospital,
         "hospital": lianou_hospital,
         "professionalList": professional_list,
         "healthCommissionBase": "",
@@ -178,11 +179,14 @@ def build_update_op(
     """已存在的医院 → 按 updateField 点名映射为待提交键值（operationType=1）。"""
     payload: dict[str, Any] = {"operationType": OPERATION_UPDATE, "aId": a_id}
     payload.update(_required_identity(doctor, cert_code, id_card))
-    payload["updateField"] = _map_missing_to_values(
+    update_field = _map_missing_to_values(
         missing_fields=missing_fields,
         export_row=export_row,
         practice_source=practice_source,
     )
+    # hospitalName 为接口必填字段，无论 updateField 是否点名都要带上
+    update_field["hospitalName"] = hospital
+    payload["updateField"] = update_field
     payload["_capture"] = _capture_meta(id_card, cert_code, practice_source, hospital)
     payload["_op"] = "update"
     return payload

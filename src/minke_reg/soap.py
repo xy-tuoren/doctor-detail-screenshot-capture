@@ -1,17 +1,69 @@
 from __future__ import annotations
 
 import http.client
+import ipaddress
+import socket
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from typing import Any
+from typing import Any, Literal
 from xml.sax.saxutils import escape
+
+# Clash 等工具的 fake-ip 默认池；解析到此段时 TCP 直连会超时，
+# 表现为 Login/列表偶发仍通、GetRegDetailForUnit 大面积超时。
+_FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
 
 
 def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
+
+
+def is_clash_fake_ip(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip) in _FAKE_IP_NET
+    except ValueError:
+        return False
+
+
+def resolve_service_host(service_url: str) -> tuple[str, str]:
+    """Return (hostname, resolved_ip)."""
+    host = urllib.parse.urlparse(service_url).hostname or ""
+    if not host:
+        raise ValueError(f"service_url missing host: {service_url}")
+    ip = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)[0][4][0]
+    return host, ip
+
+
+def check_minke_service_route(
+    service_url: str,
+    *,
+    on_fake_ip: Literal["warn", "error"] = "warn",
+) -> str | None:
+    """检测机构端 SOAP 主机是否被解析到代理 fake-ip。
+
+    返回提示文案；``on_fake_ip='error'`` 时直接抛错，避免全量预取空转超时。
+    """
+    try:
+        host, ip = resolve_service_host(service_url)
+    except OSError as exc:
+        msg = f"无法解析机构端主机（{service_url}）：{exc}"
+        if on_fake_ip == "error":
+            raise RuntimeError(msg) from exc
+        print(f"[WARN] {msg}", flush=True)
+        return msg
+    if not is_clash_fake_ip(ip):
+        return None
+    msg = (
+        f"机构端主机 {host} 解析到代理 fake-ip {ip}（198.18.0.0/15）。"
+        "这会导致 GetRegDetailForUnit 等详情接口超时。"
+        "请关闭 Clash/系统代理，或将 jgd.wsb002.cn 设为 DIRECT 后重试。"
+    )
+    if on_fake_ip == "error":
+        raise RuntimeError(msg)
+    print(f"[WARN] {msg}", flush=True)
+    return msg
 
 
 def _find_text(parent: ET.Element, local: str) -> str:
@@ -156,6 +208,41 @@ def build_mk_header(
     return f'<MKSoapHeader xmlns="{ns}">{inner}</MKSoapHeader>'
 
 
+def login_failure_message(soap_xml: str, *, phase: str = "Login") -> str:
+    root = ET.fromstring(soap_xml)
+    check_result = _find_text(root, "CheckLoginResult")
+    login_result = _find_text(root, "LoginResult")
+    error_msg = _find_text(root, "aErrorMsg") or _find_text(root, "ErrorMsg")
+
+    if check_result and not check_result.isdigit():
+        return f"机构端{phase}失败：{check_result}"
+    if error_msg:
+        return f"机构端{phase}失败：{error_msg}"
+    code = login_result or check_result or "unknown"
+    return f"机构端{phase}失败：LoginResult={code}"
+
+
+# CheckLogin 成功码：历史为 "0"；现网亦可能返回 "C"（仍带 UserId/KeyResult）
+_CHECK_LOGIN_OK = frozenset({"0", "C"})
+
+
+def assert_login_success(soap_xml: str, *, phase: str = "Login") -> None:
+    root = ET.fromstring(soap_xml)
+    login_result = _find_text(root, "LoginResult")
+    check_result = _find_text(root, "CheckLoginResult")
+    if login_result == "0":
+        return
+    if phase == "CheckLogin" and check_result in _CHECK_LOGIN_OK:
+        return
+    if check_result and check_result.isdigit() and int(check_result) != 0:
+        raise RuntimeError(login_failure_message(soap_xml, phase=phase))
+    if login_result and login_result != "0":
+        raise RuntimeError(login_failure_message(soap_xml, phase=phase))
+    if phase == "CheckLogin" and check_result and check_result not in _CHECK_LOGIN_OK:
+        if not check_result.isdigit():
+            raise RuntimeError(login_failure_message(soap_xml, phase=phase))
+
+
 def parse_login_user(soap_xml: str) -> dict[str, str]:
     root = ET.fromstring(soap_xml)
     user_elem = None
@@ -170,12 +257,7 @@ def parse_login_user(soap_xml: str) -> dict[str, str]:
     for child in list(user_elem):
         result[_local_name(child.tag)] = (child.text or "").strip()
 
-    login_result = _find_text(root, "LoginResult")
-    if login_result and login_result != "0":
-        check_result = _find_text(root, "CheckLoginResult")
-        raise RuntimeError(
-            f"Login failed: LoginResult={login_result or check_result or 'unknown'}"
-        )
+    assert_login_success(soap_xml, phase="Login")
     return result
 
 

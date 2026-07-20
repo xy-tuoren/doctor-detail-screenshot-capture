@@ -95,6 +95,7 @@ def _normalize_province(raw: str) -> str:
 DETAIL_HEADERS: tuple[str, ...] = (
     "姓名",
     "身份证号",
+    "执业证书编码",
     "性别",
     "医师类别",
     "医师级别",
@@ -290,6 +291,7 @@ def _base_from_list(row: dict[str, str], detail: dict[str, str]) -> dict[str, st
     return {
         "姓名": row.get("Doctor_Name", ""),
         "身份证号": row.get("IDCard") or detail.get("IDCard", ""),
+        "执业证书编码": detail.get("WorkLicenceCode", "") or row.get("WorkLicenceCode", ""),
         "性别": row.get("Sex", ""),
         "医师类别": row.get("Doctor_SortName", ""),
         "医师级别": row.get("Doctor_LevelName", ""),
@@ -367,21 +369,42 @@ def _collect_prefetch_keys(
 
 def _prefetch_details(
     reg, session, keys: list[tuple[str, str]], workers: int, on_progress=None,
-) -> None:
-    """并行预取 detail，task 内重试 2 次；失败的 key 用 4 线程低并发补一轮。"""
+) -> dict | None:
+    """并行预取 detail，task 内重试 2 次；会话失效自动重登录；失败 key 用 4 线程低并发补一轮。
+
+    返回 ``{"session": ...}`` holder（session 可能已被重登录更新），无 key 时返回 None。
+    """
     if not keys:
-        return
+        return None
     import time
+
+    holder = {"session": session}
+    relogin_lock = threading.Lock()
+    last_relogin_ts = [0.0]
+    RELOGIN_MIN_INTERVAL = 10.0  # 秒；避免多线程同时失效时重复重登录
+
+    def maybe_relogin() -> None:
+        """线程安全重登录：10 秒内只重登录一次，其他线程复用新 session。"""
+        with relogin_lock:
+            now = time.time()
+            if now - last_relogin_ts[0] < RELOGIN_MIN_INTERVAL:
+                return
+            last_relogin_ts[0] = now
+            holder["session"] = login_minke_reg(reg)
 
     def task(dg, rg):
         key = (dg, rg)
         for attempt in range(3):  # 首次 + 2 重试
             try:
-                val = _detail_map_raw(reg, session, dg, rg)
+                val = _detail_map_raw(reg, holder["session"], dg, rg)
                 with _DETAIL_CACHE_LOCK:
                     _DETAIL_CACHE[key] = val
                 return True
-            except Exception:
+            except Exception as exc:
+                msg = str(exc)
+                if "非法的用户身份" in msg:
+                    maybe_relogin()
+                    continue  # 用新 session 重试，不计入 attempt
                 if attempt < 2:
                     time.sleep(0.3 * (attempt + 1))
         return False
@@ -403,25 +426,54 @@ def _prefetch_details(
             if on_progress and (done == 1 or done == total or done % 50 == 0):
                 on_progress("detail", done, total)
 
-    # 失败的 key 低并发补取（服务端压力小，成功率高）
+    # 失败的 key 低并发补取（4 线程，服务端压力小，成功率高）
     if failed:
         if on_progress:
             on_progress("detail-retry", 0, len(failed))
         retry_done = 0
-        for dg, rg in failed:
-            task(dg, rg)
-            retry_done += 1
-            if on_progress and retry_done % 100 == 0:
-                on_progress("detail-retry", retry_done, len(failed))
+        retry_lock = threading.Lock()
+
+        def retry_progress(_ok):
+            nonlocal retry_done
+            with retry_lock:
+                retry_done += 1
+                if on_progress and (retry_done == 1 or retry_done == len(failed) or retry_done % 100 == 0):
+                    on_progress("detail-retry", retry_done, len(failed))
+
+        with ThreadPoolExecutor(max_workers=min(4, len(failed))) as pool:
+            futs = {pool.submit(task, dg, rg): dg for dg, rg in failed}
+            for fut in as_completed(futs):
+                try:
+                    fut.result()
+                except Exception:
+                    pass
+                retry_progress(True)
+    return holder
 
 
 def _prefetch_muti(
     reg, session, reg_ids: list[str], workers: int, on_progress=None,
-) -> None:
-    """并行预取 muti，失败不缓存；失败的 id 用串行补一轮。"""
+) -> dict | None:
+    """并行预取 muti，会话失效自动重登录；失败 id 用 4 线程低并发补一轮。
+
+    返回 ``{"session": ...}`` holder，无 id 时返回 None。
+    """
     if not reg_ids:
-        return
+        return None
     import time
+
+    holder = {"session": session}
+    relogin_lock = threading.Lock()
+    last_relogin_ts = [0.0]
+    RELOGIN_MIN_INTERVAL = 10.0
+
+    def maybe_relogin() -> None:
+        with relogin_lock:
+            now = time.time()
+            if now - last_relogin_ts[0] < RELOGIN_MIN_INTERVAL:
+                return
+            last_relogin_ts[0] = now
+            holder["session"] = login_minke_reg(reg)
 
     def task(rid):
         for attempt in range(3):
@@ -429,7 +481,7 @@ def _prefetch_muti(
                 raw = _detail_client(reg).call_operation(
                     "GetMutiRegListByRegisterId",
                     {"aRegisterId": rid},
-                    header_xml=session.doctor_header(),
+                    header_xml=holder["session"].doctor_header(),
                 )
                 rows: list[dict[str, str]] = []
                 for elem in ET.fromstring(raw).iter():
@@ -440,7 +492,11 @@ def _prefetch_muti(
                 with _MUTI_REG_LOCK:
                     _MUTI_REG_CACHE[rid] = rows
                 return True
-            except Exception:
+            except Exception as exc:
+                msg = str(exc)
+                if "非法的用户身份" in msg:
+                    maybe_relogin()
+                    continue
                 if attempt < 2:
                     time.sleep(0.3 * (attempt + 1))
         return False
@@ -465,8 +521,25 @@ def _prefetch_muti(
     if failed:
         if on_progress:
             on_progress("muti-retry", 0, len(failed))
-        for rid in failed:
-            task(rid)
+        retry_done = 0
+        retry_lock = threading.Lock()
+
+        def retry_progress(_ok):
+            nonlocal retry_done
+            with retry_lock:
+                retry_done += 1
+                if on_progress and (retry_done == 1 or retry_done == len(failed) or retry_done % 100 == 0):
+                    on_progress("muti-retry", retry_done, len(failed))
+
+        with ThreadPoolExecutor(max_workers=min(4, len(failed))) as pool:
+            futs = {pool.submit(task, rid): rid for rid in failed}
+            for fut in as_completed(futs):
+                try:
+                    fut.result()
+                except Exception:
+                    pass
+                retry_progress(True)
+    return holder
 
 
 def _assemble_rows_for_doctor(
@@ -669,7 +742,7 @@ def _write_xlsx(rows: list[dict[str, str]], path: Path, sheet_name: str = "明�
     for row in rows:
         ws.append([row.get(h, "") for h in DETAIL_HEADERS])
     widths = {
-        "姓名": 8, "身份证号": 20, "性别": 6,
+        "姓名": 8, "身份证号": 20, "执业证书编码": 22, "性别": 6,
         "医师类别": 8, "医师级别": 10, "执业范围": 12, "任职资格": 10,
         "审批日期": 12,
         "开始日期": 12, "结束日期": 12, "是否主执业机构": 12,
@@ -810,7 +883,11 @@ def fetch_practice_table_parallel(
     - 并发预取 detail / muti，workers 默认按 CPU 推算
     返回 (总行数, 输出路径, 每医生行数)。
     """
+    from src.minke_reg.soap import check_minke_service_route
+
     reg = reg_cfg or _load_reg_cfg(config_path)
+    # 全量预取前硬拦截 fake-ip，避免 detail×上万次空转超时
+    check_minke_service_route(str(reg.get("docUnitServiceUrl") or ""), on_fake_ip="error")
     session = login_minke_reg(reg)
     w = workers or default_workers(reg)
 
@@ -830,15 +907,17 @@ def fetch_practice_table_parallel(
     if on_progress:
         on_progress(0, len(doctor_names), f"预取 detail×{len(detail_keys)} muti×{len(muti_reg_ids)} (workers={w})")
 
-    # 并行预取 detail
+    # 并行预取 detail（内部会话失效自动重登录）
     if on_progress:
         on_progress(0, len(doctor_names), f"预取 detail {len(detail_keys)} 次")
-    _prefetch_details(reg, session, detail_keys, w, on_progress)
+    detail_holder = _prefetch_details(reg, session, detail_keys, w, on_progress)
+    session = detail_holder["session"] if detail_holder else session
 
-    # 并行预取 muti
+    # 并行预取 muti（内部会话失效自动重登录）
     if on_progress:
         on_progress(0, len(doctor_names), f"预取 muti {len(muti_reg_ids)} 次")
-    _prefetch_muti(reg, session, muti_reg_ids, w, on_progress)
+    muti_holder = _prefetch_muti(reg, session, muti_reg_ids, w, on_progress)
+    session = muti_holder["session"] if muti_holder else session
 
     # 纯内存组装（无网络）
     all_rows: list[dict[str, str]] = []

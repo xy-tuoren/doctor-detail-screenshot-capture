@@ -26,14 +26,7 @@ def institution_capture_exists(
     folder = captures_root / institution_list_folder(list_entry)
     if not folder.exists():
         return False
-    exact = folder / f"{name}_{cert_code}.png"
-    if exact.exists():
-        return True
-    prefix = f"{name}_"
-    for path in folder.glob(f"{name}_*.png"):
-        if path.name.startswith(prefix):
-            return True
-    return False
+    return (folder / f"{name}_{cert_code}.png").exists()
 
 
 def filter_institution_capture_targets(

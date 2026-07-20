@@ -116,7 +116,7 @@ doctor-detail-screenshot-capture/
 │ ├── artifacts/ # 核对主产物（to_submit、报告、摘要）
 │ ├── cache/ # 莲藕 API 24h 缓存
 │ ├── debug/ # --debug 中间快照
-│ └── tmp/ # 采图临时配置
+│ └── tmp/ # 采图临时配置；后台长任务日志/状态（如 build-practice-hospital-report.*）
 ├── captures/ # 截图输出（机构端 + 卫健委）
 └── docs/adr/ # 架构决策记录
 ```
@@ -242,7 +242,7 @@ python -m src.cli fetch-practice-table --all --workers 16
 
 `workspace/artifacts/医生执业医院.xlsx`（默认命名：单医生 `医生执业医院_艾勇.xlsx`；多人/全量 `医生执业医院.xlsx`，可用 `--output` 覆盖）。
 
-列：姓名、身份证号、性别、医师类别、医师级别、执业范围、任职资格、审批日期、开始日期、结束日期、是否主执业机构、是否省外、执业医院、医院地址、省份、数据来源。
+列：姓名、身份证号、**执业证书编码**、性别、医师类别、医师级别、执业范围、任职资格、审批日期、开始日期、结束日期、是否主执业机构、是否省外、执业医院、医院地址、省份、数据来源。
 
 ### 容错
 
@@ -251,6 +251,49 @@ python -m src.cli fetch-practice-table --all --workers 16
 ### 依赖
 
 `openpyxl`（写 xlsx），在 `capture-institution` extra 内；单独使用须 `pip install openpyxl`。
+
+---
+
+## 独立流程：医生执业医院信息报告（`build-practice-hospital-report`）
+
+在 `fetch-practice-table` 产出的机构端明细基础上，**实时请求**莲藕 `GetDoctorMedicalPage`（**不读** `workspace/cache/doctors_api_cache.json`），按执业证书编码 join 档案三列，生成四 sheet 汇总报告。
+
+### 数据来源
+
+| 来源 | 作用 |
+|------|------|
+| 机构端 SOAP（`fetch-practice-table --all` 或本命令内置拉取） | 全量明细行（含执业证书编码） |
+| 莲藕 API `fetch_all_records` | 档案编号 / 档案状态 / 所属团队 |
+| 模板 `医生执业医院信息.xlsx` | 保留「互联网医院重叠数」名单（A–G 列），重算 H 列及另外三 sheet |
+
+**禁止**使用 `practice_hospitals_all_fixed.xlsx` 作为输入。
+
+### 产出
+
+默认 `workspace/artifacts/医生执业医院信息_20260706.xlsx`（四 sheet：全量明细、医生执业医院数、互联网医院重叠数、医院重叠数）。
+
+### 执行方式（Agent 必读）
+
+本命令全量约 **15–25 分钟**，超过 Cursor Agent Shell 等待上限（约 15 分钟）。**Agent 执行时必须用方式 2**，禁止方式 3。
+
+| 方式 | 适用 | 做法 |
+|------|------|------|
+| **1. 集成终端** | 用户本人操作 | 在 Cursor 底部终端手动跑前台命令，进度可见 |
+| **2. Agent 前台 Shell** | ❌ 禁止 | 易超时中断，长任务请走方式 1 |
+
+```powershell
+# 用户本人在集成终端跑
+python -m src.cli build-practice-hospital-report
+
+# 已有机构端明细时跳过 SOAP
+python -m src.cli build-practice-hospital-report --skip-institution-fetch
+```
+
+**禁止：** Agent 用前台 Shell 跑完整 `build-practice-hospital-report`（约 15–25 分钟，易超时中断）。
+
+### 依赖
+
+`openpyxl`（与 `fetch-practice-table` 相同）。
 
 ---
 
@@ -429,10 +472,19 @@ OCR 与校验均按**执业证书编号**，非身份证。
 5. **采图**：机构端依赖 Windows 桌面客户端与 PS1；卫健委依赖 Playwright，勿在无头环境强行跑 UI 步骤。
 6. **最小改动**：沿用现有 CLI 子命令与目录约定；新功能优先扩展 `src/cli/pipeline_cmds.py` 与对应模块。
 7. **危险操作**：脚本中**禁止**对项目根目录、`workspace/`、`captures/` 使用 `Remove-Item -Recurse -Force`；任何清理操作必须显式指定文件名/扩展名，禁止用通配符兜底。变量为空时 `Remove-Item "$x\*"` 等价于删除当前目录全部内容。
+8. **长任务（Agent）**：预计 **>10 分钟** 或含全量 SOAP/API 的命令（如 `build-practice-hospital-report`、`fetch-practice-table --all`），**Agent 禁止用前台 Shell 跑**（易超时中断）；请提示用户在 Cursor 集成终端手动执行。详见上文「医生执业医院信息报告 → 执行方式」。
 
 ---
 
 ## 相关文档
 
 - 接口字段：[`医生医疗机构接口文档.md`](医生医疗机构接口文档.md)
-- 架构决策：[`docs/adr/0008-cert-match-docmedical-operationtype.md`](docs/adr/0008-cert-match-docmedical-operationtype.md)
+- 架构决策（`docs/adr/`）：
+  - [`0001-updatefield-driven-completion-pipeline.md`](docs/adr/0001-updatefield-driven-completion-pipeline.md) — 以莲藕 `updateField` 驱动的单向补全管线
+  - [`0002-retain-powershell-capture.md`](docs/adr/0002-retain-powershell-capture.md) — 统一 Python CLI，保留 PS1 截图脚本（详情采图已用 Python 重写，导出/验证仍用 PS1）
+  - [`0003-main-practice-record-date-from-review-date.md`](docs/adr/0003-main-practice-record-date-from-review-date.md) — 主执业备案日期取自审核日期
+  - [`0004-field-mapping-rules.md`](docs/adr/0004-field-mapping-rules.md) — 机构端导出列到莲藕字段的映射规则
+  - [`0005-merge-batch-doctor-query.md`](docs/adr/0005-merge-batch-doctor-query.md) — 卫健委采集并入主项目
+  - [`0006-writeback-via-update-doctor-medical.md`](docs/adr/0006-writeback-via-update-doctor-medical.md) — 写回经 UpdateDoctorMedical 单条更新
+  - [`0007-strict-match-and-slim-artifacts.md`](docs/adr/0007-strict-match-and-slim-artifacts.md) — 严格双字段匹配与精简 reconcile 产物（匹配规则部分被 0008 取代）
+  - [`0008-cert-match-docmedical-operationtype.md`](docs/adr/0008-cert-match-docmedical-operationtype.md) — 证书号 + 姓名双字段匹配，operationType 由 docMedicalList 推断

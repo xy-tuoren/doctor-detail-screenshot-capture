@@ -84,8 +84,13 @@ def cmd_export_reg(args: argparse.Namespace) -> int:
             save_reg_workbook,
             save_reg_xlsx,
         )
+        from src.minke_reg.config import apply_minke_credential_overrides
 
         cfg = load_minke_reg_config(args.config)
+        cfg = apply_minke_credential_overrides(
+            cfg,
+            login_password=getattr(args, "password", None),
+        )
         print("正在登录医师注册系统...")
         session = login_minke_reg(cfg)
         print(f"登录成功：{session.organ_name or session.login_id}")
@@ -623,6 +628,105 @@ def cmd_fetch_practice_table(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_build_practice_hospital_report(args: argparse.Namespace) -> int:
+    """机构端执业明细 + 莲藕 API 实时拉取，生成「医生执业医院信息」四 sheet 报告。"""
+    try:
+        from src.api.doctor_medical import fetch_all_records
+        from src.minke_reg.practice_hospital_report import run_build_practice_hospital_report
+        from src.minke_reg.practice_table import (
+            all_doctor_names,
+            default_workers,
+            fetch_practice_table_parallel,
+            _fetch_list_for_other,
+            _load_reg_cfg,
+        )
+        from src.minke_reg.session import login_minke_reg
+
+        workspace = _workspace(args)
+        artifacts = workspace / "artifacts"
+        institution_path = getattr(args, "institution", None) or (artifacts / "医生执业医院.xlsx")
+        template_path = getattr(args, "template", None) or (artifacts / "医生执业医院信息.xlsx")
+        output_path = args.output or (artifacts / "医生执业医院信息_20260706.xlsx")
+
+        if not template_path.exists():
+            print(f"[ERROR] 模板不存在: {template_path}", file=sys.stderr)
+            return 1
+
+        if not getattr(args, "skip_institution_fetch", False):
+            print("正在从机构端 SOAP 拉取全量执业明细（st=1∪st=8）...")
+            reg = _load_reg_cfg(args.config)
+            session = login_minke_reg(reg)
+            print(f"登录: {session.organ_name}")
+            list_cache: dict[int, list] = {}
+            for st in (1, 8):
+                _fetch_list_for_other(reg, session, st, list_cache)
+            names = all_doctor_names(list_cache)
+            workers = getattr(args, "workers", None) or default_workers(reg)
+            print(f"全量 {len(names)} 名医生, workers={workers}")
+
+            def on_progress(i, total, name, count=None, error=None):
+                if isinstance(i, str) and i in ("detail", "muti", "detail-retry", "muti-retry"):
+                    done, total_count = total, name
+                    if isinstance(total_count, int) and total_count > 0:
+                        pct = done * 100 // total_count
+                        print(f"[预取] {i}: {done}/{total_count} ({pct}%)", file=sys.stderr, flush=True)
+                    return
+                if i == 0 and count is None and error is None:
+                    print(f"[阶段] {name}", file=sys.stderr, flush=True)
+                elif isinstance(name, str) and name.startswith("预取"):
+                    print(f"[阶段] {name}", file=sys.stderr, flush=True)
+                elif error is not None and isinstance(error, str):
+                    print(f"[{i}/{total}] {name} 失败: {error[:80]}", file=sys.stderr, flush=True)
+                elif count is not None:
+                    pct = i * 100 // total if total else 0
+                    step = max(1, total // 100) if total >= 100 else 1
+                    if i == 1 or i == total or i % step == 0:
+                        print(
+                            f"[组装] {i}/{total} ({pct}%) {name} → {count} 行",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+
+            total_rows, institution_path, _ = fetch_practice_table_parallel(
+                doctor_names=names,
+                reg_cfg=reg,
+                output_path=institution_path,
+                sheet_name="全量明细",
+                on_progress=on_progress,
+                list_cache=list_cache,
+                workers=workers,
+            )
+            print(f"机构端明细: {total_rows} 行 → {institution_path}")
+        elif not institution_path.exists():
+            print(f"[ERROR] 机构端明细不存在: {institution_path}", file=sys.stderr)
+            return 1
+
+        api_cfg = merge_api_config(load_api_config(args.config))
+        if getattr(args, "page_size", None) is not None:
+            api_cfg["pageSize"] = args.page_size
+        print("正在从莲藕 API 拉取全量医生（不使用缓存）...")
+        lianou_records = fetch_all_records(api_cfg, max_pages=getattr(args, "max_pages", None))
+        print(f"莲藕 API: {len(lianou_records)} 条")
+
+        summary = run_build_practice_hospital_report(
+            config_path=args.config,
+            template_path=template_path,
+            output_path=output_path,
+            institution_xlsx=institution_path,
+            lianou_records=lianou_records,
+        )
+        print(f"\n已生成: {summary['output']}")
+        print(f"  明细行: {summary['detailRows']}")
+        print(f"  医生数: {summary['doctors']}")
+        print(f"  莲藕匹配: {summary['lianouMatchedRows']} 行, 未匹配: {summary['lianouMissRows']} 行")
+        print(f"  合作/不合作: {summary['coopDoctors']} / {summary['nonCoopDoctors']}")
+        print(f"  执业医院: {summary['hospitals']} 家")
+        return 0
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+
 def cmd_check_elec_license(args: argparse.Namespace) -> int:
     """获取医生电子证照预览 URL + 申领状态（独立流程，不依赖执业医院明细）。"""
     try:
@@ -712,6 +816,11 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
     )
     export_reg.add_argument("--skip-main", action="store_true", help="跳过主执业导出")
     export_reg.add_argument("--skip-multi", action="store_true", help="跳过多执业导出")
+    export_reg.add_argument(
+        "--password",
+        default=None,
+        help="覆盖 config 中的机构端登录密码（也可用环境变量 MINKE_REG_PASSWORD）",
+    )
     export_reg.set_defaults(func=cmd_export_reg)
 
     fetch = subparsers.add_parser("fetch", parents=[common], help="Fetch Lianou doctors")
@@ -1001,3 +1110,41 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
         help="输出 xlsx 路径（默认 workspace/artifacts/elec_license_*.xlsx）",
     )
     elec.set_defaults(func=cmd_check_elec_license)
+
+    report = subparsers.add_parser(
+        "build-practice-hospital-report",
+        parents=[common],
+        help="机构端执业明细 + 莲藕 API 生成「医生执业医院信息」报告（不用 API 缓存）",
+    )
+    report.add_argument(
+        "--institution",
+        type=Path,
+        default=None,
+        help="机构端明细 xlsx（默认 workspace/artifacts/医生执业医院.xlsx）",
+    )
+    report.add_argument(
+        "--template",
+        type=Path,
+        default=None,
+        help="报告模板（保留互联网医院名单；默认 workspace/artifacts/医生执业医院信息.xlsx）",
+    )
+    report.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="输出路径（默认 workspace/artifacts/医生执业医院信息_20260706.xlsx）",
+    )
+    report.add_argument(
+        "--skip-institution-fetch",
+        action="store_true",
+        help="跳过机构端拉取，使用已有 医生执业医院.xlsx",
+    )
+    report.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="机构端并行预取线程数（默认按 CPU 推算）",
+    )
+    report.add_argument("--page-size", type=int, default=None, help="覆盖 doctorApi.pageSize")
+    report.add_argument("--max-pages", type=int, default=None, help="莲藕 API 仅拉前 N 页（调试用）")
+    report.set_defaults(func=cmd_build_practice_hospital_report)

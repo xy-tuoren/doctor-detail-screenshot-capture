@@ -29,6 +29,9 @@ MAIN_UI_HEADERS: tuple[str, ...] = (
     "医通办注册",
 )
 
+# 详情接口返回的 LastPassDate/PassTime 是「最近业务办理通过日期」，
+# 与 UI「审核日期」（列表接口 LastApprovalTime，备案审批日期）语义不同，
+# 不能用于 recordDate，故不在此提取。
 _DETAIL_FIELDS = (
     "IDCard",
     "WorkLicenceCode",
@@ -187,6 +190,8 @@ def enrich_main_rows(
 
 def format_main_row_ui(row: dict[str, str]) -> dict[str, str]:
     post_name = row.get("PostCpetName", "") or row.get("WorkCpetName", "")
+    # 审核日期只能来自列表接口的 LastApprovalTime（需 UI「获取最新」后全量模式才返回）。
+    # 详情接口的 LastPassDate/PassTime 是「最近业务办理通过日期」，语义不同，不能用。
     audit_raw = row.get("LastApprovalTime", "") or row.get("Add_UpdateApproval_Time", "")
     audit_value = format_audit_date(audit_raw)
     return {
@@ -197,7 +202,7 @@ def format_main_row_ui(row: dict[str, str]) -> dict[str, str]:
         "医师类别": row.get("Doctor_SortName", ""),
         "医师级别": row.get("Doctor_LevelName", ""),
         "执业范围": row.get("Subject_Name", ""),
-        "资格证书编码": row.get("CPETLicenceCode", ""),
+        "资格证书编码": row.get("CPETLicenceCode", "") or row.get("CpetCode", ""),
         "所在科室": "",
         "执业证书编码": row.get("WorkLicenceCode", ""),
         "任职资格": post_name,
@@ -205,4 +210,49 @@ def format_main_row_ui(row: dict[str, str]) -> dict[str, str]:
         "是否修改过信息": row.get("IfModified", ""),
         "审核日期": audit_value,
         "医通办注册": row.get("YtbRegStatus", ""),
+    }
+
+
+MULTI_UI_HEADERS: tuple[str, ...] = (
+    "姓名",
+    "身份证号",
+    "性别",
+    "年龄",
+    "医师类别",
+    "医师级别",
+    "执业范围",
+    "资格证书编码",
+    "执业证书编码",
+    "任职资格",
+    "开始日期",
+    "结束日期",
+    "执业医院",
+    "主执业医院",
+)
+
+
+def _iso_to_excel_serial(value: str) -> str | float:
+    dt = _parse_iso_datetime(value)
+    if dt is None:
+        return ""
+    return datetime_to_excel_serial(dt)
+
+
+def format_multi_row_ui(row: dict[str, str]) -> dict[str, str]:
+    post_name = row.get("PostCpetName", "") or row.get("WorkCpetName", "")
+    return {
+        "姓名": row.get("Doctor_Name", ""),
+        "身份证号": row.get("IDCard", ""),
+        "性别": row.get("Sex", ""),
+        "年龄": str(row.get("Age", "")),
+        "医师类别": row.get("Doctor_SortName", ""),
+        "医师级别": row.get("Doctor_LevelName", ""),
+        "执业范围": row.get("Subject_Name", ""),
+        "资格证书编码": row.get("CPETLicenceCode", ""),
+        "执业证书编码": row.get("WorkLicenceCode", ""),
+        "任职资格": post_name,
+        "开始日期": _iso_to_excel_serial(row.get("BeginDate", "")),
+        "结束日期": _iso_to_excel_serial(row.get("EndDate", "")),
+        "执业医院": row.get("MutiUnitName", "") or row.get("Unit_Name", ""),
+        "主执业医院": row.get("Unit_Name", ""),
     }
