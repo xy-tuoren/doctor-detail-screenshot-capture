@@ -942,6 +942,7 @@ def fetch_practice_table_parallel(
 
 ELEC_HEADERS: tuple[str, ...] = (
     "姓名",
+    "执业证书编码",
     "身份证号",
     "医师类别",
     "医师级别",
@@ -951,15 +952,89 @@ ELEC_HEADERS: tuple[str, ...] = (
 )
 
 
-def _find_reg_row(
+def parse_elec_doctor_query(raw: str) -> tuple[str, str | None]:
+    """解析 ``姓名`` 或 ``姓名:执业证书编号`` / ``姓名：执业证书编号``。"""
+    text = (raw or "").strip()
+    if not text:
+        return "", None
+    for sep in (":", "："):
+        if sep in text:
+            name, licence = text.split(sep, 1)
+            name = name.strip()
+            licence = licence.strip()
+            return name, licence or None
+    return text, None
+
+
+def _normalize_licence(code: str | None) -> str:
+    return (code or "").strip().upper()
+
+
+def _iter_name_matches(
     list_cache: dict[int, list[dict[str, str]]], name: str,
-) -> dict[str, str] | None:
-    """从已缓存列表里按姓名找注册行，优先主执业(st=1)，其次多执业含本院(st=8)。"""
+) -> list[dict[str, str]]:
+    """st=1 优先，再 st=8；同名单内保持接口返回顺序。"""
+    matched: list[dict[str, str]] = []
     for st in (1, 8):
-        rows = list_cache.get(st) or []
-        for r in rows:
-            if r.get("Doctor_Name") == name:
-                return r
+        for r in list_cache.get(st) or []:
+            if (r.get("Doctor_Name") or "").strip() == name:
+                matched.append(r)
+    return matched
+
+
+def _licence_on_row(
+    reg: dict,
+    session,
+    row: dict[str, str],
+    *,
+    fetch_detail_if_missing: bool,
+) -> str:
+    """读行上的执业证书编码；名单无该字段时可补一次详情。"""
+    code = (row.get("WorkLicenceCode") or "").strip()
+    if code:
+        return code
+    if not fetch_detail_if_missing:
+        return ""
+    detail = _detail_map(
+        reg,
+        session,
+        str(row.get("Doctor_GID", "")),
+        str(row.get("Doctor_RegisterGID", "")),
+    )
+    code = (detail.get("WorkLicenceCode") or "").strip()
+    if code:
+        row["WorkLicenceCode"] = code
+    return code
+
+
+def _find_reg_row(
+    list_cache: dict[int, list[dict[str, str]]],
+    name: str,
+    *,
+    work_licence: str | None = None,
+    reg: dict | None = None,
+    session=None,
+) -> dict[str, str] | None:
+    """按姓名定位注册行；提供执业证书编号时按「姓名+证号」唯一定位。
+
+    - 未给证号：兼容旧行为，取 st=1/8 中该姓名的首条
+    - 给了证号：在同名候选人中匹配 WorkLicenceCode；名单无证号时补拉详情
+    """
+    candidates = _iter_name_matches(list_cache, name)
+    if not candidates:
+        return None
+
+    want = _normalize_licence(work_licence)
+    if not want:
+        return candidates[0]
+
+    if reg is None or session is None:
+        raise ValueError("按执业证书编号匹配时需要 reg/session")
+
+    for r in candidates:
+        code = _licence_on_row(reg, session, r, fetch_detail_if_missing=True)
+        if _normalize_licence(code) == want:
+            return r
     return None
 
 
@@ -972,35 +1047,59 @@ def fetch_elec_license(
 ) -> tuple[int, Path]:
     """获取多名医生的电子证照预览 URL + 申领状态，写入 Excel。
 
-    只拉 st=1 / st=8 两个列表定位 Doctor_GID / Doctor_RegisterGID，
-    不拉详情、不拉多执业备案，与执业医院明细流程解耦。
+    ``doctor_names`` 每项可为 ``姓名`` 或 ``姓名:执业证书编号``。
+    带证号时按姓名+证号唯一定位；仅姓名时取该名在 st=1/8 的首条（兼容旧用法）。
     """
+    queries = [parse_elec_doctor_query(raw) for raw in doctor_names]
+    queries = [(n, lic) for n, lic in queries if n]
+    if not queries:
+        raise ValueError("请指定医生姓名（可选 姓名:执业证书编号）")
+
     reg = reg_cfg or _load_reg_cfg(config_path)
     session = login_minke_reg(reg)
 
     list_cache: dict[int, list[dict[str, str]]] = {}
     if on_progress:
-        on_progress(0, len(doctor_names), "预拉列表(st=1/8)")
+        on_progress(0, len(queries), "预拉列表(st=1/8)")
     for st in (1, 8):
         _fetch_list_for_other(reg, session, st, list_cache)
 
     rows_out: list[dict[str, str]] = []
-    for i, name in enumerate(doctor_names, 1):
+    for i, (name, licence) in enumerate(queries, 1):
+        label = f"{name}:{licence}" if licence else name
         if on_progress:
-            on_progress(i, len(doctor_names), name)
-        row = _find_reg_row(list_cache, name)
+            on_progress(i, len(queries), label)
+        row = _find_reg_row(
+            list_cache,
+            name,
+            work_licence=licence,
+            reg=reg,
+            session=session,
+        )
         if not row:
-            rows_out.append({"姓名": name, "查看电子证照": "", "是否已申领电子证照": "未找到该医生"})
+            miss = "未找到该医生（姓名+执业证书编号无匹配）" if licence else "未找到该医生"
+            rows_out.append(
+                {
+                    "姓名": name,
+                    "执业证书编码": licence or "",
+                    "查看电子证照": "",
+                    "是否已申领电子证照": miss,
+                }
+            )
             if on_progress:
-                on_progress(i, len(doctor_names), name, count=0, error="未找到")
+                on_progress(i, len(queries), label, count=0, error="未找到")
             continue
         doctor_gid = str(row.get("Doctor_GID", ""))
         register_gid = str(row.get("Doctor_RegisterGID", ""))
+        resolved_licence = _licence_on_row(
+            reg, session, row, fetch_detail_if_missing=bool(licence)
+        ) or (licence or "")
         elec_url = make_electronic_license_url(doctor_gid, register_gid)
         applied = check_elec_applied(elec_url)
         rows_out.append(
             {
                 "姓名": name,
+                "执业证书编码": resolved_licence,
                 "身份证号": row.get("IDCard", ""),
                 "医师类别": row.get("Doctor_SortName", ""),
                 "医师级别": row.get("Doctor_LevelName", ""),
@@ -1010,13 +1109,13 @@ def fetch_elec_license(
             }
         )
         if on_progress:
-            on_progress(i, len(doctor_names), name, count=1, error=applied or None)
+            on_progress(i, len(queries), label, count=1, error=applied or None)
 
     if output_path is None:
         output_path = Path("workspace/artifacts") / (
-            f"elec_license_batch{len(doctor_names)}.xlsx"
-            if len(doctor_names) > 1
-            else f"elec_license_{doctor_names[0]}.xlsx"
+            f"elec_license_batch{len(queries)}.xlsx"
+            if len(queries) > 1
+            else f"elec_license_{queries[0][0]}.xlsx"
         )
     out_path = Path(output_path)
     wb = Workbook()
@@ -1029,7 +1128,16 @@ def fetch_elec_license(
         cell.alignment = Alignment(horizontal="center", vertical="center")
     for r in rows_out:
         ws.append([r.get(h, "") for h in ELEC_HEADERS])
-    widths = {"姓名": 8, "身份证号": 20, "医师类别": 8, "医师级别": 10, "执业范围": 12, "查看电子证照": 60, "是否已申领电子证照": 16}
+    widths = {
+        "姓名": 8,
+        "执业证书编码": 22,
+        "身份证号": 20,
+        "医师类别": 8,
+        "医师级别": 10,
+        "执业范围": 12,
+        "查看电子证照": 60,
+        "是否已申领电子证照": 22,
+    }
     for col_idx, h in enumerate(ELEC_HEADERS, 1):
         ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = widths.get(h, 12)
     ws.freeze_panes = "A2"

@@ -299,28 +299,37 @@ python -m src.cli build-practice-hospital-report --skip-institution-fetch
 
 ## 独立流程：电子证照（`check-elec-license`）
 
-与执业医院明细流程**解耦**的独立命令，只生成电子证照预览 URL 并检测申领状态，不拉详情、不拉多执业备案。
+与执业医院明细流程**解耦**的独立命令，只生成电子证照预览 URL 并检测申领状态，不拉多执业备案。
 
 ### 数据来源
 
 | 来源 | 作用 |
 |------|------|
-| `DoctorUnitGetListForOther` (st=1/8) | 按姓名定位 `Doctor_GID` / `Doctor_RegisterGID`（优先主执业 st=1，其次多执业含本院 st=8） |
+| `DoctorUnitGetListForOther` (st=1/8) | 按姓名（可选再加执业证书编号）定位 `Doctor_GID` / `Doctor_RegisterGID`（优先主执业 st=1，其次多执业含本院 st=8） |
+| `GetRegDetailForUnit`（仅当名单无证号且查询带了证号时） | 补齐 `WorkLicenceCode` 以便「姓名+证号」匹配 |
 | `make_electronic_license_url`（本地 AES-128-CBC） | 用 GID 拼对生成 `https://license.wsb003.cn/license/doctor?ty=d&encry=...&f=D_U` |
 | HTTP GET 该 URL + 解析 `<title>` | title 含 `--` 与 `信息展示` 视为「已申领」，否则「未申领」；按 URL 缓存结果 |
+
+### 定位规则
+
+| 入参 | 行为 |
+|------|------|
+| `姓名` | 兼容旧用法：取该姓名在 st=1/8 的首条 |
+| `姓名:执业证书编号`（也支持中文冒号 `：`） | 在同名候选人中按 `WorkLicenceCode` 唯一定位；名单无证号字段时补拉详情再比 |
 
 ### 命令
 
 ```powershell
 python -m src.cli check-elec-license 艾勇 白广同
-python -m src.cli check-elec-license 艾勇 --output workspace/artifacts/elec.xlsx
+python -m src.cli check-elec-license 艾勇:110230100008430
+python -m src.cli check-elec-license 艾勇:110230100008430 白广同:210370523000252 --output workspace/artifacts/elec.xlsx
 ```
 
 ### 产出
 
 `workspace/artifacts/elec_license_*.xlsx`（单医生 `elec_license_艾勇.xlsx`；批量 `elec_license_batchN.xlsx`）。
 
-列：姓名、身份证号、医师类别、医师级别、执业范围、查看电子证照、是否已申领电子证照。未在 st=1/st=8 列表中找到的医生，"是否已申领电子证照"填「未找到该医生」。
+列：姓名、执业证书编码、身份证号、医师类别、医师级别、执业范围、查看电子证照、是否已申领电子证照。未匹配时「是否已申领电子证照」填「未找到该医生」或「未找到该医生（姓名+执业证书编号无匹配）」。
 
 ### 依赖
 

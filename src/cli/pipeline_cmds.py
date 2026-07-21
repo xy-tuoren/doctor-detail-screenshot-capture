@@ -1101,7 +1101,7 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
     elec.add_argument(
         "names",
         nargs="+",
-        help="医生姓名列表",
+        help="医生查询项：姓名，或 姓名:执业证书编号（同名时用证号唯一定位）",
     )
     elec.add_argument(
         "--output",
