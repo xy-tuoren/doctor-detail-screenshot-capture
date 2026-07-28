@@ -96,7 +96,7 @@ def cmd_export_reg(args: argparse.Namespace) -> int:
         print(f"登录成功：{session.organ_name or session.login_id}")
 
         if not args.skip_main:
-            print("正在拉取主执业列表并补全证号...")
+            print("正在拉取主执业列表并补全任职资格...")
             sheets = export_main_records(cfg, session)
             main_out = reg_default_output_path(cfg, "主执业")
             total = save_reg_workbook(sheets, main_out)
@@ -211,6 +211,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             f"createOps={summary.get('createOps', 0)} "
             f"updateOps={summary.get('updateOps', 0)} "
             f"submitOps={summary.get('submitOps', 0)} "
+            f"skippedDisabled={summary.get('skippedDisabled', 0)} "
+            f"exportMatchedDisabled={summary.get('exportMatchedDisabled', 0)} "
             f"lianouOnly={summary.get('lianouOnly', 0)} "
             f"(noCert={summary.get('missingNoCert', 0)} "
             f"notInExport={summary.get('missingNotInExport', 0)} "
@@ -632,7 +634,10 @@ def cmd_build_practice_hospital_report(args: argparse.Namespace) -> int:
     """机构端执业明细 + 莲藕 API 实时拉取，生成「医生执业医院信息」四 sheet 报告。"""
     try:
         from src.api.doctor_medical import fetch_all_records
-        from src.minke_reg.practice_hospital_report import run_build_practice_hospital_report
+        from src.minke_reg.practice_hospital_report import (
+            default_report_output_path,
+            run_build_practice_hospital_report,
+        )
         from src.minke_reg.practice_table import (
             all_doctor_names,
             default_workers,
@@ -646,7 +651,7 @@ def cmd_build_practice_hospital_report(args: argparse.Namespace) -> int:
         artifacts = workspace / "artifacts"
         institution_path = getattr(args, "institution", None) or (artifacts / "医生执业医院.xlsx")
         template_path = getattr(args, "template", None) or (artifacts / "医生执业医院信息.xlsx")
-        output_path = args.output or (artifacts / "医生执业医院信息_20260706.xlsx")
+        output_path = args.output or default_report_output_path(artifacts)
 
         if not template_path.exists():
             print(f"[ERROR] 模板不存在: {template_path}", file=sys.stderr)
@@ -754,6 +759,45 @@ def cmd_check_elec_license(args: argparse.Namespace) -> int:
             on_progress=on_progress,
         )
         print(f"\n共 {total} 名医生 → {out_path}")
+        return 0
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_fetch_business_list(args: argparse.Namespace) -> int:
+    """拉取机构端「业务办理」三档列表（SearchListOfBusiness），独立于核对主线。"""
+    try:
+        from src.minke_reg.business_list import fetch_business_lists_to_xlsx
+
+        audits = list(args.audit) if args.audit else None
+        months = int(args.months)
+
+        def on_progress(label: str, audit: int, count: int) -> None:
+            if audit < 0:
+                print(f"  {label}: {count} 条", flush=True)
+            else:
+                print(f"  {label} (aAudit={audit}): {count} 条", flush=True)
+
+        print(
+            f"正在拉取业务办理列表（近 {months} 个月"
+            + (f"，aAudit={audits}" if audits else "，三档全量")
+            + ")...",
+            flush=True,
+        )
+        counts, out_path = fetch_business_lists_to_xlsx(
+            config_path=args.config,
+            audits=audits,
+            months=months,
+            name=args.name or "",
+            busi_type=args.busi_type or "",
+            id_card=args.id_card or "",
+            include_types=bool(args.include_types),
+            output_path=args.output,
+            on_progress=on_progress,
+        )
+        total = sum(counts.values())
+        print(f"\n共 {total} 条 → {out_path}")
         return 0
     except Exception as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
@@ -1111,6 +1155,51 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
     )
     elec.set_defaults(func=cmd_check_elec_license)
 
+    business = subparsers.add_parser(
+        "fetch-business-list",
+        parents=[common],
+        help="拉取机构端业务办理列表（SearchListOfBusiness，独立流程）",
+    )
+    business.add_argument(
+        "--months",
+        type=int,
+        default=1,
+        help="时间段月数（对应 UI「最近 N 个月」，默认 1）",
+    )
+    business.add_argument(
+        "--audit",
+        type=int,
+        nargs="+",
+        choices=(0, 1, 2),
+        default=None,
+        help="只拉指定 aAudit：0 待机构确认 / 1 正在申办 / 2 已完成；默认三档都拉",
+    )
+    business.add_argument("--name", default="", help="按姓名筛选（可选）")
+    business.add_argument(
+        "--busi-type",
+        default="",
+        dest="busi_type",
+        help="按业务类型筛选（可选，空=全部）",
+    )
+    business.add_argument(
+        "--id-card",
+        default="",
+        dest="id_card",
+        help="按身份证号筛选（可选）",
+    )
+    business.add_argument(
+        "--include-types",
+        action="store_true",
+        help="额外写入「业务类型字典」sheet（GetBusinessType）",
+    )
+    business.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="输出 xlsx（默认 workspace/artifacts/业务办理列表_*_近N月.xlsx）",
+    )
+    business.set_defaults(func=cmd_fetch_business_list)
+
     report = subparsers.add_parser(
         "build-practice-hospital-report",
         parents=[common],
@@ -1132,7 +1221,7 @@ def add_pipeline_commands(subparsers: argparse._SubParsersAction) -> None:
         "--output",
         type=Path,
         default=None,
-        help="输出路径（默认 workspace/artifacts/医生执业医院信息_20260706.xlsx）",
+        help="输出路径（默认 workspace/artifacts/医生执业医院信息_YYYYMMDD.xlsx，当天日期）",
     )
     report.add_argument(
         "--skip-institution-fetch",

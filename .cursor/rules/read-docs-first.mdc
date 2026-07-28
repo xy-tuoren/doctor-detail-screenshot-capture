@@ -1,0 +1,46 @@
+---
+description: 开发或分析前必须先读项目文档，禁止凭猜测理解业务口径
+alwaysApply: true
+---
+
+# 先读文档，再开发
+
+涉及本仓库的**任何开发、分析、统计、调试**，必须先阅读相关文档，再写代码或下结论。禁止跳过文档直接凭代码/经验推断业务规则。
+
+## 必读文档（按任务选读）
+
+| 任务 | 先读 |
+|------|------|
+| 任何改动 | `AGENTS.md`（管线、术语、目录约定、安全默认） |
+| 核对 / to_submit / 字段映射 / 「数据是否拿全」 | `AGENTS.md` 核对章节 + `docs/adr/0001-updatefield-driven-completion-pipeline.md` + `docs/adr/0004-field-mapping-rules.md` |
+| 日期 / recordDate / recordExpireDate | `docs/adr/0003-main-practice-record-date-from-review-date.md` + `src/reconcile/field_mapping.py` |
+| 匹配 / operationType / docMedicalList | `docs/adr/0008-cert-match-docmedical-operationtype.md` |
+| 写回 / submit / fill-images | `docs/adr/0006-writeback-via-update-doctor-medical.md` + `医生医疗机构接口文档.md` |
+| 采图 / OCR / 截图命名 | `AGENTS.md` 机构端 UI 自动化章节 |
+| 执业医院信息报告 / 全量 SOAP 长任务 | `AGENTS.md` → `build-practice-hospital-report` → **执行方式（Agent 禁止前台 Shell 跑）** |
+| 业务办理列表（申办/审批） | `AGENTS.md` → `fetch-business-list` + `src/minke_reg/business_list.py` |
+
+## 执行顺序
+
+1. **定位任务**属于哪条管线或模块（reconcile / capture / fill-images / submit 等）。
+2. **阅读上表对应文档**，确认术语、字段口径、产出路径。
+3. **再读**将要修改的源码（`src/reconcile/`、`src/capture/` 等）。
+4. **最后**才写代码、跑脚本或回答用户。
+
+若文档与代码不一致，以文档 + ADR 为准，或先向用户说明差异再改。
+
+## 关键口径（易错，文档里有详细说明）
+
+- **`updateField` 驱动**：`to_submit.json` 里有什么字段才提交什么；不在其中的字段（含被 dropped 的 `recordDate`）**不算缺失**。
+- **日期 dropped**：莲藕点名缺 `recordDate` 但机构端导出无对应日期 → reconcile 丢弃，条目仍可提交。
+- **主执业**：不写 `recordExpireDate`（`MAIN_PRACTICE_EXCLUDED_FIELDS`）。
+- **匹配**：必须姓名 + 执业证书编号双字段，禁止仅姓名或仅身份证。
+- **写回范围**：仅「莲藕健康医院」生成 `to_submit` 条目。
+- **危险操作**：禁止对 `workspace/`、`captures/` 使用通配符批量删除。
+- **Agent 长任务**：`build-practice-hospital-report` 等 >10 分钟任务，Agent 禁止用前台 Shell 跑（易超时），提示用户在集成终端执行。
+
+## 禁止
+
+- 未读 `AGENTS.md` 就分析 `to_submit.json` 是否「拿全」。
+- 自行发明「必须同时有机构端图 + 卫健委图」或「必须有日期字段」等文档未规定的判定标准。
+- 修改 `config.json` 或提交含密钥的文件。

@@ -91,7 +91,7 @@ MONGO_URI=mongodb://USER:PASS@HOST:27017/hospital_admin?authSource=hospital_admi
 | 文件 | 含义 |
 |------|------|
 | `workspace/artifacts/医生执业医院.xlsx` | 机构端全量明细（中间结果） |
-| `workspace/artifacts/医生执业医院信息_20260706.xlsx` | 四 sheet 报告（含莲藕档案列） |
+| `workspace/artifacts/医生执业医院信息_YYYYMMDD.xlsx` | 四 sheet 报告（含莲藕档案列，按当天日期命名） |
 | 运行时模板（本机） | `workspace/artifacts/医生执业医院信息.xlsx`（可含历史数据；生成时覆盖数据区） |
 | **仓库内精简模板（可提交）** | `templates/医生执业医院信息.xlsx`（四 sheet + 互联网医院 A–G 名单，无明细数据） |
 
@@ -114,11 +114,11 @@ MONGO_URI=mongodb://USER:PASS@HOST:27017/hospital_admin?authSource=hospital_admi
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\export_practice_report_to_mongo.py `
-  -x workspace/artifacts/医生执业医院信息_20260706.xlsx
+  -x workspace/artifacts/医生执业医院信息_20260721.xlsx
 
 # 若要先清空旧明细与批次（互联网医院主数据不动）
 .\.venv\Scripts\python.exe scripts\export_practice_report_to_mongo.py `
-  -x workspace/artifacts/医生执业医院信息_20260706.xlsx `
+  -x workspace/artifacts/医生执业医院信息_20260721.xlsx `
   --drop-existing
 ```
 
@@ -138,7 +138,7 @@ Python 参考：`src/minke_reg/practice_hospital_report.py`（复制模板 → �
 
 | 场景 | 建议路径 |
 |------|----------|
-| 本仓库 CLI | `workspace/artifacts/医生执业医院信息_20260706.xlsx`（历史固定名，每次覆盖） |
+| 本仓库 CLI | `workspace/artifacts/医生执业医院信息_YYYYMMDD.xlsx`（按当天日期；同日多次运行会覆盖） |
 | hospital-admin | 如 `data/exports/医生执业医院信息_YYYYMMDD_HHmmss.xlsx`，并在 `importReports.sourceXlsx` 记录路径 |
 
 ### 模板文件
@@ -157,6 +157,8 @@ Python 参考：`src/minke_reg/practice_hospital_report.py`（复制模板 → �
 |----|------|
 | A–Q | 机构端：姓名、身份证号、执业证书编码、性别、医师类别、医师级别、执业范围、任职资格、审批日期、开始日期、结束日期、是否主执业机构、是否省外、执业医院、医院地址、省份、数据来源 |
 | R–T | 莲藕：档案编号、档案状态（启用/停用）、所属团队 |
+
+仅多执业入选时，会补一条真实主执业医院行（`isMainPractice=true`，`practiceHospital`=UI「主执业机构」），本院多执业行仍为 `false`。
 
 #### Sheet「医生执业医院数」
 
@@ -399,7 +401,9 @@ Worker 机器另需：
 | 路径 | 说明 |
 |------|------|
 | `src/cli/pipeline_cmds.py` → `build-practice-hospital-report` | 报告 CLI 入口 |
+| `src/cli/pipeline_cmds.py` → `fetch-business-list` | 业务办理列表 CLI（独立流程） |
 | `src/minke_reg/practice_table.py` | 机构端 SOAP 明细 |
+| `src/minke_reg/business_list.py` | `SearchListOfBusiness` 业务办理列表 |
 | `src/minke_reg/practice_hospital_report.py` | 拼报告、莲藕 join |
 | `src/minke_reg/session.py` / `soap.py` | 登录与 SOAP 客户端 |
 | `scripts/export_practice_report_to_mongo.py` | xlsx → Mongo |

@@ -4,6 +4,8 @@
 
 **CLI 入口**：`python -m src.cli <子命令>`（默认读取项目根目录 `config.json`）
 
+独立 SOAP 能力（不进核对主线）还包括：`fetch-practice-table`、`build-practice-hospital-report`、`check-elec-license`、**`fetch-business-list`**（机构端业务办理申办/审批列表，见下文）。
+
 ---
 
 ## 快速开始
@@ -244,6 +246,8 @@ python -m src.cli fetch-practice-table --all --workers 16
 
 列：姓名、身份证号、**执业证书编码**、性别、医师类别、医师级别、执业范围、任职资格、审批日期、开始日期、结束日期、是否主执业机构、是否省外、执业医院、医院地址、省份、数据来源。
 
+仅多执业入选（st=8）时，会额外用列表「主执业机构」(`Unit_Name`) 补一条「是否主执业机构=是」的主执业行，避免只有本院多执业行被标成「否」。
+
 ### 容错
 
 会话失效（"非法的用户身份"）时自动重新登录、清空列表缓存重新预拉，并重试当前医生一次。
@@ -270,7 +274,7 @@ python -m src.cli fetch-practice-table --all --workers 16
 
 ### 产出
 
-默认 `workspace/artifacts/医生执业医院信息_20260706.xlsx`（四 sheet：全量明细、医生执业医院数、互联网医院重叠数、医院重叠数）。
+默认 `workspace/artifacts/医生执业医院信息_YYYYMMDD.xlsx`（当天日期，如 `医生执业医院信息_20260721.xlsx`；四 sheet：全量明细、医生执业医院数、互联网医院重叠数、医院重叠数）。
 
 ### 执行方式（Agent 必读）
 
@@ -334,6 +338,60 @@ python -m src.cli check-elec-license 艾勇:110230100008430 白广同:2103705230
 ### 依赖
 
 `pycryptodome`（AES），在 `capture-institution` extra 内；单独使用须 `pip install pycryptodome`。
+
+---
+
+## 独立流程：业务办理列表（`fetch-business-list`）
+
+与核对/采图/写回主线**完全独立**。对应机构端客户端「业务办理」菜单下的申办/审批列表，经 SOAP 拉取后导出 Excel，不写回莲藕。
+
+### 用途
+
+- 盘点本院待机构确认、正在申办、已完成审批的业务单
+- 取得申请日期、机构/行政部门审核状态与时间、业务类型等
+
+### 数据来源（全 SOAP）
+
+| 接口 | 作用 |
+|------|------|
+| `SearchListOfBusiness` | 业务列表；`aAudit` 分档，`aMonths` 对应 UI「最近 N 个月」 |
+| `GetBusinessType`（可选 `--include-types`） | 「医师申请业务办理」用的业务类型字典 |
+
+`aAudit` 与 UI 对应关系：
+
+| aAudit | Sheet 名 | 含义 |
+|--------|----------|------|
+| 0 | 待机构确认 | `FlagUnitAuditDesc=等待机构确认` |
+| 1 | 正在申办 | 机构已确认 / 等待行政部门审批（UI「医师正在申办的业务列表」） |
+| 2 | 已完成审批 | 已完成；通常有 `ApprovalTime_Org`（UI「已完成审批业务列表」） |
+
+### 命令
+
+```powershell
+# 默认：近 1 个月，三档都拉
+python -m src.cli fetch-business-list
+
+# 只拉正在申办 + 已完成，近 3 个月
+python -m src.cli fetch-business-list --audit 1 2 --months 3
+
+# 按姓名筛选，并附带业务类型字典
+python -m src.cli fetch-business-list --name 齐彬彬 --include-types
+
+# 指定输出
+python -m src.cli fetch-business-list --output workspace/artifacts/业务办理.xlsx
+```
+
+### 产出
+
+默认 `workspace/artifacts/业务办理列表_YYYYMMDD_HHMMSS_近N月.xlsx`。
+
+Sheet：汇总、待机构确认_aAudit0、正在申办_aAudit1、已完成审批_aAudit2；（可选）业务类型字典。
+
+主要列：姓名、身份证号、业务类型、申请日期、机构/行政部门审核状态与时间、确认机构、审批机关、业务编号、`Bis_ID` / `Bis_GID` 等。
+
+### 依赖
+
+`openpyxl`（与 `fetch-practice-table` 相同）。
 
 ---
 
@@ -406,6 +464,7 @@ python -m src.cli run-automation verify-captures
 - **`_capture` / `_op`**：采图定位用，**不提交**接口
 
 生成规则：
+- 莲藕档案 **`staus=1`（停用）** → **不写入** `to_submit.json`（不采图、不写回），也**不进入**两份未匹配名单；仅 `staus=0` 启用（或字段缺失）继续后续规则
 - docMedicalList **缺「莲藕健康医院」** → `operationType=0` 新增
 - docMedicalList **仅有「莲藕健康医院」**且其 `updateField` 非空 → `operationType=1` 更新；图片字段空字符串表示待采图
 - **其它医院**（即使有点名缺失字段）→ **不写入** `to_submit.json`，`submit` / `fill-images` 亦跳过
@@ -413,9 +472,9 @@ python -m src.cli run-automation verify-captures
 
 **莲藕健康医院**：本院在 docMedicalList 中的固定医院名。
 
-**未匹配名单**（`workspace/artifacts/reconcile_report.xlsx`，每次覆盖）：
-- sheet `莲藕有机构端无`：双字段无法匹配（含无证书号、导出无此证、姓名不一致）
-- sheet `机构端有莲藕无`：导出有、莲藕无对应证书号
+**未匹配名单**（`workspace/artifacts/reconcile_report.xlsx`，每次覆盖；均以**启用档案**为口径）：
+- sheet `莲藕有机构端无`：启用档案双字段无法匹配（含无证书号、导出无此证、姓名不一致）；停用不上名单
+- sheet `机构端有莲藕无`：导出有、莲藕无对应**启用**证书号；若莲藕仅有停用档案对应同一证书，不算「莲藕无」（摘要 `exportMatchedDisabled`）
 
 ### 工作区产物
 
@@ -461,7 +520,7 @@ OCR 与校验均按**执业证书编号**，非身份证。
 | 用途 | 莲藕 | 机构端导出 |
 |------|------|------------|
 | 匹配 | `doctorName` + `practicingCertCode` | 「姓名」+「执业证书编码」 |
-| 科室 | `professionalList` | 「执业范围」（`,`/`，` → `;`）+「医师类别」→`professionalType` |
+| 科室 | `professionalList` | 「执业范围」（`,`/`，` → `;`）+「医师类别」→`professionalType`；单项为「公共卫生类别专业」时强制 `professionalType=4` |
 | 主执业备案日 | `recordDate` | 「审核日期」 |
 | 多执业起止 | `recordDate` / `recordExpireDate` | 「开始日期」/「结束日期」 |
 | 执业类型 | `medicalInstitutionType` | 主=1，多=2（由匹配表推断） |
