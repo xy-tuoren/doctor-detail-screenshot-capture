@@ -102,9 +102,9 @@ def fetch_main_list_ex(
 ) -> list[dict[str, str]]:
     """调 DoctorUnitGetListEx：无需 md5，直接返回含 WorkLicenceCode/CpetCode 的全量列表。
 
-    与 fetch_main_list_for_export 相比省掉 N 次 GetRegDetailForUnit 详情调用，
-    但不返回审核日期（LastApprovalTime 仍需 UI「获取最新」后的全量模式），
-    也不返回任职资格（PostCpetName，reconcile 不用此字段）。
+    与 fetch_main_list_for_export 相比列表本身不含审核日期 / 任职资格。
+    审核日期（LastApprovalTime）仍需 UI「获取最新」后的全量模式；
+    任职资格由 export_main_records 在 GetListEx 后按需 enrich（GetRegDetailForUnit）。
     """
     client = SoapClient(
         str(cfg["docUnitServiceUrl"]),

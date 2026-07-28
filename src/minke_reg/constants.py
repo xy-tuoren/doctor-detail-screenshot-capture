@@ -56,6 +56,9 @@ DEFAULT_MINKE_REG_CONFIG = {
 
     "useDoctorUnitGetListForOther": False,
 
+    # GetListEx 后是否再调 GetRegDetailForUnit 补任职资格（PostCpetName）。默认开。
+    "mainEnrichDetail": True,
+
     "detailFetchWorkers": 48,
 
     "detailFetchRetries": 2,

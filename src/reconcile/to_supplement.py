@@ -128,6 +128,12 @@ def postable_body(payload: dict[str, Any], *, include_images: bool = True) -> di
             continue
         if value is None:
             value = ""
+        if key == "professionalList":
+            from src.reconcile.field_mapping import coerce_professional_list_types
+
+            value = coerce_professional_list_types(value)
+            if not value and not create:
+                continue
         body[key] = value
 
     return body

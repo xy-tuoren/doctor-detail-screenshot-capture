@@ -4,7 +4,7 @@ r"""将「医生执业医院信息」xlsx 导入 MongoDB（仅源数据 + 互联
 
     $env:MONGO_URI = "mongodb://hospital_admin_user:***@43.138.254.94:27017/hospital_admin?authSource=hospital_admin"
     & .venv\Scripts\python.exe scripts\export_practice_report_to_mongo.ps1 `
-        -XlsxPath "workspace/artifacts/医生执业医院信息_20260706.xlsx"
+        -XlsxPath "workspace/artifacts/医生执业医院信息_20260721.xlsx"
 
 Collection 设计（数据库 hospital_admin）：
 

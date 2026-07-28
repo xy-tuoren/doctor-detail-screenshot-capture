@@ -49,10 +49,13 @@ def fetch_doctor_unit_list_for_other(
 
 def export_main_records(cfg: dict[str, Any], session: MinkeSession) -> dict[str, list[dict[str, str]]]:
     search_type = int(cfg.get("mainSearchType", 1))
-    # 默认走 DoctorUnitGetListEx：直接返回含 WorkLicenceCode/CpetCode 的列表，省掉 N 次详情调用。
-    # 配置 mainUseGetListEx=false 时回退到旧路径（DoctorUnitGetList + enrich，仍拿不到审核日期）。
+    # 默认走 DoctorUnitGetListEx：直接返回含 WorkLicenceCode/CpetCode 的列表。
+    # GetListEx 不含任职资格；默认再调 GetRegDetailForUnit 补 PostCpetName（mainEnrichDetail）。
+    # 配置 mainUseGetListEx=false 时回退到 DoctorUnitGetList + enrich（仍拿不到审核日期）。
     if cfg.get("mainUseGetListEx", True):
         rows = fetch_main_list_ex(cfg, session, search_type)
+        if cfg.get("mainEnrichDetail", True):
+            rows = enrich_main_rows(cfg, session, rows)
     else:
         rows = fetch_main_list_for_export(cfg, session, search_type)
         rows = enrich_main_rows(cfg, session, rows)

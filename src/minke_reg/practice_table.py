@@ -542,6 +542,85 @@ def _prefetch_muti(
     return holder
 
 
+def _ensure_main_practice_row(
+    out: list[dict[str, str]],
+    per_st: dict[int, list[dict[str, str]]],
+    detail_cache: dict[tuple[str, str], dict[str, str]],
+    profile: dict[str, str],
+) -> None:
+    """若明细里还没有「是否主执业机构=是」的行，用多执业列表的主执业机构名补一条。
+
+    st=8 只产出「本院多执业」行（否）；UI「主执业机构」列的 Unit_Name 才是真实主执业，
+    此前未落成独立行，导致大量医生看起来主执业全是「否」。
+    """
+    if any(r.get("是否主执业机构") == "是" for r in out):
+        return
+    for r in per_st.get(8) or []:
+        unit_main = str(r.get("Unit_Name") or "").strip()
+        if not unit_main:
+            continue
+        dg, rg = str(r.get("Doctor_GID", "")), str(r.get("Doctor_RegisterGID", ""))
+        detail = detail_cache.get((dg, rg)) or {}
+        base = _base_from_list(r, detail)
+        for key in ("身份证号", "性别", "任职资格"):
+            if not base.get(key) and profile.get(key):
+                base[key] = profile[key]
+        hospital = (detail.get("UnitName") or unit_main).strip()
+        province = _normalize_province(detail.get("AreaName") or r.get("AreaName", ""))
+        if not province:
+            province = HOME_PROVINCE if hospital == HOME_UNIT else ""
+        audit = detail.get("LastPassDate", "")
+        out.insert(
+            0,
+            {
+                **base,
+                "审批日期": _iso_date(str(audit)) if audit else "",
+                "开始日期": "",
+                "结束日期": "",
+                "是否主执业机构": "是",
+                "是否省外": "是" if province and province != HOME_PROVINCE else "否",
+                "执业医院": hospital,
+                "医院地址": detail.get("UnitAddress", ""),
+                "省份": province or HOME_PROVINCE,
+                "数据来源": "主执业机构",
+            },
+        )
+        return
+    # 仅有本院多机构备案(st=9)、无 st=1 时，主执业为本院
+    if not (per_st.get(9) or []):
+        return
+    seed = (per_st.get(9) or [None])[0]
+    if not seed:
+        return
+    dg, rg = str(seed.get("Doctor_GID", "")), str(seed.get("Doctor_RegisterGID", ""))
+    detail = detail_cache.get((dg, rg)) or {}
+    base = _base_from_list(seed, detail)
+    for key in ("身份证号", "性别", "任职资格"):
+        if not base.get(key) and profile.get(key):
+            base[key] = profile[key]
+    hospital = (detail.get("UnitName") or seed.get("Unit_Name") or HOME_UNIT).strip()
+    audit = (
+        seed.get("LastApprovalTime")
+        or seed.get("Add_UpdateApproval_Time")
+        or detail.get("LastPassDate", "")
+    )
+    out.insert(
+        0,
+        {
+            **base,
+            "审批日期": _iso_date(str(audit)) if audit else "",
+            "开始日期": "",
+            "结束日期": "",
+            "是否主执业机构": "是",
+            "是否省外": "否",
+            "执业医院": hospital or HOME_UNIT,
+            "医院地址": detail.get("UnitAddress", ""),
+            "省份": HOME_PROVINCE,
+            "数据来源": "主执业机构在本院",
+        },
+    )
+
+
 def _assemble_rows_for_doctor(
     reg: dict,
     session,
@@ -608,6 +687,7 @@ def _assemble_rows_for_doctor(
             elif kind == "multi_at_home":
                 # st=8：外院医生来本院多执业。执业医院=本院(MutiUnitName)，
                 # 医院地址=本院地址（非外院 detail 地址）；备案审批日期接口不返回，留空。
+                # 真实主执业医院见 Unit_Name，由 _ensure_main_practice_row 补「是」行。
                 out.append(
                     {
                         **base,
@@ -677,6 +757,14 @@ def _assemble_rows_for_doctor(
                             "数据来源": f"多执业机构备案（主执业:{hospital}）",
                         }
                     )
+
+    # 仅多执业入选、从未落过主执业行时，用列表「主执业机构」补一条「是」
+    if not profile:
+        for r in (per_st.get(8) or per_st.get(9) or []):
+            dg, rg = str(r.get("Doctor_GID", "")), str(r.get("Doctor_RegisterGID", ""))
+            profile = _base_from_list(r, detail_cache.get((dg, rg)) or {})
+            break
+    _ensure_main_practice_row(out, per_st, detail_cache, profile)
 
     # 全局去重
     seen_muti: set[tuple] = set()

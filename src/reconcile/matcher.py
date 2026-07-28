@@ -53,6 +53,19 @@ def extract_practicing_cert(record: dict[str, Any]) -> str:
     return ""
 
 
+def is_archive_disabled(record: dict[str, Any]) -> bool:
+    """莲藕档案停用：``staus == 1``（接口字段名即为 staus；0=启用）。"""
+    raw = record.get("staus")
+    if raw is None and "status" in record:
+        raw = record.get("status")
+    if raw is None or raw == "":
+        return False
+    try:
+        return int(raw) == 1
+    except (TypeError, ValueError):
+        return str(raw).strip() in {"1", "停用"}
+
+
 def _doc_hospital(item: dict[str, Any]) -> str:
     """docMedicalList 元素的执业医院名：优先 hospitalName（新接口），回退 hospital（旧接口/缓存）。"""
     return normalize_name(item.get("hospitalName") or item.get("hospital"))
@@ -221,9 +234,11 @@ def reconcile_doctors(
 ) -> dict[str, Any]:
     """以执业证书编号 + 姓名核对莲藕与机构端导出。
 
-    - 莲藕无 practicingCertCode、导出无该证书号、或姓名不一致 → 莲藕未匹配名单。
-    - 双匹配成功 → 按 docMedicalList 生成 CREATE/UPDATE 操作。
-    - 机构端导出有、莲藕无对应证书号 → 机构端未匹配名单。
+    - 莲藕无 practicingCertCode、导出无该证书号、或姓名不一致 → 莲藕未匹配名单（仅启用档案）。
+    - 双匹配成功且档案启用 → 按 docMedicalList 生成 CREATE/UPDATE 操作。
+    - 机构端导出有、莲藕无对应**启用**证书号 → 机构端未匹配名单；
+      若莲藕仅有停用档案对应，不算「莲藕无」（从该名单剔除）。
+    - ``staus=1`` 停用：不进 to_submit、不进两份未匹配名单。
     """
     main_index: dict[str, dict[str, Any]] = export_index.get("main", {})
     multi_index: dict[str, list[dict[str, Any]]] = export_index.get("multi", {})
@@ -232,17 +247,27 @@ def reconcile_doctors(
     lianou_only: list[dict[str, str]] = []
 
     matched_certs: set[str] = set()
+    disabled_certs: set[str] = set()
     lianou_certs: set[str] = set()
 
     missing_no_cert = 0
     missing_not_in_export = 0
     name_mismatch = 0
+    skipped_disabled = 0
     matched_doctors = 0
     create_ops = 0
     update_ops = 0
     dropped_fields: Counter = Counter()
 
     for doctor in doctors:
+        if is_archive_disabled(doctor):
+            # 停用：不进 to_submit / 未匹配名单；证书记入 disabled_certs，避免误进「机构端有莲藕无」
+            skipped_disabled += 1
+            disabled_cert = extract_practicing_cert(doctor)
+            if disabled_cert:
+                disabled_certs.add(disabled_cert)
+            continue
+
         cert = extract_practicing_cert(doctor)
         doctor_name = extract_doctor_name(doctor)
         doctor_file_id = extract_doctor_file_id(doctor)
@@ -300,8 +325,14 @@ def reconcile_doctors(
         dropped_fields.update(doc_dropped)
 
     lianou_id_by_cert = _build_lianou_id_by_cert(doctors)
+    export_certs = set(main_index.keys()) | set(multi_index.keys())
+    export_matched_disabled = len(export_certs & disabled_certs)
     export_only = _collect_export_only(
-        matched_certs, main_index, multi_index, lianou_id_by_cert=lianou_id_by_cert
+        matched_certs,
+        main_index,
+        multi_index,
+        lianou_id_by_cert=lianou_id_by_cert,
+        exclude_certs=disabled_certs,
     )
 
     lianou_only = _dedupe_roster(lianou_only)
@@ -317,6 +348,8 @@ def reconcile_doctors(
             "missingNoCert": missing_no_cert,
             "missingNotInExport": missing_not_in_export,
             "nameMismatch": name_mismatch,
+            "skippedDisabled": skipped_disabled,
+            "exportMatchedDisabled": export_matched_disabled,
             "exportOnly": len(export_only),
             "droppedFields": dict(dropped_fields),
         },
@@ -332,11 +365,13 @@ def _collect_export_only(
     multi_index: dict[str, list[dict[str, Any]]],
     *,
     lianou_id_by_cert: dict[str, str] | None = None,
+    exclude_certs: set[str] | None = None,
 ) -> list[dict[str, str]]:
     api_ids = lianou_id_by_cert or {}
+    excluded = exclude_certs or set()
     rows: list[dict[str, str]] = []
     export_certs = set(main_index.keys()) | set(multi_index.keys())
-    for cert in sorted(export_certs - matched_certs):
+    for cert in sorted(export_certs - matched_certs - excluded):
         row = main_index.get(cert)
         if row is None:
             multi_rows = multi_index.get(cert, [])

@@ -58,6 +58,8 @@
     "multiSearchType": 8,
     "useDoctorUnitGetListForOther": false,
     "forceRefreshMd5": "",
+    "mainEnrichDetail": true,
+    "_mainEnrichDetailNote": "主执业 GetListEx 后调详情补任职资格；false 可跳过以加速（任职资格将为空）",
     "detailFetchWorkers": 48,
     "detailFetchRetries": 2,
     "detailReuseConnection": true

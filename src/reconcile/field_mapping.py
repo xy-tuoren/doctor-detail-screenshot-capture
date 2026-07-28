@@ -48,6 +48,10 @@ PROFESSIONAL_TYPE_MAP: dict[str, int] = {
     "公共卫生": 4,
 }
 
+# 执业范围项为该名称时，无论「医师类别」为何，professionalType 一律按公共卫生(4)提交
+PUBLIC_HEALTH_SCOPE_NAME = "公共卫生类别专业"
+PUBLIC_HEALTH_PROFESSIONAL_TYPE = 4
+
 
 def _professional_type(export_row: dict[str, Any]) -> int:
     raw = export_row.get(_CATEGORY_EXPORT_KEY)
@@ -76,17 +80,54 @@ def _split_professional_names(value: Any) -> list[str]:
     return [part.strip() for part in text.splitlines() if part.strip()]
 
 
+def _type_for_professional_name(name: str, default_type: int) -> int:
+    if name.strip() == PUBLIC_HEALTH_SCOPE_NAME:
+        return PUBLIC_HEALTH_PROFESSIONAL_TYPE
+    return default_type
+
+
+def coerce_professional_list_types(items: Any) -> list[dict[str, Any]]:
+    """提交前校正：执业范围为「公共卫生类别专业」的项强制 professionalType=4。"""
+    if not isinstance(items, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("professionalName") or "").strip()
+        try:
+            default_type = int(item.get("professionalType") or 0)
+        except (TypeError, ValueError):
+            default_type = 0
+        out.append(
+            {
+                "professionalType": _type_for_professional_name(name, default_type),
+                "professionalName": name,
+            }
+        )
+    return out
+
+
 def map_professional_list(export_row: dict[str, Any]) -> list[dict[str, Any]]:
     """professionalList ← 导出「执业范围」(可多项) + 「医师类别」→ professionalType。
 
     返回 [{"professionalType": int, "professionalName": str}, ...]；
     无执业范围数据时返回空列表。
+
+    例外：单项名称为「公共卫生类别专业」时，professionalType 固定为 4（公共卫生），
+    不随「医师类别」变化（避免莲藕专业类型校验失败）。
     """
     names = _split_professional_names(export_row.get(_PROFESSIONAL_EXPORT_KEY))
     if not names:
         return []
-    professional_type = _professional_type(export_row)
-    return [{"professionalType": professional_type, "professionalName": name} for name in names]
+    default_type = _professional_type(export_row)
+    return [
+        {
+            "professionalType": _type_for_professional_name(name, default_type),
+            "professionalName": name,
+        }
+        for name in names
+    ]
 
 
 def map_export_values(practice_source: str, export_row: dict[str, Any]) -> dict[str, str]:

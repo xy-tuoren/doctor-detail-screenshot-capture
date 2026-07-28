@@ -31,9 +31,15 @@ from bson import ObjectId
 from pymongo import ASCENDING, MongoClient, ReturnDocument
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_XLSX = ROOT / "workspace" / "artifacts" / "医生执业医院信息_20260706.xlsx"
+ARTIFACTS = ROOT / "workspace" / "artifacts"
 JOBS = "practiceHospitalJobs"
 REPORT_ID_RE = re.compile(r"reportId:\s*([0-9a-fA-F]{24})")
+
+
+def _default_report_xlsx() -> Path:
+    from src.minke_reg.practice_hospital_report import default_report_output_path
+
+    return default_report_output_path(ARTIFACTS)
 
 
 def _load_dotenv(path: Path) -> None:
@@ -118,7 +124,17 @@ def process_job(db, job: dict[str, Any], config: Path) -> None:
     py = _python()
 
     set_job(db, job_id, phase="building_report")
-    build_cmd = [py, "-m", "src.cli", "build-practice-hospital-report", "--config", str(config)]
+    report_xlsx = _default_report_xlsx()
+    build_cmd = [
+        py,
+        "-m",
+        "src.cli",
+        "build-practice-hospital-report",
+        "--config",
+        str(config),
+        "--output",
+        str(report_xlsx),
+    ]
     if skip_institution:
         build_cmd.append("--skip-institution-fetch")
     code, build_out = _run_cmd(build_cmd, "build-report")
@@ -134,14 +150,14 @@ def process_job(db, job: dict[str, Any], config: Path) -> None:
         )
         return
 
-    if not DEFAULT_XLSX.is_file():
+    if not report_xlsx.is_file():
         set_job(
             db,
             job_id,
             status="failed",
             phase="failed_build",
             finishedAt=_now(),
-            error=f"报告文件不存在: {DEFAULT_XLSX}",
+            error=f"报告文件不存在: {report_xlsx}",
         )
         return
 
@@ -150,7 +166,7 @@ def process_job(db, job: dict[str, Any], config: Path) -> None:
         py,
         str(ROOT / "scripts" / "export_practice_report_to_mongo.py"),
         "-x",
-        str(DEFAULT_XLSX),
+        str(report_xlsx),
     ]
     if drop_existing:
         export_cmd.append("--drop-existing")

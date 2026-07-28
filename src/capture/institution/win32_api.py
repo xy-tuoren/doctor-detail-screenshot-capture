@@ -13,6 +13,7 @@ kernel32 = ctypes.windll.kernel32
 
 # --- Key codes ---
 VK_ESCAPE = 0x1B
+VK_SHIFT = 0x10
 VK_CONTROL = 0x11
 VK_SPACE = 0x20
 VK_MENU = 0x12  # Alt

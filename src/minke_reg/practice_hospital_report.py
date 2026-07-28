@@ -8,6 +8,7 @@ from __future__ import annotations
 import shutil
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,16 @@ HOSPITAL_COUNT_BIN_ORDER: tuple[str, ...] = (
 )
 
 _CENTER = Alignment(horizontal="center", vertical="center")
+
+
+def default_report_output_path(
+    artifacts_dir: Path | str,
+    *,
+    on_date: date | None = None,
+) -> Path:
+    """默认报告路径：``医生执业医院信息_YYYYMMDD.xlsx``（按当天日期）。"""
+    day = on_date or date.today()
+    return Path(artifacts_dir) / f"医生执业医院信息_{day.strftime('%Y%m%d')}.xlsx"
 
 
 def normalize_cert(value: Any) -> str:
